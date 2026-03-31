@@ -1,0 +1,93 @@
+# Example backup configuration
+# Copy to backup.toml and customize for your needs
+
+# Group directories and files under a "selection" to
+# archive, which generates a named tarball in the backup.
+
+[tarball]
+compress = "gzip"
+checksum = "sha256"
+backups = ".bak"  # Extension for backing up existing files during restore
+
+# SSH keys and known_hosts
+[tar.ssh-keys]
+root = "$HOME"
+dirs = [".ssh"]
+
+# Shell dotfiles using glob patterns
+[tar.dotfiles]
+root = "$HOME"
+files = [
+    ".*rc",           # Matches .bashrc, .zshrc, .vimrc, etc.
+    ".bash_*",        # Matches .bash_profile, .bash_history, etc.
+    ".gitconfig",
+    ".gitignore_global",
+]
+
+# All config directories
+[tar.config]
+root = "$HOME"
+dirs = [
+    ".config/*",      # All subdirs: nvim, fish, i3, etc.
+]
+
+# Application data
+[tar.local]
+root = "$HOME/.local/share"
+dirs = [
+    "applications",
+    "fonts",
+]
+
+# Development tools
+[tar.dev-tools]
+root = "$HOME"
+dirs = [
+    ".cargo",
+    ".rustup",
+    ".npm",
+]
+
+# Homebrew (macOS)
+[tar.homebrew]
+root = "/usr/local"
+dirs = ["Cellar", "Caskroom"]
+files = ["bin/brew"]
+
+# Custom application with symlink
+# The 'link' field creates a symlink during restore: link -> root
+[tar.myapp]
+root = "/opt/myapp"
+link = "$HOME/myapp"  # Creates symlink: ~/myapp -> /opt/myapp
+dirs = ["bin", "lib", "config"]
+
+# External volume with symlink
+[tar.workspace]
+root = "/Volumes/workplace"
+link = "$HOME/workplace"  # Creates symlink: ~/workplace -> /Volumes/workplace
+dirs = ["projects", "repos"]
+
+# System configuration (requires sudo)
+[tar.system]
+root = "/etc"
+dirs = [
+    "nginx",
+    "systemd/system",
+]
+files = [
+    "hosts",
+    "fstab",
+]
+
+# Log files using patterns
+[tar.logs]
+root = "/var/log"
+files = [
+    "*.log",          # All .log files in /var/log
+    "nginx/*.log",    # All logs in nginx subdirectory
+]
+
+# Optional: Run scripts before/after backup
+[scripts]
+# before = ["scripts/dump-database.sh"]
+after = ["scripts/backup-brew.sh"]

@@ -1,0 +1,43 @@
+# Example custom configuration "deploy"
+# Represents deploying a snapshot to a remote machine
+
+[tar]
+# Select which archives to deploy to remote machine
+# e.g. application code, configs, and system files
+#
+# * matches tarball names specified in backup.toml
+archives = [
+    "myapp",           # Application code
+    "system",          # System configuration
+    "nginx",           # Web server config
+]
+
+# Alternative examples:
+#
+# Deploy only application:
+# archives = ["myapp"]
+#
+# Deploy application with all configs:
+# archives = ["myapp", "*-config"]
+#
+# Deploy everything except logs:
+# archives = ["ssh-keys", "dotfiles", "config", "myapp", "system"]
+
+# Scripts for deployment workflow
+[scripts]
+after = ["scripts/restore-brew.sh"]
+
+# Alternative examples:
+#
+# Run before restoring archives (local or remote)
+# before = [
+#     "scripts/stop-services.sh",
+#     "scripts/backup-existing.sh",
+# ]
+# Run after restoring archives (on remote)
+# after = [
+#     "scripts/fix-permissions.sh",
+#     "scripts/reload-configs.sh",
+#     "scripts/start-services.sh",
+#     "scripts/health-check.sh",
+# ]

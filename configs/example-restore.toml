@@ -1,0 +1,38 @@
+# Example restore configuration with glob pattern matching
+# Copy this to restore.toml and customize for your needs
+
+[tar]
+# Unarchive selected tarballs specified in backup.toml:
+#
+# Skip restore entirely:
+# archives = []
+#
+# Restore all archives:
+# archives = ["*"]
+#
+# Restore specific archives (exact match):
+# archives = ["ssh-keys", "dotfiles", "homebrew"]
+#
+# Restore using glob patterns:
+archives = [
+    "ssh*",           # All SSH-related archives (ssh-keys, ssh-config, etc.)
+    "dotfiles",       # Exact match for dotfiles
+    "*-config",       # All archives ending with "-config"
+]
+
+# Alternative examples:
+#
+# Restore only SSH and system configs:
+# archives = ["ssh*", "system-config"]
+#
+# Restore everything except system files:
+# archives = ["ssh*", "dotfiles", "homebrew", "user-*"]
+#
+# Restore user-specific files only:
+# archives = ["dot*", "*keys", "user-*"]
+
+[scripts]
+# Optional: Run scripts before/after restore
+# before = ["scripts/pre-restore.sh"]
+after = ["scripts/restore-brew.sh"]
+

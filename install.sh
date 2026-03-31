@@ -93,6 +93,18 @@ mkdir -p "$INSTALL_DIR/backups"
 # Symlink to make backups accessible as ~/Backups 
 ln -sf "$INSTALL_DIR/backups" "$HOME/Backups" 
 
+# Copy configuration files
+echo "Installing configuration files..."
+if [ -d "$SCRIPT_DIR/configs" ]; then
+    cp "$SCRIPT_DIR/configs/"*.toml "$INSTALL_DIR/configs/" 2>/dev/null || true
+fi
+
+# Copy scripts
+echo "Installing scripts..."
+if [ -d "$SCRIPT_DIR/scripts" ]; then
+    cp "$SCRIPT_DIR/scripts/"*.sh "$INSTALL_DIR/scripts/" 2>/dev/null || true
+fi
+
 echo
 echo "✓ Installation complete!"
 echo
@@ -149,7 +161,7 @@ echo
 echo "Installation complete!"
 echo
 echo "Next steps:"
-echo "  1. Customize configs in: $INSTALL_DIR/configs/"
+echo "  1. Review and customize configs in: $INSTALL_DIR/configs/"
 echo "  2. Create your first backup: snap backup"
 echo "  3. For help: snap --help"
 echo
