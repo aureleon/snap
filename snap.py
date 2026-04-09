@@ -3,7 +3,7 @@
 Backup and restore utility for creating system snapshots.
 """
 
-__version__ = '0.1'
+__version__ = "0.1"
 
 import sys
 
@@ -34,10 +34,28 @@ from pathlib import Path
 from tqdm import tqdm
 
 # Global flags
-DRY_RUN = False
-VERBOSE = False
 
-SCRIPT = Path(__file__).resolve()
+__dry_run__ = False
+__verbose__ = False
+
+__script__ = Path(__file__).resolve()
+
+
+def printd(*args, **kwargs):
+    """Adds [DRY-RUN] to output if __dry_run__=True."""
+    if not __dry_run__:
+        print(*args, **kwargs)
+        return
+    if not args:
+        print('[DRY-RUN]', **kwargs)
+        return
+    space = {'\r', '\n', '\r\n'}
+    nargs = [(f"[DRY-RUN]" if arg in space else 
+              f"[DRY-RUN] {arg}") for arg in args]
+    if 'sep' not in kwargs:
+        kwargs['sep'] = '\n'
+    print(*nargs, **kwargs)
+
 
 # --- Subprocess Runners --- #
 
@@ -52,32 +70,31 @@ MAX_RSYNC_TIMEOUT = 7200
 REMOTE_DIR_SUFFIX_LENGTH = 8
 AVG_DOWNLOAD_RATE = 50
 
-def ssh_run(host, *commands, check=True, stdin_data=None, tty=False):
-    """Execute commands on remote host with timeout and proper error handling.
 
-    Commands are joined with && for sequential execution.
-    Returns tuple: (returncode, stdout, stderr)
-    """
+def ssh_run(host, *commands, check=True, stdin_data=None, tty=False):
+    """Execute commands on remote host with timeout and proper error handling."""
     command_str = " && ".join(commands)
 
     ssh_args = [
         "ssh",
-        "-o", f"ConnectTimeout={SSH_CONNECT_TIMEOUT}",
-        "-o", f"ServerAliveInterval={SSH_ALIVE_INTERVAL}"
+        "-o",
+        f"ConnectTimeout={SSH_CONNECT_TIMEOUT}",
+        "-o",
+        f"ServerAliveInterval={SSH_ALIVE_INTERVAL}",
     ]
     if tty:
         ssh_args.append("-t")
     ssh_args.extend([host, command_str])
 
-    if DRY_RUN:
-        print(f"[DRY-RUN] ssh {host}:")
+    if __dry_run__:
+        printd(f"ssh {host}:")
         for cmd in commands:
-            print(f"[DRY-RUN]   {cmd}")
+            printd(f"  {cmd}")
         if stdin_data:
             if len(stdin_data) > 100:
-                print(f"[DRY-RUN]   stdin: {stdin_data[:100]}...")
+                printd(f"  stdin: {stdin_data[:100]}...")
             else:
-                print(f"[DRY-RUN]   stdin: {stdin_data}")
+                printd(f"  stdin: {stdin_data}")
         return None
 
     try:
@@ -88,9 +105,9 @@ def ssh_run(host, *commands, check=True, stdin_data=None, tty=False):
                 check=check,
                 timeout=COMMAND_TIMEOUT,
                 input=stdin_data,
-                text=stdin_data is not None
+                text=stdin_data is not None,
             )
-            return (result.returncode, "", "")
+            return (result.returncode, '', '')
 
         # For non-TTY, capture output
         result = subprocess.run(
@@ -99,19 +116,19 @@ def ssh_run(host, *commands, check=True, stdin_data=None, tty=False):
             timeout=COMMAND_TIMEOUT,
             input=stdin_data,
             text=True,
-            capture_output=True
+            capture_output=True,
         )
         return (result.returncode, result.stdout, result.stderr)
     except subprocess.TimeoutExpired:
-        print(f"Error: Command timed out on {host}", file=sys.stderr)
+        printd(f"Error: Command timed out on {host}", file=sys.stderr)
         sys.exit(1)
     except subprocess.CalledProcessError as e:
         # Print captured output on error before exiting
         if e.stdout:
-            print(e.stdout, end='')
+            printd(e.stdout, end='')
         if e.stderr:
-            print(e.stderr, end='', file=sys.stderr)
-        print(f"Error: SSH command failed on {host}", file=sys.stderr)
+            printd(e.stderr, end='', file=sys.stderr)
+        printd(f"Error: SSH command failed on {host}", file=sys.stderr)
         sys.exit(1)
 
 
@@ -135,16 +152,16 @@ def rsync_run(source, dest, check=True):
 
     # Build rsync command with optional progress
     rsync_cmd = ["rsync", "-az"]
-    if VERBOSE:
+    if __verbose__:
         rsync_cmd.append("--info=progress2")
     rsync_cmd.extend([f"--timeout={timeout}", source, dest])
 
-    if DRY_RUN:
-        print(f"[DRY-RUN] {shlex.join(rsync_cmd)}")
+    if __dry_run__:
+        printd(f"{shlex.join(rsync_cmd)}")
         # Show file size if available
         if ":" not in source and Path(source).is_file():
             size_mb = Path(source).stat().st_size / (1024 * 1024)
-            print(f"[DRY-RUN]   file size: {size_mb:.2f} MB, timeout: {timeout}s")
+            printd(f"  file size: {size_mb:.2f} MB, timeout: {timeout}s")
         return None
 
     try:
@@ -153,24 +170,24 @@ def rsync_run(source, dest, check=True):
             check=check,
             timeout=timeout + TIMEOUT_BUFFER,
             capture_output=True,
-            text=True
+            text=True,
         )
         return (result.returncode, result.stdout, result.stderr)
     except subprocess.TimeoutExpired:
-        print(f"Error: rsync timed out copying {source} to {dest}", file=sys.stderr)
+        printd(f"Error: rsync timed out copying {source} to {dest}", file=sys.stderr)
         sys.exit(1)
     except subprocess.CalledProcessError as e:
         # Print captured output on error before exiting
         if e.stdout:
-            print(e.stdout, end='')
+            printd(e.stdout, end='')
         if e.stderr:
-            print(e.stderr, end='', file=sys.stderr)
-        print(f"Error: rsync failed copying {source} to {dest}", file=sys.stderr)
+            printd(e.stderr, end='', file=sys.stderr)
+        printd(f"Error: rsync failed copying {source} to {dest}", file=sys.stderr)
         sys.exit(1)
 
 
-def dtqdm(total, desc="", unit="item", autorefresh=None, **kwargs):
-    """Return tqdm progress bar or no-op context in DRY_RUN mode.
+def dtqdm(total, desc='', unit="item", autorefresh=None, **kwargs):
+    """Return tqdm progress bar or no-op context in __dry_run__ mode.
 
     For unknown totals (total=None) or when autorefresh=True, starts a background
     thread to refresh the display every second so elapsed time updates even during
@@ -179,6 +196,7 @@ def dtqdm(total, desc="", unit="item", autorefresh=None, **kwargs):
 
     class _dtqdm:
         """No-op progress bar for dry-run mode."""
+
         def __enter__(self):
             return self
 
@@ -189,10 +207,11 @@ def dtqdm(total, desc="", unit="item", autorefresh=None, **kwargs):
             pass
 
         def write(self, msg):
-            print(msg)
+            printd(msg)
 
     class _AutoRefreshProgress:
         """Wrapper that auto-refreshes progress bar."""
+
         def __init__(self, pbar):
             self.pbar = pbar
             self.stop_event = threading.Event()
@@ -221,7 +240,7 @@ def dtqdm(total, desc="", unit="item", autorefresh=None, **kwargs):
         def write(self, msg):
             return self.pbar.write(msg)
 
-    if DRY_RUN:
+    if __dry_run__:
         return _dtqdm()
 
     pbar = tqdm(total=total, desc=desc, unit=unit, **kwargs)
@@ -238,28 +257,35 @@ def rsync_parallel(transfers):
     if not transfers:
         return 0
 
-    if DRY_RUN:
-        print(f"[DRY-RUN] {len(transfers)} parallel transfer(s):")
+    printd(f"Transferring {len(transfers)} file(s) in parallel...")
+    if __verbose__:
         for source, dest, desc in transfers:
-            print(f"[DRY-RUN]   {desc}: {source} -> {dest}")
-        return len(transfers)
+            printd(f"  {desc}: {source} -> {dest}")
 
-    print(f"Transferring {len(transfers)} file(s) in parallel...")
+    if __dry_run__:
+        return len(transfers)
     success_count = 0
 
-    with dtqdm(len(transfers), "  Transfer progress", " files", bar_format='{desc}: {n}/{total} [{elapsed}, {rate_fmt}]', autorefresh=True) as pbar:
+    with dtqdm(
+        len(transfers),
+        "  Transfer progress",
+        " files",
+        bar_format="{desc}: {n}/{total} [{elapsed}, {rate_fmt}]",
+        autorefresh=True,
+    ) as pbar:
+
         def transfer_with_desc(transfer):
             source, dest, desc = transfer
             try:
-                if VERBOSE:
+                if __verbose__:
                     pbar.write(f"  Starting: {desc}")
                 returncode, stdout, stderr = rsync_run(source, dest)
                 # Print any output after transfer completes
-                if stdout and VERBOSE:
+                if stdout and __verbose__:
                     pbar.write(stdout.strip())
                 if stderr:
                     pbar.write(f"  rsync stderr: {stderr.strip()}")
-                if VERBOSE:
+                if __verbose__:
                     pbar.write(f"  Completed: {desc}")
                 return True
             except Exception as e:
@@ -273,9 +299,12 @@ def rsync_parallel(transfers):
                     success_count += 1
                 pbar.update(1)
 
-    print()
+    printd()
     if success_count < len(transfers):
-        print(f"Warning: Only {success_count}/{len(transfers)} transfers succeeded", file=sys.stderr)
+        printd(
+            f"Warning: Only {success_count}/{len(transfers)} transfers succeeded",
+            file=sys.stderr,
+        )
 
     return success_count
 
@@ -291,30 +320,31 @@ def run_scripts(root_dir, config, when, working_dir, remote_host=None, remote_di
         remote_host: If set, run on remote host
         remote_dir: Remote directory (when remote_host is set)
     """
-    if not config or "scripts" not in config:
-        return
+    if not config or "scripts" not in config: 
+        printd('\n', f"Config has no [scripts] table, skipping {when} script execution...", '\n')
 
     if when not in config["scripts"]:
+        printd('\n', f"No {when} list defined in [scripts] table, skipping execution...", '\n')
         return
 
     scripts = config["scripts"][when]
     if not scripts:
+        printd('\n', f"Skipping {when} script execution ([scripts].{when} = [])", '\n')
         return
 
     if remote_host:
-        print(f"\nRunning {when} scripts on remote...")
+        printd('\n', f"Running {when} scripts on remote...", '\n')
     else:
-        print(f"\nRunning {when} scripts...")
+        printd('\n', f"Running {when} scripts...", '\n')
 
     for run_script_path in scripts:
         script_path = root_dir / run_script_path
-
         if not script_path.exists():
-            print(f"  Warning: Script {script_path} not found, skipping", file=sys.stderr)
+            printd(
+                f"  Warning: Script {script_path} not found, skipping", file=sys.stderr
+            )
             continue
-
         script_name = script_path.name
-        print(f"  Executing {script_name}...")
 
         if remote_host:
             # Run on remote with sudo, in the remote backup directory
@@ -324,22 +354,22 @@ def run_scripts(root_dir, config, when, working_dir, remote_host=None, remote_di
             cmds = [
                 f"cd {escaped_dir}",
                 f"chmod +x {escaped_script}",
-                f"sudo bash {escaped_script}"
+                f"sudo bash {escaped_script}",
             ]
             returncode, stdout, stderr = ssh_run(remote_host, *cmds)
             # Print script output after completion
             if stdout:
-                print(stdout, end='')
+                printd(stdout, end='')
             if stderr:
-                print(stderr, end='', file=sys.stderr)
+                printd(stderr, end='', file=sys.stderr)
         else:
             # Run locally in the backup directory
             script_cmd = ["bash", str(script_path)]
-            if DRY_RUN:
-                print(f"[DRY-RUN] {shlex.join(script_cmd)}")
+            if __dry_run__:
+                printd(f"{shlex.join(script_cmd)}")
                 if working_dir:
-                    print(f"[DRY-RUN]   cwd: {working_dir}")
-                print(f"[DRY-RUN]   timeout: {COMMAND_TIMEOUT}s")
+                    printd(f"  cwd: {working_dir}")
+                printd(f"  timeout: {COMMAND_TIMEOUT}s")
             else:
                 try:
                     result = subprocess.run(
@@ -348,23 +378,23 @@ def run_scripts(root_dir, config, when, working_dir, remote_host=None, remote_di
                         cwd=working_dir,
                         timeout=COMMAND_TIMEOUT,
                         capture_output=True,
-                        text=True
+                        text=True,
                     )
                     # Print script output after completion
                     if result.stdout:
-                        print(result.stdout, end='')
+                        printd(result.stdout, end='')
                     if result.stderr:
-                        print(result.stderr, end='', file=sys.stderr)
+                        printd(result.stderr, end='', file=sys.stderr)
                 except subprocess.TimeoutExpired:
-                    print(f"Error: Script {script_name} timed out", file=sys.stderr)
+                    printd(f"Error: Script {script_name} timed out", file=sys.stderr)
                     sys.exit(1)
                 except subprocess.CalledProcessError as e:
                     # Print captured output on error
                     if e.stdout:
-                        print(e.stdout, end='')
+                        printd(e.stdout, end='')
                     if e.stderr:
-                        print(e.stderr, end='', file=sys.stderr)
-                    print(f"Error: Script {script_name} failed", file=sys.stderr)
+                        printd(e.stderr, end='', file=sys.stderr)
+                    printd(f"Error: Script {script_name} failed", file=sys.stderr)
                     sys.exit(1)
 
 
@@ -375,12 +405,15 @@ DEFAULT_ROOT_SNAP = "~/.snap"
 DEFAULT_CONFIG_BACKUP = "configs/backup.toml"
 DEFAULT_CONFIG_RESTORE = "configs/restore.toml"
 DEFAULT_CONFIG_DEPLOY = "configs/deploy.toml"
+DEFAULT_CONFIG_MIGRATE = "configs/migrate.toml"
 
 DEFAULT_TARBALL_TOML = "tarball.toml"
+
 
 def expand_path(path_str):
     """Expand environment variables and user home in a path string."""
     return Path(os.path.expandvars(path_str)).expanduser()
+
 
 def resolve_root(specified_root):
     """Resolve the snap root directory.
@@ -410,11 +443,16 @@ def resolve_root(specified_root):
         return home_root.resolve()
 
     # None found - error
-    print("Error: No .snap directory found", file=sys.stderr)
-    print(f"  Searched: {pwd_root}", file=sys.stderr)
-    print(f"  Searched: {home_root}", file=sys.stderr)
-    print("\nCreate a .snap directory manually or specify a custom location with --snap-root", file=sys.stderr)
+    printd("Error: No .snap directory found", file=sys.stderr)
+    printd(f"  Searched: {pwd_root}", file=sys.stderr)
+    printd(f"  Searched: {home_root}", file=sys.stderr)
+    printd(
+        '\n',
+        "Create a .snap directory manually or specify a custom location with --snap-root",
+        file=sys.stderr,
+    )
     sys.exit(1)
+
 
 def load_config(root_dir, config_name):
     """Load a TOML config file from the root directory."""
@@ -424,69 +462,90 @@ def load_config(root_dir, config_name):
         with open(config_file, "rb") as f:
             return tomllib.load(f)
     except FileNotFoundError:
-        print(f"Error: Config file {config_file} not found", file=sys.stderr)
+        printd(f"Error: Config file {config_file} not found", file=sys.stderr)
         sys.exit(1)
     except tomllib.TOMLDecodeError as e:
-        print(f"Error parsing TOML: {e}", file=sys.stderr)
+        printd(f"Error parsing TOML: {e}", file=sys.stderr)
         sys.exit(1)
 
 
 def verify_backup_config(config, config_name):
     """Verify backup configuration structure."""
     if "tar" not in config:
-        print(f"Error: {config_name} missing required [tar] section", file=sys.stderr)
+        printd(f"Error: {config_name} missing required [tar] section", file=sys.stderr)
         sys.exit(1)
 
     tar_config = config["tar"]
     if not tar_config or not isinstance(tar_config, dict):
-        print(f"Error: {config_name} [tar] section is empty or invalid", file=sys.stderr)
+        printd(
+            f"Error: {config_name} [tar] section is empty or invalid", file=sys.stderr
+        )
         sys.exit(1)
 
     # Verify each category has required fields
     for category, data in tar_config.items():
         if not isinstance(data, dict):
-            print(f"Error: {config_name} [tar.{category}] must be a table", file=sys.stderr)
+            printd(
+                f"Error: {config_name} [tar.{category}] must be a table",
+                file=sys.stderr,
+            )
             sys.exit(1)
 
         if "root" not in data:
-            print(f"Error: {config_name} [tar.{category}] missing required 'root' field", file=sys.stderr)
+            printd(
+                f"Error: {config_name} [tar.{category}] missing required 'root' field",
+                file=sys.stderr,
+            )
             sys.exit(1)
 
         if "dirs" not in data and "files" not in data:
-            print(f"Error: {config_name} [tar.{category}] must have 'dirs' or 'files' field", file=sys.stderr)
+            printd(
+                f"Error: {config_name} [tar.{category}] must have 'dirs' or 'files' field",
+                file=sys.stderr,
+            )
             sys.exit(1)
 
 
 def verify_restore_config(config, config_name):
     """Verify restore/deploy configuration structure."""
-    if "tar" not in config:
-        print(f"Error: {config_name} missing required [tar] section", file=sys.stderr)
+    if "tarball" not in config:
+        printd(
+            f"Error: {config_name} missing required [tarball] section", file=sys.stderr
+        )
         sys.exit(1)
 
-    tar_config = config["tar"]
+    tar_config = config["tarball"]
     if not isinstance(tar_config, dict):
-        print(f"Error: {config_name} [tar] section must be a table", file=sys.stderr)
+        printd(f"Error: {config_name} [tar] section must be a table", file=sys.stderr)
         sys.exit(1)
 
     if "archives" not in tar_config:
-        print(f"Error: {config_name} [tar] section missing 'archives' field", file=sys.stderr)
+        printd(
+            f"Error: {config_name} [tar] section missing 'archives' field",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     archives = tar_config["archives"]
     if archives is not None and not isinstance(archives, list):
-        print(f"Error: {config_name} [tar].archives must be a list or null", file=sys.stderr)
+        printd(
+            f"Error: {config_name} [tar].archives must be a list or null",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
 
 def verify_backup(backup_dir, require_checksum=False):
     """Validate that a backup directory contains required files."""
     if not backup_dir.exists():
-        print(f"Error: Backup directory {backup_dir} does not exist", file=sys.stderr)
+        printd(f"Error: Backup directory {backup_dir} does not exist", file=sys.stderr)
         sys.exit(1)
 
     toml_path = backup_dir / DEFAULT_TARBALL_TOML
     if not toml_path.exists():
-        print(f"Error: {DEFAULT_TARBALL_TOML} not found in {backup_dir}", file=sys.stderr)
+        printd(
+            f"Error: {DEFAULT_TARBALL_TOML} not found in {backup_dir}", file=sys.stderr
+        )
         sys.exit(1)
 
     # Load compression type from tarball.toml
@@ -495,7 +554,7 @@ def verify_backup(backup_dir, require_checksum=False):
 
     compress_type = tarball_config.get("tarball", {}).get("compress", "gzip")
     if compress_type not in COMPRESS_MAP:
-        print(f"Error: Unsupported compression type: {compress_type}", file=sys.stderr)
+        printd(f"Error: Unsupported compression type: {compress_type}", file=sys.stderr)
         sys.exit(1)
 
     ext, _ = COMPRESS_MAP[compress_type]
@@ -503,26 +562,10 @@ def verify_backup(backup_dir, require_checksum=False):
     # Check that at least one tar archive exists
     archives = list(backup_dir.glob(f"*{ext}"))
     if not archives:
-        print(f"Error: No tar archives found in {backup_dir}", file=sys.stderr)
+        printd(f"Error: No tar archives found in {backup_dir}", file=sys.stderr)
         sys.exit(1)
 
     return toml_path
-
-
-# --- Dry-Run Helper Functions --- #
-
-def dry_run_create_archive(name, root_path, expanded_paths, archive_path):
-    """Dry-run for archive creation - shows what would be added."""
-    print(f"[DRY-RUN] Create archive: {archive_path}")
-    if VERBOSE:
-        for path in expanded_paths:
-            full_path = root_path / path
-            if full_path.exists():
-                arcname = str(path)
-                print(f"[DRY-RUN]   add: {arcname}")
-            else:
-                print(f"[DRY-RUN]   Warning: {full_path} not found, skipping", file=sys.stderr)
-    return archive_path
 
 
 # --- Archive Handlers --- #
@@ -530,18 +573,47 @@ def dry_run_create_archive(name, root_path, expanded_paths, archive_path):
 # Compression type mappings: extension, write mode
 # Read mode is always 'r:*' for auto-detection
 COMPRESS_MAP = {
-    "gzip":  (".tar.gz",  "w:gz"),
+    "gzip": (".tar.gz", "w:gz"),
     "bzip2": (".tar.bz2", "w:bz2"),
-    "xz":    (".tar.xz",  "w:xz"),
-    "":      (".tar",     "w"),
+    "xz": (".tar.xz", "w:xz"),
+    '': (".tar", "w"),
 }
+
+
+def archive_check_paths(paths, truthy, falsey, cond):
+    """
+    Formats `paths` into two lists of text, one 'truthy' to stdout, other
+    'falsey' to stderr, decided based on lambda `cond` for each path.
+    """
+    groups = {truthy: [], falsey: []}
+    for path in paths:
+        if cond(path):
+            groups[truthy] += [path]
+        else:
+            groups[falsey] += [path]
+    if not groups[truthy]:
+        return [], []
+    if __verbose__:
+        for prefix in groups:
+            group = groups[prefix]
+            for n, path in enumerate(group):
+                group[n] = f"{prefix}: '{path}'"
+    else:
+        for prefix in groups:
+            if not groups[prefix]:
+                continue
+            length = len(groups[prefix])
+            suffix = 's' * (length > 1)
+            msg = f"{prefix}: {length} path{suffix}"
+            groups[prefix] = [msg]
+    return groups[truthy], groups[falsey]
 
 
 def archive_filter(tarinfo):
     """Filters metadata files from archives."""
-    if sys.platform == 'darwin':
+    if sys.platform == "darwin":
         # Skip ._* resource fork files and .DS_Store
-        re_metadata = r'^(?:\._.*)|(?:.*/?.DS_Store)$'
+        re_metadata = r"^(?:\._.*)|(?:.*/?.DS_Store)$"
         if re.match(re_metadata, tarinfo.name):
             return None
     return tarinfo
@@ -549,12 +621,11 @@ def archive_filter(tarinfo):
 
 def archive_expand(patterns, root_path):
     """Expand glob patterns in file/directory lists."""
-    expanded = []
     matched_paths = set()
-
+    expanded, warnings = [], []
     for pattern in patterns:
         # Check if pattern contains glob characters
-        if any(char in pattern for char in ['*', '?', '[', ']']):
+        if any(char in pattern for char in ["*", "?", "[", "]"]):
             # Use glob to find matches relative to root
             matches = list(root_path.glob(pattern))
             if matches:
@@ -565,26 +636,19 @@ def archive_expand(patterns, root_path):
                         expanded.append(str(rel_path))
                         matched_paths.add(str(rel_path))
             else:
-                print(f"  Warning: Pattern '{pattern}' matched no files, skipping", file=sys.stderr)
+                warnings += [f"skipped: pattern '{pattern}'"]
         else:
             # Literal path - add as-is
             if pattern not in matched_paths:
                 expanded.append(pattern)
                 matched_paths.add(pattern)
-
-    return expanded
+    return expanded, warnings
 
 
 def archive_create(name, root, paths, outdir, compress="gzip"):
-    """Create a compressed tar archive for a backup category.
-
-    Args:
-        compress: Compression type ("gzip", "bzip2", "xz", or "" for no compression)
-
-    Returns tuple: (archive_path, warnings_list)
-    """
+    """Create a compressed tar archive for a backup category."""
     if compress not in COMPRESS_MAP:
-        print(f"Error: Unsupported compression type: {compress}", file=sys.stderr)
+        printd(f"Error: Unsupported compression type: {compress}", file=sys.stderr)
         sys.exit(1)
 
     ext, mode = COMPRESS_MAP[compress]
@@ -593,27 +657,29 @@ def archive_create(name, root, paths, outdir, compress="gzip"):
     warnings = []
 
     # Expand any glob patterns in the paths
-    expanded_paths = archive_expand(paths, root_path)
+    expanded_paths, expand_warnings = archive_expand(paths, root_path)
 
-    if DRY_RUN:
-        return dry_run_create_archive(name, root_path, expanded_paths, archive_path), []
+    lines = [f"  {archive_path.name} (root: '{root_path}')"]
+    includes, warnings = archive_check_paths(
+        expanded_paths, 'include', 'skipping',
+        cond=lambda path: (root_path / path).exists()
+    )
+    lines += includes
+    warnings += expand_warnings
+
+    if __dry_run__:
+        return archive_path, lines, warnings
 
     # Don't show individual progress bars during parallel creation
     # (avoids terminal corruption and empty lines)
     with tarfile.open(archive_path, mode) as tar:
         for path in expanded_paths:
             full_path = root_path / path
-            if full_path.exists():
-                # Store with relative path (relative to root)
-                arcname = str(path)
-                tar.add(full_path, arcname=arcname, filter=archive_filter)
+            if not full_path.exists():
+                continue
+            tar.add(full_path, arcname=str(path), filter=archive_filter)
 
-                if VERBOSE:
-                    warnings.append(f"  {name}: Added {full_path.name}")
-            else:
-                warnings.append(f"  Warning: {full_path.name} not found, skipping")
-
-    return archive_path, warnings
+    return archive_path, lines, warnings
 
 
 def create_archives(tasks, compress="gzip"):
@@ -626,127 +692,121 @@ def create_archives(tasks, compress="gzip"):
     if not tasks:
         return []
 
-    print(f"Creating {len(tasks)} archive(s)...")
-    results = []
-    all_warnings = []
-
+    results, buffer = [], {}
+    printd('\n', f"Creating {len(tasks)} archive(s)...", '\n')
     with ccft.ThreadPoolExecutor(max_workers=len(tasks)) as exc:
         futures = {exc.submit(archive_create, *task, compress): task for task in tasks}
-        with dtqdm(len(tasks), "Overall progress", unit=" archives", bar_format='{desc}: {n}/{total} [{elapsed}, {rate_fmt}]', autorefresh=True) as pbar:
+        with dtqdm(
+            len(tasks),
+            "Overall progress",
+            unit=" archives",
+            bar_format="{desc}: {n}/{total} [{elapsed}, {rate_fmt}]",
+            autorefresh=True,
+        ) as pbar:
             for future in ccft.as_completed(futures):
                 task = futures[future]
                 category = task[0]
                 try:
-                    archive_path, warnings = future.result()
+                    archive_path, lines, warnings = future.result()
+                    buffer[archive_path.name] = [*lines, *warnings]
                     results.append(archive_path)
-                    all_warnings.extend(warnings)
                 except Exception as e:
                     pbar.write(f"\nError creating archive {category}: {e}")
                 pbar.update(1)
-
-    print()
-
-    # Print all collected warnings after parallel operations complete
-    for warning in all_warnings:
-        if "Warning:" in warning:
-            print(warning, file=sys.stderr)
-        elif VERBOSE:
-            print(warning)
-
+    for arcname in sorted(buffer):
+        header, *lines = buffer[arcname]
+        printd(header)
+        if not any('include: ' in l for l in lines):
+            lines = ["warning: no files matched"]
+        for line in map(lambda s: f'    {s}', lines):
+            if 'include:' in line:
+                printd(line)
+            else:
+                printd(line, file=sys.stderr)
+        printd()
     return results
 
 
-def generate_tarball_toml(outdir, tasks, compress="gzip", category_meta=None, backups_ext=None):
-    """Generate tarball.toml with checksums for all archives.
-
-    Args:
-        outdir: Directory containing compressed tar archives
-        tasks: List of (category, root, paths, outdir) tuples from create_archives
-        compress: Compression type used for archives
-        category_meta: Dict mapping category name to {"root": str, "link": str_or_None}
-        backups_ext: Backup file extension (e.g., ".bak") or None
-
-    Returns:
-        Path to generated tarball.toml file
-    """
+def generate_tarball_toml(
+    outdir, tasks, compress="gzip", category_meta=None, backups_ext=None
+):
+    """Generate tarball.toml with checksums for all archives."""
     if category_meta is None:
         category_meta = {}
-    print("Generating tarball.toml...")
 
     # Find archives based on compression type
     if compress not in COMPRESS_MAP:
-        print(f"Error: Unsupported compression type: {compress}", file=sys.stderr)
+        printd(f"Error: Unsupported compression type: {compress}", file=sys.stderr)
         sys.exit(1)
 
     ext, _ = COMPRESS_MAP[compress]
-    archives = list(outdir.glob(f"*{ext}"))
 
-    if DRY_RUN:
-        toml_path = outdir / DEFAULT_TARBALL_TOML
-        print(f"[DRY-RUN] Generate tarball.toml at: {toml_path}")
-        for archive in archives:
-            print(f"[DRY-RUN]   calculate checksum for: {archive.name}")
-        return toml_path
+    toml_path = outdir / DEFAULT_TARBALL_TOML
+    printd(f"  writing {toml_path.name}")
+    printd(f"    added tarball options")
+
+    if __dry_run__:
+        printd(f"    calculated archive checksums")
+        return toml_path, 'abcd123'
+
+    archives = list(outdir.glob(f"*{ext}"))
 
     # Calculate checksums for all archives
     checksums = {}
-    with dtqdm(len(archives), "  Calculating checksums", " archives",
-               bar_format='{desc}: {n}/{total} [{elapsed}, {rate_fmt}]',
-               autorefresh=True) as pbar:
+    with dtqdm(
+        len(archives),
+        "  Calculating checksums",
+        " archives",
+        bar_format="{desc}: {n}/{total} [{elapsed}, {rate_fmt}]",
+        autorefresh=True,
+    ) as pbar:
         for archive in archives:
             category = archive_category(archive)
-            checksum = calculate_checksum(archive, show_progress=False)
+            checksum = calculate_file_checksum(archive, show=False)
             checksums[category] = checksum
             pbar.update(1)
 
-    print()
+    printd()
 
     # Generate TOML content
-    toml_lines = [
-        '[tarball]',
-        f'compress = "{compress}"  # compression type',
-        'checksum = "sha256"  # digest type',
-    ]
+    toml_lines = ["#", "# Backup Configuration TOML", "#", "[tarball]"]
     if backups_ext:
-        toml_lines.append(f'backups = "{backups_ext}"  # backup file extension')
-    toml_lines.append('')
+        toml_lines += [f'backups = "{backups_ext}"  # backup path extension']
+    if compress != "gzip":
+        toml_lines += [f'compress = "{compress}"  # tar compression type']
+    toml_lines += ['checksum = "sha256"  # checksum digest type']
+    toml_lines += ['']
 
     for category in sorted(checksums.keys()):
         checksum = checksums[category]
-        toml_lines.append(f'[tar.{category}]')
+        toml_lines += [f"[tar.{category}]"]
 
-        # Add root and link if available in category_meta
         meta = category_meta.get(category, {})
         if "root" in meta:
-            toml_lines.append(f'root = "{meta["root"]}"')
+            toml_lines += [f'root = "{meta["root"]}"']
         if meta.get("link"):
-            toml_lines.append(f'link = "{meta["link"]}"')
+            toml_lines += [f'link = "{meta["link"]}"']
 
-        # Split checksum into 64-character chunks
-        chunks = []
-        for i in range(0, len(checksum), 64):
-            chunks.append(f'    {checksum[i:i+64]}')
-
-        toml_lines.append('checksum = [')
-        toml_lines.extend([chunk + ',' for chunk in chunks[:-1]])  # Add commas to all but last
-        toml_lines.append(chunks[-1])  # Last one without comma
-        toml_lines.append(']')
-        toml_lines.append('')
+        toml_lines += [f'checksum = "{checksum}"']
+        toml_lines += ['']
 
     # Write TOML file
-    toml_path = outdir / DEFAULT_TARBALL_TOML
-    with open(toml_path, 'w') as f:
+    with open(toml_path, "w") as f:
         f.write('\n'.join(toml_lines))
+    printd(f"  Done: {toml_path.name}")
 
-    print(f"  Done: {toml_path.name}")
-    return toml_path
+    # Combined checksum from all archive checksums
+    combined = ''.join(checksums[cat] for cat in sorted(checksums))
+    return toml_path, calculate_checksum(combined.encode('utf-8'))
 
 
 # --- Archive Extraction Handlers --- #
 
+
 def archive_category(archive):
     """Extract category name from archive filename."""
-    return archive.stem.replace(".tar", "")
+    return archive.stem.replace(".tar", '')
+
 
 def archive_entries(tar):
     """Get set of top-level entry names from a tar archive."""
@@ -757,52 +817,49 @@ def archive_entries(tar):
             entries.add(parts[0])
     return entries
 
+
 def archive_confirm(archive, compress="gzip", root=None):
     """Ask user for confirmation to extract archive."""
     name = archive_category(archive)
 
     if compress not in COMPRESS_MAP:
-        print(f"Error: Unsupported compression type: {compress}", file=sys.stderr)
+        printd(f"Error: Unsupported compression type: {compress}", file=sys.stderr)
         sys.exit(1)
 
-    if DRY_RUN:
-        print(f"\n[DRY-RUN] Restore {name}?  [Y/N]: Y")
-        if root:
-            print(f"[DRY-RUN]  Extraction target: {root}")
-        return True
-
     # Get top-level directories from the archive (auto-detect compression)
-    with tarfile.open(archive, 'r:*') as tar:
+    with tarfile.open(archive, "r:*") as tar:
         entries = archive_entries(tar)
 
-        # Format paths for display
-        top_level_dirs = set()
-        for entry in entries:
-            if root:
-                # Show paths relative to root
-                top_level_dirs.add(str(Path(root) / entry))
-            else:
-                # Legacy: show absolute paths
-                top_level_dirs.add("/" + entry)
+    # Format paths for display
+    top_level_dirs = set()
+    for entry in entries:
+        if root:
+            top_level_dirs.add(str(Path(root) / entry))
+        else:
+            top_level_dirs.add("/" + entry)
 
-        # Show what will be restored
-        print(f"\n{name} will restore to:")
-        for d in sorted(top_level_dirs):
-            print(f"  {d}")
+    # Show what will be restored
+    printd('\n', f"{name} will restore to:")
+    for d in sorted(top_level_dirs):
+        printd(f"  {d}")
 
-        # Prompt user for confirmation
-        try:
-            msg = f"Restore {name}? This will overwrite any existing files... [Y/N]:"
-            response = input(msg).strip().lower()
-        except (KeyboardInterrupt, EOFError):
-            print(f"\n  Skipping {name}")
-            return False
-
-        if response not in ('y', 'yes'):
-            print(f"  Skipping {name}")
-            return False
-
+    if __dry_run__:
+        printd(f"Restore {name}?  [Y/N]: Y")
         return True
+
+    # Prompt user for confirmation
+    try:
+        msg = f"Restore {name}? This will overwrite any existing files... [Y/N]:"
+        response = input(msg).strip().lower()
+    except (KeyboardInterrupt, EOFError):
+        printd('\n', f"  Skipping {name}")
+        return False
+
+    if response not in ("y", "yes"):
+        printd(f"  Skipping {name}")
+        return False
+
+    return True
 
 
 def archive_select(available, selected_archives, tmpdir, compress="gzip"):
@@ -811,7 +868,7 @@ def archive_select(available, selected_archives, tmpdir, compress="gzip"):
         return available
 
     if compress not in COMPRESS_MAP:
-        print(f"Error: Unsupported compression type: {compress}", file=sys.stderr)
+        printd(f"Error: Unsupported compression type: {compress}", file=sys.stderr)
         sys.exit(1)
 
     ext, _ = COMPRESS_MAP[compress]
@@ -836,20 +893,50 @@ def archive_select(available, selected_archives, tmpdir, compress="gzip"):
                         archives_to_restore.append(archive)
                         matched_names.add(archive_name)
                         pattern_matched = True
-
             if not pattern_matched:
-                print(f"Warning: No archives match pattern '{pattern}', skipping", file=sys.stderr)
+                printd( f"skipped: pattern '{pattern}'", file=sys.stderr)
 
     return archives_to_restore
 
 
+def copy_with_ownership(src, dst):
+    """Copy file or directory tree preserving ownership when running as root."""
+    src_path = Path(src)
+    dst_path = Path(dst)
+
+    if src_path.is_dir():
+        shutil.copytree(str(src_path), str(dst_path), symlinks=True)
+        # Preserve ownership recursively if running as root
+        if hasattr(os, 'geteuid') and os.geteuid() == 0:
+            for root, dirs, files in os.walk(dst_path):
+                root_path = Path(root)
+                src_root = src_path / root_path.relative_to(dst_path)
+
+                # Copy ownership for directory itself
+                src_stat = src_root.stat()
+                os.chown(root_path, src_stat.st_uid, src_stat.st_gid)
+
+                # Copy ownership for files
+                for file in files:
+                    dst_file = root_path / file
+                    src_file = src_root / file
+                    if src_file.exists():
+                        file_stat = src_file.stat()
+                        os.chown(dst_file, file_stat.st_uid, file_stat.st_gid)
+    else:
+        shutil.copy2(str(src_path), str(dst_path))
+        # Preserve ownership if running as root
+        if hasattr(os, 'geteuid') and os.geteuid() == 0:
+            src_stat = src_path.stat()
+            os.chown(dst_path, src_stat.st_uid, src_stat.st_gid)
+
+
 def archive_extract(archive, compress="gzip", root=None):
-    """Extract an archive without prompting (assumes already confirmed).
-    """
+    """Extract an archive without prompting (assumes already confirmed)."""
     name = archive_category(archive)
 
     if compress not in COMPRESS_MAP:
-        print(f"Error: Unsupported compression type: {compress}", file=sys.stderr)
+        printd(f"Error: Unsupported compression type: {compress}", file=sys.stderr)
         sys.exit(1)
 
     # Determine extraction path
@@ -863,19 +950,21 @@ def archive_extract(archive, compress="gzip", root=None):
         # Don't show individual progress bars during parallel extraction
         # (avoids terminal corruption and empty lines)
         # Use 'r:*' to auto-detect compression type
-        with tarfile.open(archive, 'r:*') as tar:
+        with tarfile.open(archive, "r:*") as tar:
             # Extract to root; use 'tar' filter if available (Python 3.12+)
             # 'tar' filter provides security without breaking symlinks or permissions
+            # When running as root, tarfile automatically preserves ownership from archive
             members = tar.getmembers()
             for member in members:
                 try:
-                    tar.extract(member, extract_path, filter='tar')
+                    # 'tar' filter preserves ownership information
+                    tar.extract(member, extract_path, filter="tar")
                 except TypeError:
                     # Python < 3.12 doesn't support filter parameter
                     tar.extract(member, extract_path)
         return True
     except Exception as e:
-        print(f"\nError extracting {name}: {e}", file=sys.stderr)
+        printd('\n', f"Error extracting {name}: {e}", file=sys.stderr)
         return False
 
 
@@ -891,32 +980,30 @@ def restore_category(archive, root, backup_ext, compress="gzip"):
     category = archive_category(archive)
 
     if compress not in COMPRESS_MAP:
-        print(f"Error: Unsupported compression type: {compress}", file=sys.stderr)
+        printd(f"Error: Unsupported compression type: {compress}", file=sys.stderr)
         return False
 
     root_path = expand_path(root)
     backup_dir = Path(str(root_path) + backup_ext)
 
-    if DRY_RUN:
-        print(f"\n[DRY-RUN] Restore category: {category} -> {root_path}")
-        if backup_dir.exists():
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            old_backup = Path(str(backup_dir) + f"_{timestamp}")
-            print(f"[DRY-RUN]   mv {backup_dir} {old_backup}")
-        print(f"[DRY-RUN]   mkdir {backup_dir}")
+    # Always open archive and classify entries
+    with tarfile.open(archive, "r:*") as tar:
+        entries = list(archive_entries(tar))
+        all_members = tar.getmembers()
 
-        # Show what would be backed up and extracted
-        if VERBOSE:
-            with tarfile.open(archive, 'r:*') as tar:
-                entries = archive_entries(tar)
-                for entry in entries:
-                    entry_path = root_path / entry
-                    if entry_path.exists():
-                        if entry_path.is_dir():
-                            print(f"[DRY-RUN]   cp -r {entry_path} {backup_dir / entry}")
-                        else:
-                            print(f"[DRY-RUN]   cp {entry_path} {backup_dir / entry}")
-                    print(f"[DRY-RUN]   extract: {entry} (from {archive.name})")
+    # Classify entries: replace (existing) vs extract (new)
+    replaces, extracts = archive_check_paths(
+        entries, 'replace', 'extract',
+        cond=lambda entry: (root_path / entry).exists()
+    )
+
+    printd(f"  {archive.name} (root: '{root_path}')")
+    for line in replaces:
+        printd(f"    {line}")
+    for line in extracts:
+        printd(f"    {line}")
+
+    if __dry_run__:
         return True
 
     # Handle existing backup directory
@@ -924,58 +1011,50 @@ def restore_category(archive, root, backup_ext, compress="gzip"):
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         old_backup = Path(str(backup_dir) + f"_{timestamp}")
         backup_dir.rename(old_backup)
-        if VERBOSE:
-            print(f"  Moved existing backup: {backup_dir} -> {old_backup}")
+        if __verbose__:
+            printd(f"  Moved existing backup: {backup_dir} -> {old_backup}")
 
     # Create fresh backup directory
     backup_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"Restoring {category}...")
+    printd(f"  Restoring {category}...")
     restored = []  # Track what we've touched for rollback
 
     try:
-        with tarfile.open(archive, 'r:*') as tar:
-            entries = archive_entries(tar)
-            all_members = tar.getmembers()
+        for entry in entries:
+            entry_path = root_path / entry
 
-            # Separate into directories and files
-            for entry in entries:
-                entry_path = root_path / entry
+            # Backup existing entry if it exists
+            if entry_path.exists():
+                copy_with_ownership(entry_path, backup_dir / entry)
+                if entry_path.is_dir():
+                    shutil.rmtree(str(entry_path))
+                else:
+                    entry_path.unlink()
 
-                # Backup existing entry if it exists
-                if entry_path.exists():
-                    if entry_path.is_dir():
-                        shutil.copytree(str(entry_path), str(backup_dir / entry), symlinks=True)
-                        shutil.rmtree(str(entry_path))
-                    else:
-                        shutil.copy2(str(entry_path), str(backup_dir / entry))
-                        entry_path.unlink()
+            # Extract this entry's members from the archive
+            members = [
+                m
+                for m in all_members
+                if Path(m.name).parts and Path(m.name).parts[0] == entry
+            ]
 
-                    if VERBOSE:
-                        print(f"  Backed up: {entry}")
-
-                # Extract this entry's members from the archive
-                members = [m for m in all_members
-                          if Path(m.name).parts and Path(m.name).parts[0] == entry]
-
+            with tarfile.open(archive, "r:*") as tar:
                 for member in members:
                     try:
-                        tar.extract(member, root_path, filter='tar')
+                        tar.extract(member, root_path, filter="tar")
                     except TypeError:
-                        # Python < 3.12 doesn't support filter parameter
                         tar.extract(member, root_path)
 
-                restored.append(entry)
-                if VERBOSE:
-                    print(f"  Restored: {entry}")
+            restored.append(entry)
 
-        print(f"  ✓ {category} restored")
+        printd(f"  ✓ {category} restored")
         return True
 
     except Exception as e:
         # Rollback: delete extracted entries and restore from backup
-        print(f"\nError restoring {category}: {e}", file=sys.stderr)
-        print(f"Rolling back {len(restored)} entry(s)...", file=sys.stderr)
+        printd('\n', f"Error restoring {category}: {e}", file=sys.stderr)
+        printd(f"Rolling back {len(restored)} entry(s)...", file=sys.stderr)
 
         for entry in restored:
             entry_path = root_path / entry
@@ -990,12 +1069,9 @@ def restore_category(archive, root, backup_ext, compress="gzip"):
 
             # Restore from backup if it exists
             if backup_path.exists():
-                if backup_path.is_dir():
-                    shutil.copytree(str(backup_path), str(entry_path), symlinks=True)
-                else:
-                    shutil.copy2(str(backup_path), str(entry_path))
+                copy_with_ownership(backup_path, entry_path)
 
-        print(f"✓ Rollback complete for {category}", file=sys.stderr)
+        printd(f"✓ Rollback complete for {category}", file=sys.stderr)
         return False
 
 
@@ -1022,7 +1098,7 @@ def extract_archives(archives, skip_confirm=False, root_map=None, compress="gzip
         return 0
 
     # Extract confirmed archives in parallel
-    print(f"\nExtracting {len(confirmed)} archive(s)...")
+    printd('\n', f"Extracting {len(confirmed)} archive(s)...")
     success_count = 0
 
     with ccft.ThreadPoolExecutor(max_workers=len(confirmed)) as exc:
@@ -1033,7 +1109,13 @@ def extract_archives(archives, skip_confirm=False, root_map=None, compress="gzip
             root = root_map.get(category)
             futures[exc.submit(archive_extract, archive, compress, root)] = archive
 
-        with dtqdm(len(confirmed), "Extraction progress", " archives", bar_format='{desc}: {n}/{total} [{elapsed}, {rate_fmt}]', autorefresh=True) as pbar:
+        with dtqdm(
+            len(confirmed),
+            "Extraction progress",
+            " archives",
+            bar_format="{desc}: {n}/{total} [{elapsed}, {rate_fmt}]",
+            autorefresh=True,
+        ) as pbar:
             for future in ccft.as_completed(futures):
                 archive = futures[future]
                 try:
@@ -1046,7 +1128,9 @@ def extract_archives(archives, skip_confirm=False, root_map=None, compress="gzip
     return success_count
 
 
-def restore_archives(backup_dir, selected_archives, compress="gzip", skip_confirm=False, root_map=None):
+def restore_archives(
+    backup_dir, selected_archives, compress="gzip", skip_confirm=False, root_map=None
+):
     """Restore archives from backup directory.
 
     Args:
@@ -1057,7 +1141,7 @@ def restore_archives(backup_dir, selected_archives, compress="gzip", skip_confir
         root_map: Dict mapping category name to root path
     """
     if compress not in COMPRESS_MAP:
-        print(f"Error: Unsupported compression type: {compress}", file=sys.stderr)
+        printd(f"Error: Unsupported compression type: {compress}", file=sys.stderr)
         sys.exit(1)
 
     ext, _ = COMPRESS_MAP[compress]
@@ -1066,19 +1150,23 @@ def restore_archives(backup_dir, selected_archives, compress="gzip", skip_confir
     available = list(backup_dir.glob(f"*{ext}"))
 
     if not available:
-        print("Error: No archives found to restore", file=sys.stderr)
+        printd("Error: No archives found to restore", file=sys.stderr)
         sys.exit(1)
 
-    if DRY_RUN:
-        print(f"[DRY-RUN] Found {len(available)} archives")
+    if __dry_run__:
+        printd(f"Found {len(available)} archives")
 
     # Select which archives to restore based on patterns
-    archives_to_restore = archive_select(available, selected_archives, backup_dir, compress)
+    archives_to_restore = archive_select(
+        available, selected_archives, backup_dir, compress
+    )
 
     # Extract selected archives in parallel
-    success_count = extract_archives(archives_to_restore, skip_confirm, root_map, compress)
+    success_count = extract_archives(
+        archives_to_restore, skip_confirm, root_map, compress
+    )
 
-    print(f"\n✓ {success_count}/{len(archives_to_restore)} archive(s) restored")
+    printd('\n', f"✓ {success_count}/{len(archives_to_restore)} archive(s) restored")
 
 
 def create_symlinks(tarball_config):
@@ -1099,78 +1187,87 @@ def create_symlinks(tarball_config):
         link_path = expand_path(link)
         root_path = expand_path(root)
 
-        if DRY_RUN:
-            print(f"[DRY-RUN] ln -s {root_path} {link_path}")
-            symlinks_created.append(str(link_path))
-            continue
-
         # Check if link already exists
         if link_path.exists() or link_path.is_symlink():
             if link_path.is_symlink():
-                # Check if it points to the correct target
                 current_target = link_path.resolve()
                 if current_target == root_path.resolve():
-                    # Already correct, skip
                     continue
                 else:
-                    print(f"Error: {link_path} already exists as symlink to {current_target}, expected {root_path}", file=sys.stderr)
+                    printd(
+                        f"Error: {link_path} already exists as symlink to {current_target}, expected {root_path}",
+                        file=sys.stderr,
+                    )
                     sys.exit(1)
             else:
-                print(f"Error: {link_path} already exists and is not a symlink", file=sys.stderr)
+                printd(
+                    f"Error: {link_path} already exists and is not a symlink",
+                    file=sys.stderr,
+                )
                 sys.exit(1)
 
-        # Create parent directory if needed
-        link_path.parent.mkdir(parents=True, exist_ok=True)
+        if not __dry_run__:
+            link_path.parent.mkdir(parents=True, exist_ok=True)
+            link_path.symlink_to(root_path)
 
-        # Create symlink
-        link_path.symlink_to(root_path)
         symlinks_created.append(str(link_path))
 
     if symlinks_created:
-        print(f"\n✓ Created {len(symlinks_created)} symlink(s)")
+        printd('\n', f"✓ Created {len(symlinks_created)} symlink(s)")
         for link in symlinks_created:
-            print(f"  {link}")
+            printd(f"  {link}")
 
 
 # --- Checksum Handlers --- #
 
 CHECKSUM_CHUNK_SIZE = 8192
 
-def calculate_checksum(filepath, show_progress=False):
+
+def calculate_checksum(data):
     """Calculate a SHA-256 digest."""
+    sha256 = hashlib.sha256()
+    sha256.update(data)
+    return sha256.hexdigest()
+
+
+def calculate_file_checksum(filepath, show=False):
+    """Calculate a SHA-256 digest from a file."""
     sha256 = hashlib.sha256()
     file_size = filepath.stat().st_size
 
-    if show_progress and file_size > 0:
+    if show and file_size > 0:
         with open(filepath, "rb") as f:
-            with dtqdm(file_size, "  Computing checksum", "B", unit_scale=True, unit_divisor=1024, bar_format='{desc}: {n_fmt}/{total_fmt} [{elapsed}, {rate_fmt}]', leave=False) as pbar:
-                for chunk in iter(lambda: f.read(CHECKSUM_CHUNK_SIZE), b""):
+            with dtqdm(
+                file_size,
+                "  Computing checksum",
+                "B",
+                unit_scale=True,
+                unit_divisor=1024,
+                bar_format="{desc}: {n_fmt}/{total_fmt} [{elapsed}, {rate_fmt}]",
+                leave=False,
+            ) as pbar:
+                for chunk in iter(lambda: f.read(CHECKSUM_CHUNK_SIZE), b''):
                     sha256.update(chunk)
                     pbar.update(len(chunk))
     else:
         with open(filepath, "rb") as f:
-            for chunk in iter(lambda: f.read(CHECKSUM_CHUNK_SIZE), b""):
+            for chunk in iter(lambda: f.read(CHECKSUM_CHUNK_SIZE), b''):
                 sha256.update(chunk)
 
     return sha256.hexdigest()
 
 
 def verify_archives_from_toml(backup_dir):
-    """Verify all archives using tarball.toml checksums.
-
-    Args:
-        backup_dir: Directory containing tarball.toml and .tar.gz archives
-
-    Returns:
-        True if all checksums match, exits on failure
-    """
+    """Verify all archives using tarball TOML checksums."""
     toml_path = backup_dir / DEFAULT_TARBALL_TOML
 
     if not toml_path.exists():
-        print(f"Error: {DEFAULT_TARBALL_TOML} not found in {backup_dir}", file=sys.stderr)
+        printd(
+            f"Error: {DEFAULT_TARBALL_TOML} not found in {backup_dir}", file=sys.stderr
+        )
         sys.exit(1)
 
-    # Load tarball.toml
+    # Load tarball TOML
     with open(toml_path, "rb") as f:
         tarball_config = tomllib.load(f)
 
@@ -1181,38 +1278,49 @@ def verify_archives_from_toml(backup_dir):
 
     # Verify compression type
     if compress_type not in COMPRESS_MAP:
-        print(f"Error: Unsupported compression type: {compress_type}", file=sys.stderr)
+        printd(f"Error: Unsupported compression type: {compress_type}", file=sys.stderr)
         sys.exit(1)
 
     archive_ext, _ = COMPRESS_MAP[compress_type]
 
-    if DRY_RUN:
-        print(f"[DRY-RUN] Verify archives from: {toml_path}")
-        return tarball_config
-
     # If no checksum specified in options, skip verification
     if not digest_type:
-        print("Warning: No checksum type specified in tarball.toml, skipping verification")
+        printd(
+            f"Warning: No checksum type specified in {DEFAULT_TARBALL_TOML}, skipping verification"
+        )
         return tarball_config
 
-    print("Verifying archive integrity...")
+    printd("Verifying archive integrity...")
 
     if digest_type != "sha256":
-        print(f"Error: Unsupported digest type: {digest_type}", file=sys.stderr)
+        printd(f"Error: Unsupported digest type: {digest_type}", file=sys.stderr)
         sys.exit(1)
 
     # Get all tar sections
     tar_sections = tarball_config.get("tar", {})
 
     if not tar_sections:
-        print("Error: No tar sections found in tarball.toml", file=sys.stderr)
+        printd(f"Error: No tar sections found in {DEFAULT_TARBALL_TOML}", file=sys.stderr)
         sys.exit(1)
+
+    # List archives to verify
+    for category in sorted(tar_sections.keys()):
+        archive_path = backup_dir / f"{category}{archive_ext}"
+        printd(f"  verify: {archive_path.name}")
+
+    if __dry_run__:
+        printd("✓ All archives verified (dry-run)")
+        return tarball_config
 
     # Verify each archive
     all_valid = True
-    with dtqdm(len(tar_sections), "  Verifying", " archives",
-               bar_format='{desc}: {n}/{total} [{elapsed}, {rate_fmt}]',
-               autorefresh=True) as pbar:
+    with dtqdm(
+        len(tar_sections),
+        "  Verifying",
+        " archives",
+        bar_format="{desc}: {n}/{total} [{elapsed}, {rate_fmt}]",
+        autorefresh=True,
+    ) as pbar:
         for category, section_data in tar_sections.items():
             archive_path = backup_dir / f"{category}{archive_ext}"
 
@@ -1233,7 +1341,7 @@ def verify_archives_from_toml(backup_dir):
             expected_checksum = ''.join(checksum_chunks)
 
             # Calculate actual checksum
-            actual_checksum = calculate_checksum(archive_path, show_progress=False)
+            actual_checksum = calculate_file_checksum(archive_path, show=False)
 
             if actual_checksum != expected_checksum:
                 pbar.write(f"Error: Checksum mismatch for {archive_path.name}")
@@ -1241,24 +1349,29 @@ def verify_archives_from_toml(backup_dir):
 
             pbar.update(1)
 
-    print()
+    printd()
 
     if not all_valid:
-        print("Error: Checksum verification failed! Backup may be corrupted.", file=sys.stderr)
+        printd(
+            "Error: Checksum verification failed! Backup may be corrupted.",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
-    print("✓ All archives verified")
+    printd("✓ All archives verified")
     return tarball_config
 
 
 # --- Backup Logic --- #
 
-def backup(args, root_dir, outdir, config):
-    """Create backup archives in specified directory.
 
-    Returns:
-        Path to final backup directory (with checksum subdirectory)
-    """
+def backup(args, root_dir, outdir, config):
+    """Create backup archives in specified directory."""
+
+    # Run before scripts
+    if args.run_scripts:
+        run_scripts(root_dir, config, "before", working_dir=outdir)
+
     # Get compression type and backups extension from config
     tarball_opts = config.get("tarball", {})
     compress = tarball_opts.get("compress", "gzip")
@@ -1283,45 +1396,40 @@ def backup(args, root_dir, outdir, config):
 
         tasks.append((category, root, paths, outdir))
 
-        # Store root and link for tarball.toml
-        category_meta[category] = {
-            "root": root,
-            "link": data.get("link")
-        }
+        # Store root and link for tarball TOML
+        category_meta[category] = {"root": root, "link": data.get("link")}
 
     # Create archives in parallel
     create_archives(tasks, compress)
 
-    # Generate tarball.toml with checksums
-    toml_path = generate_tarball_toml(outdir, tasks, compress, category_meta, backups_ext)
+    # Generate tarball TOML with backup checksum
+    printd(f"Creating tarball metadata...", '\n')
+    toml_path, checksum = generate_tarball_toml(
+        outdir, tasks, compress, category_meta, backups_ext
+    )
 
-    # Calculate checksum of tarball.toml for directory naming
-    if DRY_RUN:
-        print(f"[DRY-RUN] Generate checksum of tarball.toml")
-        short_hash = "abcd123"  # Placeholder for dry-run
-    else:
-        print("Generating backup checksum...")
-        checksum = calculate_checksum(toml_path, show_progress=True)
-        short_hash = checksum[:7]
+    printd(f"  Backup checksum: '{checksum[:7]}...'")
 
     # Create checksum-named subdirectory and move files
-    final_dir = outdir.parent / outdir.name / short_hash
+    printd('\n', f"Setting up final backup layout...", '\n')
+    dst_dir = outdir.parent / outdir.name / checksum[:7]
 
-    if DRY_RUN:
-        print(f"[DRY-RUN] mkdir {final_dir}")
-        print(f"[DRY-RUN] Move all tar archives and tarball.toml to: {final_dir}")
-    else:
-        final_dir.mkdir(parents=True, exist_ok=False)
+    ext, _ = COMPRESS_MAP[compress]
+    printd(f"  mkdir {dst_dir}")
+    printd(f"  mv *{ext} -> {dst_dir.name}/")
+    printd(f"  mv {DEFAULT_TARBALL_TOML} -> {dst_dir.name}/")
+
+    if not __dry_run__:
+        dst_dir.mkdir(parents=True, exist_ok=False)
 
         # Move all tar archives to checksum directory
-        ext, _ = COMPRESS_MAP[compress]
         for archive in outdir.glob(f"*{ext}"):
-            archive.rename(final_dir / archive.name)
+            archive.rename(dst_dir / archive.name)
 
         # Move tarball.toml to checksum directory
-        toml_path.rename(final_dir / DEFAULT_TARBALL_TOML)
+        toml_path.rename(dst_dir / DEFAULT_TARBALL_TOML)
 
-        print(f"✓ Backup files moved to {final_dir.name}")
+    printd(f"✓ Backup files moved to {dst_dir.name}")
 
     # Run after-backup scripts if requested
     if args.run_scripts:
@@ -1329,14 +1437,14 @@ def backup(args, root_dir, outdir, config):
         config_name = args.config_toml if args.config_toml else DEFAULT_CONFIG_BACKUP
         scripts_config = load_config(root_dir, config_name)
         # Skip verification for scripts-only config (may not have [tar] section)
-        run_scripts(root_dir, scripts_config, "after", working_dir=final_dir)
+        run_scripts(root_dir, scripts_config, "after", working_dir=dst_dir)
 
-    return final_dir
+    return dst_dir
 
 
 def remote_backup(backup_dir, dest_host, intended_path):
     """Copy completed backup directory to remote host."""
-    print(f"\nCopying backup to {dest_host}...")
+    printd('\n', f"Copying backup to {dest_host}...")
 
     # Ensure remote directory exists
     escaped_path = shlex.quote(str(intended_path))
@@ -1348,48 +1456,58 @@ def remote_backup(backup_dir, dest_host, intended_path):
     # Add tarball.toml
     toml_path = backup_dir / DEFAULT_TARBALL_TOML
     if toml_path.exists():
-        transfers.append((str(toml_path), f"{dest_host}:{intended_path}/", DEFAULT_TARBALL_TOML))
+        transfers.append(
+            (str(toml_path), f"{dest_host}:{intended_path}/", DEFAULT_TARBALL_TOML)
+        )
 
         # Load compression type from tarball.toml
         with open(toml_path, "rb") as f:
             tarball_config = tomllib.load(f)
         compress_type = tarball_config.get("tarball", {}).get("compress", "gzip")
         if compress_type not in COMPRESS_MAP:
-            print(f"Error: Unsupported compression type: {compress_type}", file=sys.stderr)
+            printd(
+                f"Error: Unsupported compression type: {compress_type}", file=sys.stderr
+            )
             sys.exit(1)
         ext, _ = COMPRESS_MAP[compress_type]
 
         # Add all tar archives with the specified compression type
         for archive in backup_dir.glob(f"*{ext}"):
-            transfers.append((str(archive), f"{dest_host}:{intended_path}/", archive.name))
+            transfers.append(
+                (str(archive), f"{dest_host}:{intended_path}/", archive.name)
+            )
     else:
-        print(f"Error: {DEFAULT_TARBALL_TOML} not found in {backup_dir}", file=sys.stderr)
+        printd(
+            f"Error: {DEFAULT_TARBALL_TOML} not found in {backup_dir}", file=sys.stderr
+        )
         sys.exit(1)
 
     if not transfers:
-        print("Error: No backup files found to copy", file=sys.stderr)
+        printd("Error: No backup files found to copy", file=sys.stderr)
         sys.exit(1)
 
     success_count = rsync_parallel(transfers)
     if success_count < len(transfers):
-        print("Error: Failed to copy all files to remote", file=sys.stderr)
+        printd("Error: Failed to copy all files to remote", file=sys.stderr)
         sys.exit(1)
 
-    print(f"✓ Backup copied to {dest_host}:{intended_path}")
+    printd(f"✓ Backup copied to {dest_host}:{intended_path}")
+
 
 # --- Restore Logic --- #
+
 
 def restore(args, root_dir, backup_dir=None):
     """Restore from local backup directory."""
     if backup_dir is None:
         # Use combined backup_dir if set (includes checksum), otherwise fall back to dir
-        backup_dir = getattr(args, 'backup_dir', args.dir).resolve()
+        backup_dir = getattr(args, "backup_dir", args.dir).resolve()
 
     toml_path = verify_backup(backup_dir)
 
     # Verify all archives using tarball.toml and load config
     tarball_config = verify_archives_from_toml(backup_dir)
-    print()
+    printd()
 
     # Get compression type and backups extension from tarball.toml
     tarball_opts = tarball_config.get("tarball", {})
@@ -1404,10 +1522,13 @@ def restore(args, root_dir, backup_dir=None):
         if root:
             root_map[category] = root
 
-    # Check if running with sudo (Unix only)
-    if hasattr(os, 'geteuid') and os.geteuid() != 0:
-        print("Note: This script needs sudo privileges to restore files to system locations.")
-        print("Re-running with sudo...")
+    # Check if running with sudo is required (Unix only)
+    needs_sudo = any(not os.access(r, os.W_OK) for r in root_map.values())
+    if needs_sudo and hasattr(os, "geteuid") and os.geteuid() != 0:
+        printd(
+            "Note: This script needs sudo privileges to restore files to system locations."
+        )
+        printd("Re-running with sudo...")
         cmd = ["sudo", sys.executable] + sys.argv
         os.execvp("sudo", cmd)
 
@@ -1420,7 +1541,7 @@ def restore(args, root_dir, backup_dir=None):
     # Semantics: None/[] = skip restore, ["*"] = restore all, [patterns...] = restore matching
     # Patterns support glob matching: ["ssh*", "dotfiles", "*-config"]
     archives = restore_config.get("tarball", {}).get("archives", None)
-    if archives == []:
+    if not archives or archives == []:
         archives = None  # Empty list in config means don't restore
     elif archives == ["*"] or "*" in archives:
         archives = []  # Wildcard means restore all available
@@ -1437,33 +1558,47 @@ def restore(args, root_dir, backup_dir=None):
         selected = archive_select(available, archives, backup_dir, compress)
 
         if not selected:
-            print("No archives selected for restore")
-        elif getattr(args, 'disable_backups', False):
+            printd("No archives selected for restore")
+        elif getattr(args, "disable_backups", False):
             # No backup protection - use existing extract_archives with confirmation
-            extract_archives(selected, skip_confirm=False, root_map=root_map, compress=compress)
+            extract_archives(
+                selected, skip_confirm=False, root_map=root_map, compress=compress
+            )
         else:
             # Transactional restore with rollback support
             if not backups_ext:
-                print("Warning: No backups extension specified in tarball.toml, falling back to interactive confirmation", file=sys.stderr)
-                extract_archives(selected, skip_confirm=False, root_map=root_map, compress=compress)
+                printd(
+                    "Warning: No backups extension specified in tarball.toml, falling back to interactive confirmation",
+                    file=sys.stderr,
+                )
+                extract_archives(
+                    selected, skip_confirm=False, root_map=root_map, compress=compress
+                )
             else:
-                print(f"\nRestoring {len(selected)} category archive(s)...")
+                printd(f"Restoring {len(selected)} category archive(s)...")
                 failed = []
                 for archive in selected:
                     category = archive_category(archive)
                     root = root_map.get(category)
                     if not root:
-                        print(f"Warning: No root for {category}, skipping", file=sys.stderr)
+                        printd(
+                            f"Warning: No root for {category}, skipping",
+                            file=sys.stderr,
+                        )
                         continue
                     success = restore_category(archive, root, backups_ext, compress)
                     if not success:
                         failed.append(category)
 
                 if failed:
-                    print(f"\nError: {len(failed)} category(s) failed: {', '.join(failed)}", file=sys.stderr)
+                    printd(
+                        '\n',
+                        f"Error: {len(failed)} category(s) failed: {', '.join(failed)}",
+                        file=sys.stderr,
+                    )
                     sys.exit(1)
                 else:
-                    print(f"\n✓ Restored {len(selected)} category archive(s)")
+                    printd('\n', f"✓ Restored {len(selected)} category archive(s)")
 
     # Create symlinks from link -> root
     create_symlinks(tarball_config)
@@ -1472,37 +1607,38 @@ def restore(args, root_dir, backup_dir=None):
     if args.run_scripts:
         run_scripts(root_dir, restore_config, "after", working_dir=backup_dir)
 
-    print("\n✓ Restore completed successfully")
+    printd('\n', "✓ Restore completed successfully")
 
 
 def remote_mkdir(dest_host):
     """Generate a unique remote work directory path and create it."""
     chars = string.ascii_lowercase + string.digits
     suffix = ''.join(random.choices(chars, k=REMOTE_DIR_SUFFIX_LENGTH))
-    remote_dir = f"/tmp/{SCRIPT.stem}-restore-{suffix}"
+    remote_dir = f"/tmp/{__script__.stem}-restore-{suffix}"
 
     # Create remote directory
-    print("Creating remote directory...")
+    printd("Creating remote directory...")
     ssh_run(dest_host, f"mkdir -p {shlex.quote(remote_dir)}")
     return remote_dir
+
 
 def remote_restore(args, root_dir, source_host):
     """Pull backup from remote and restore locally."""
     backup_dir_path = str(args.backup_dir)
-    print(f"Pulling backup from {source_host}:{backup_dir_path}...\n")
+    printd(f"Pulling backup from {source_host}:{backup_dir_path}...", '\n')
 
-    tmpdir = Path(tempfile.mkdtemp(prefix=f"{SCRIPT.stem}-"))
+    tmpdir = Path(tempfile.mkdtemp(prefix=f"{__script__.stem}-"))
 
     try:
         # Rsync entire backup directory (includes all .tar.gz and tarball.toml)
         # Use trailing slash to copy contents into tmpdir
-        host_path = f'{source_host}:{backup_dir_path}/'
+        host_path = f"{source_host}:{backup_dir_path}/"
         result = rsync_run(host_path, str(tmpdir) + "/")
 
-        if result is None:  # DRY_RUN
+        if result is None:  # __dry_run__
             pass
         elif result[0] != 0:
-            print("Error: Failed to pull backup from remote", file=sys.stderr)
+            printd("Error: Failed to pull backup from remote", file=sys.stderr)
             sys.exit(1)
 
         restore(args, root_dir, backup_dir=tmpdir)
@@ -1517,14 +1653,18 @@ def remote_deploy(args, root_dir, dest_host, source_host=None):
     # Determine source paths (local or remote)
     if source_host:
         # Remote source - use combined backup_dir (includes checksum)
-        backup_dir_path = str(args.backup_dir) if isinstance(args.backup_dir, Path) else args.backup_dir
-        print(f"Deploying from {source_host} to {dest_host}...\n")
+        backup_dir_path = (
+            str(args.backup_dir)
+            if isinstance(args.backup_dir, Path)
+            else args.backup_dir
+        )
+        printd(f"Deploying from {source_host} to {dest_host}...", '\n')
         config_src_base = f"{source_host}:{root_dir}"
         local_backup = None
     else:
         # Local source - use combined backup_dir (includes checksum)
         local_backup = args.backup_dir.resolve()
-        print(f"Deploying to {dest_host}...\n")
+        printd(f"Deploying to {dest_host}...", '\n')
 
         toml_path = verify_backup(local_backup)
         config_src_base = None
@@ -1539,15 +1679,17 @@ def remote_deploy(args, root_dir, dest_host, source_host=None):
     transfers = []
 
     # Add snap.py script
-    transfers.append((str(SCRIPT), f"{dest_host}:{remote_dir}/", SCRIPT.name))
+    transfers.append((str(__script__), f"{dest_host}:{remote_dir}/", __script__.name))
 
     # Add backup files (tarball.toml and all tar archives)
     if source_host:
         # Remote source - need to fetch tarball.toml first to determine archives
-        print(f"Fetching backup metadata from {source_host}...")
+        printd(f"Fetching backup metadata from {source_host}...")
 
         # Create temp file for tarball.toml
-        with tempfile.NamedTemporaryFile(mode='wb', suffix='.toml', delete=False) as tmp:
+        with tempfile.NamedTemporaryFile(
+            mode="wb", suffix=".toml", delete=False
+        ) as tmp:
             tmp_toml_path = Path(tmp.name)
 
         try:
@@ -1555,24 +1697,32 @@ def remote_deploy(args, root_dir, dest_host, source_host=None):
             remote_toml = f"{source_host}:{backup_dir_path}/{DEFAULT_TARBALL_TOML}"
             result = rsync_run(remote_toml, str(tmp_toml_path))
 
-            if result is None:  # DRY_RUN
-                print(f"[DRY-RUN] Fetch {remote_toml}")
-                print(f"[DRY-RUN] Enumerate archives from remote tarball.toml")
+            if result is None:  # __dry_run__
+                printd(f"Fetch {remote_toml}")
+                printd(f"Enumerate archives from remote tarball.toml")
                 compress_type = "gzip"
                 # In dry-run, show placeholder archives
                 tar_sections = {"archive1": {}, "archive2": {}, "archive-N": {}}
             elif result[0] != 0:
-                print(f"Error: Failed to fetch {DEFAULT_TARBALL_TOML} from {source_host}", file=sys.stderr)
+                printd(
+                    f"Error: Failed to fetch {DEFAULT_TARBALL_TOML} from {source_host}",
+                    file=sys.stderr,
+                )
                 sys.exit(1)
             else:
                 # Load tarball.toml to get compression type and archive list
                 with open(tmp_toml_path, "rb") as f:
                     tarball_config = tomllib.load(f)
-                compress_type = tarball_config.get("tarball", {}).get("compress", "gzip")
+                compress_type = tarball_config.get("tarball", {}).get(
+                    "compress", "gzip"
+                )
                 tar_sections = tarball_config.get("tar", {})
 
                 if compress_type not in COMPRESS_MAP:
-                    print(f"Error: Unsupported compression type: {compress_type}", file=sys.stderr)
+                    printd(
+                        f"Error: Unsupported compression type: {compress_type}",
+                        file=sys.stderr,
+                    )
                     sys.exit(1)
         finally:
             # Clean up temp file
@@ -1580,43 +1730,62 @@ def remote_deploy(args, root_dir, dest_host, source_host=None):
                 tmp_toml_path.unlink()
 
         # Add tarball.toml transfer
-        transfers.append((f"{source_host}:{backup_dir_path}/{DEFAULT_TARBALL_TOML}",
-                         f"{dest_host}:{remote_dir}/", DEFAULT_TARBALL_TOML))
+        transfers.append(
+            (
+                f"{source_host}:{backup_dir_path}/{DEFAULT_TARBALL_TOML}",
+                f"{dest_host}:{remote_dir}/",
+                DEFAULT_TARBALL_TOML,
+            )
+        )
 
         # Add all tar archives based on tar sections
         ext, _ = COMPRESS_MAP[compress_type]
         for category in tar_sections.keys():
             archive_name = f"{category}{ext}"
-            transfers.append((f"{source_host}:{backup_dir_path}/{archive_name}",
-                            f"{dest_host}:{remote_dir}/", archive_name))
+            transfers.append(
+                (
+                    f"{source_host}:{backup_dir_path}/{archive_name}",
+                    f"{dest_host}:{remote_dir}/",
+                    archive_name,
+                )
+            )
     else:
         # Local source - we can enumerate files directly
         toml_path = local_backup / DEFAULT_TARBALL_TOML
         if not toml_path.exists():
-            print(f"Error: {DEFAULT_TARBALL_TOML} not found in {local_backup}", file=sys.stderr)
+            printd(
+                f"Error: {DEFAULT_TARBALL_TOML} not found in {local_backup}",
+                file=sys.stderr,
+            )
             sys.exit(1)
 
-        transfers.append((str(toml_path), f"{dest_host}:{remote_dir}/", DEFAULT_TARBALL_TOML))
+        transfers.append(
+            (str(toml_path), f"{dest_host}:{remote_dir}/", DEFAULT_TARBALL_TOML)
+        )
 
         # Load compression type from tarball.toml
         with open(toml_path, "rb") as f:
             tarball_config = tomllib.load(f)
         compress_type = tarball_config.get("tarball", {}).get("compress", "gzip")
         if compress_type not in COMPRESS_MAP:
-            print(f"Error: Unsupported compression type: {compress_type}", file=sys.stderr)
+            printd(
+                f"Error: Unsupported compression type: {compress_type}", file=sys.stderr
+            )
             sys.exit(1)
         ext, _ = COMPRESS_MAP[compress_type]
 
         # Add all tar archives with the specified compression type
         for archive in local_backup.glob(f"*{ext}"):
-                transfers.append((str(archive), f"{dest_host}:{remote_dir}/", archive.name))
+            transfers.append((str(archive), f"{dest_host}:{remote_dir}/", archive.name))
 
     # Add config transfer
     if source_host:
         config_src = f"{config_src_base}/{config_name}"
     else:
         config_src = str(root_dir / config_name)
-    transfers.append((config_src, f"{dest_host}:{remote_dir}/{DEFAULT_CONFIG_RESTORE}", config_name))
+    transfers.append(
+        (config_src, f"{dest_host}:{remote_dir}/{DEFAULT_CONFIG_RESTORE}", config_name)
+    )
 
     # Add script transfers
     if deploy_config and "scripts" in deploy_config:
@@ -1626,53 +1795,104 @@ def remote_deploy(args, root_dir, dest_host, source_host=None):
                     if source_host:
                         script_src = f"{config_src_base}/{run_script_path}"
                         script_name = Path(run_script_path).name
-                        transfers.append((script_src, f"{dest_host}:{remote_dir}/", script_name))
+                        transfers.append(
+                            (script_src, f"{dest_host}:{remote_dir}/", script_name)
+                        )
                     else:
                         script_path = root_dir / run_script_path
                         if not script_path.exists():
-                            print(f"Warning: Script {script_path} not found, skipping", file=sys.stderr)
+                            printd(
+                                f"Warning: Script {script_path} not found, skipping",
+                                file=sys.stderr,
+                            )
                             continue
                         script_name = Path(run_script_path).name
-                        transfers.append((str(script_path), f"{dest_host}:{remote_dir}/", script_name))
+                        transfers.append(
+                            (
+                                str(script_path),
+                                f"{dest_host}:{remote_dir}/",
+                                script_name,
+                            )
+                        )
 
     # Execute all transfers in parallel
     success_count = rsync_parallel(transfers)
     if success_count < len(transfers):
-        print("Error: Failed to copy all files to remote", file=sys.stderr)
+        printd("Error: Failed to copy all files to remote", file=sys.stderr)
         sys.exit(1)
 
     if args.run_scripts:
         run_scripts(
-                root_dir, deploy_config, "before", 
-                working_dir=None, remote_host=dest_host, remote_dir=remote_dir
+            root_dir,
+            deploy_config,
+            "before",
+            working_dir=None,
+            remote_host=dest_host,
+            remote_dir=remote_dir,
         )
 
     # Execute restore on remote
     escaped_remote_dir = shlex.quote(remote_dir)
-    program = f'{sys.executable} {SCRIPT.name}'
-    remote_cmd = f"cd {escaped_remote_dir} && sudo {program} restore -b {escaped_remote_dir}"
-    print(f"\nExecuting restore on {dest_host}...")
-    print(f"Command: {remote_cmd}\n")
+    program = f"{sys.executable} {__script__.name}"
+    remote_cmd = (
+        f"cd {escaped_remote_dir} && sudo {program} restore -b {escaped_remote_dir}"
+    )
+    printd('\n', f"Executing restore on {dest_host}...")
+    printd(f"Command: {remote_cmd}", '\n')
     ssh_run(dest_host, remote_cmd, tty=True)
 
     if args.run_scripts:
         run_scripts(
-                root_dir, deploy_config, "after", 
-                working_dir=None, remote_host=dest_host, remote_dir=remote_dir
+            root_dir,
+            deploy_config,
+            "after",
+            working_dir=None,
+            remote_host=dest_host,
+            remote_dir=remote_dir,
         )
 
-    print("\nCleaning up remote directory...")
+    printd('\n', "Cleaning up remote directory...")
     ssh_run(dest_host, f"rm -rf {shlex.quote(remote_dir)}")
 
-    print(f"\n✓ Deploy completed successfully")
+    printd('\n', f"✓ Deploy completed successfully")
 
 
 # --- Main Execution --- #
 
+
+def cmd_check(args):
+    """Calculate and display checksums for files."""
+    files = getattr(args, "files", []) or []
+
+    if not files:
+        print("Error: Specify at least one file with -f/--file", file=sys.stderr)
+        sys.exit(1)
+
+    # Validate all files exist
+    paths = []
+    for file_path in files:
+        path = Path(file_path)
+        if not path.exists():
+            print(f"Error: File {path} does not exist", file=sys.stderr)
+            sys.exit(1)
+        if not path.is_file():
+            print(f"Error: {path} is not a file", file=sys.stderr)
+            sys.exit(1)
+        paths.append(path)
+
+    print(f"Calculating checksums for {len(paths)} file(s)...\n")
+
+    # Calculate and display checksums
+    for file_path in paths:
+        checksum = calculate_file_checksum(file_path, show=False)
+        print(f"{file_path.name}:")
+        print(f"  {checksum}\n")
+
+
 def cmd_backup(args):
     """Execute backup command (local or send to remote)."""
     root_dir = args.root
-    dest_host = getattr(args, 'host', None)
+    dest_host = getattr(args, "host", None)
     config = load_config(root_dir, DEFAULT_CONFIG_BACKUP)
     verify_backup_config(config, DEFAULT_CONFIG_BACKUP)
 
@@ -1687,55 +1907,58 @@ def cmd_backup(args):
 
     # Always use temp directory for creation (atomic operation)
     tmpdir = None
-    if DRY_RUN:
+    if __dry_run__:
         outdir = Path("/tmp/dry-run") / intended_path.name
     else:
-        tmpdir = Path(tempfile.mkdtemp(prefix=f"{SCRIPT.stem}-"))
+        tmpdir = Path(tempfile.mkdtemp(prefix=f"{__script__.stem}-"))
         outdir = tmpdir / intended_path.name
         outdir.mkdir(parents=True, exist_ok=False)
 
-    print(f"Backup destination: {intended_path}\n")
+    printd(f"Backup destination: {intended_path}")
 
     try:
         # Create backup archives (returns final path with checksum subdirectory)
-        final_dir = backup(args, root_dir, outdir, config)
+        dst_dir = backup(args, root_dir, outdir, config)
 
-        if DRY_RUN:
-            print(f"[DRY-RUN] mv {final_dir} {intended_path / final_dir.name}")
+        if __dry_run__:
+            final_dst = intended_path / dst_dir.name
         elif dest_host:
             # Copy backup to remote host
-            remote_path = intended_path / final_dir.name
-            remote_backup(final_dir, dest_host, remote_path)
+            remote_path = intended_path / dst_dir.name
+            remote_backup(dst_dir, dest_host, remote_path)
         else:
             # Move backup to local destination
-            final_dest = intended_path / final_dir.name
+            final_dst = intended_path / dst_dir.name
 
             # Ensure parent directory exists
-            final_dest.parent.mkdir(parents=True, exist_ok=True)
+            final_dst.parent.mkdir(parents=True, exist_ok=True)
 
             # Check if destination already exists
-            if final_dest.exists():
-                print(f"Error: Backup directory {final_dest} already exists", file=sys.stderr)
+            if final_dst.exists():
+                printd(
+                    f"Error: Backup directory {final_dst} already exists",
+                    file=sys.stderr,
+                )
                 sys.exit(1)
 
             # Move from temp to final location
-            shutil.move(str(final_dir), str(final_dest))
-            print(f"\n✓ Backup saved to {final_dest}")
-
+            shutil.move(str(dst_dir), str(final_dst))
     finally:
         # Cleanup temp directory if we created one
         if tmpdir and tmpdir.exists():
             shutil.rmtree(tmpdir)
 
+    printd('\n', f"✓ Backup saved to {final_dst}")
+
 
 def cmd_restore(args):
     """Execute restore command (local or remote)."""
     root_dir = args.root
-    source_host = getattr(args, 'source', None)
-    dest_host = getattr(args, 'host', None)
+    source_host = getattr(args, "source", None)
+    dest_host = getattr(args, "host", None)
 
     if not args.dir:
-        print("Error: -b/--backup-path is required", file=sys.stderr)
+        printd("Error: -b/--backup-path is required", file=sys.stderr)
         sys.exit(1)
 
     # Combine date directory with checksum to get full backup path
@@ -1747,18 +1970,20 @@ def cmd_restore(args):
     if not args.checksum:
         date_dir = args.dir
         if not date_dir.exists():
-            print(f"Error: Backup directory {date_dir} does not exist", file=sys.stderr)
+            printd(
+                f"Error: Backup directory {date_dir} does not exist", file=sys.stderr
+            )
             sys.exit(1)
 
         subdirs = [d for d in date_dir.iterdir() if d.is_dir()]
         if not subdirs:
-            print(f"Error: No backup found in {date_dir}", file=sys.stderr)
+            printd(f"Error: No backup found in {date_dir}", file=sys.stderr)
             sys.exit(1)
 
         # Sort by modification time (most recent first)
         latest = max(subdirs, key=lambda d: d.stat().st_mtime)
         args.checksum = latest.name
-        print(f"Auto-selected latest backup: {args.checksum}")
+        printd(f"Auto-selected latest backup: {args.checksum}")
 
     backup_path = args.dir / args.checksum
 
@@ -1780,80 +2005,183 @@ def cmd_restore(args):
 
 
 def setup_parser():
+
     # Helper to add configuration to any parser
-    def add_snap_options(parser, dir_help):
-        group = parser.add_argument_group('configuration')
-        group.add_argument("-r", "--snap-root", metavar="<root>", type=Path, default=DEFAULT_ROOT_SNAP,
-                           dest='root', help=f"Root directory for backups, scripts, etc (default: {DEFAULT_ROOT_SNAP})")
-        group.add_argument("-b", "--backup-path", metavar='<dir>', type=Path, dest='dir', help=dir_help)
-        group.add_argument("-t", "--config-toml", metavar='<config>', dest='config_toml', help="Use custom TOML config file")
-        group.add_argument("--run-scripts", action="store_true", help="Run before/after scripts with default config")
+    def add_snap_options(parser, dir_help, skip_toml=False, skip_scripts=False):
+        group = parser.add_argument_group("configuration")
+        group.add_argument(
+            "-r",
+            "--snap-root",
+            metavar="<root>",
+            type=Path,
+            default=DEFAULT_ROOT_SNAP,
+            dest="root",
+            help=f"Root directory for backups, scripts, etc (default: {DEFAULT_ROOT_SNAP})",
+        )
+        group.add_argument(
+            "-b", "--backup-path", metavar="<dir>", type=Path, dest="dir", help=dir_help
+        )
+        if not skip_toml:
+            group.add_argument(
+                "-t",
+                "--config-toml",
+                metavar="<config>",
+                dest="config_toml",
+                help="Use custom TOML config file",
+            )
+        if not skip_scripts:
+            group.add_argument(
+                "--run-scripts",
+                action="store_true",
+                help="Run before/after scripts, if defined"
+            )
+
 
     # Helper to add CLI options to any parser
     def add_cli_options(parser):
-        group = parser.add_argument_group('cli options')
-        group.add_argument("--dry-run", action="store_true", help="Show what would be done without doing it")
-        group.add_argument("--verbose", action="store_true", help="Show detailed progress information")
-        group.add_argument('--help', action="help", help="Show this help message and exit")
+        group = parser.add_argument_group("cli options")
+        group.add_argument(
+            "--dry-run",
+            action="store_true",
+            help="Show what would be done without doing it",
+        )
+        group.add_argument(
+            "--verbose", action="store_true", help="Show detailed progress information"
+        )
+        group.add_argument(
+            "--help", action="help", help="Show this help message and exit"
+        )
+
+
+    # Backup subcommand parser
+    def add_backup_parser(subparsers, formatter):
+        subparser = subparsers.add_parser(
+            "backup", formatter_class=formatter, add_help=False,
+            help=f"Creates a backup (can send to remote)",
+        )
+        add_snap_options(
+            subparser, "Backup to a custom directory (checksum subdir will be created)"
+        )
+        subgroup = subparser.add_argument_group("backup options")
+        subgroup.add_argument(
+            "--host",
+            metavar="<host>",
+            help="Destination host to copy backup to (user@hostname)",
+        )
+        add_cli_options(subparser)
+
+
+    # Check subcommand parser
+    def add_check_parser(subparsers, formatter):
+        subparser = subparsers.add_parser(
+            "check", formatter_class=formatter, add_help=False,
+            help="Calculate and display file checksums",
+        )
+        subgroup = subparser.add_argument_group("checksum options")
+        subgroup.add_argument(
+            "-f",
+            "--file",
+            metavar="<file>",
+            action="append",
+            dest="files",
+            help="File to checksum (can be specified multiple times)",
+        )
+        add_cli_options(subparser)
+
+
+    # Restore subcommand parser
+    def add_restore_parser(subparsers, formatter):
+        subparser = subparsers.add_parser(
+            "restore", formatter_class=formatter, add_help=False,
+            help="Restore from a backup (local or remote)",
+        )
+        add_snap_options(
+            subparser,
+            "Date directory containing backup (e.g., <root>/backups/YYYY/MM-DD)",
+        )
+        subgroup = subparser.add_argument_group("restore options")
+        subgroup.add_argument(
+            "-c",
+            "--checksum",
+            metavar="<hash>",
+            help="Backup checksum prefix (auto-selects latest if omitted)",
+        )
+        subgroup.add_argument(
+            "-s",
+            "--source-host",
+            metavar="<host>",
+            dest="source",
+            help="Source host to pull backup from (user@hostname)",
+        )
+        subgroup.add_argument(
+            "-h",
+            "--restore-host",
+            metavar="<host>",
+            dest="host",
+            help="Destination host to restore on (user@hostname)",
+        )
+        subgroup.add_argument(
+            "--disable-backups",
+            action="store_true",
+            help="Disable intermediate backup of existing files (requires confirmation)",
+        )
+        add_cli_options(subparser)
+
 
     # Main parser: displays configuration at top level (snap.py --help)
     raw_formatter = argparse.RawDescriptionHelpFormatter
-    main_parser = argparse.ArgumentParser(
-        add_help=False, formatter_class=raw_formatter,
+    snap_parser = argparse.ArgumentParser(
+        add_help=False,
+        formatter_class=raw_formatter,
         description="Backup and restore utility for creating system snapshots",
     )
-    subparsers = main_parser.add_subparsers(dest="command", required=True, title='commands', metavar='')
+    subparsers = snap_parser.add_subparsers(
+        dest="command", required=True, title="commands", metavar=''
+    )
+    add_cli_options(snap_parser)
 
-    add_cli_options(main_parser)
+    # Add subparsers
+    add_backup_parser(subparsers, raw_formatter)
+    add_check_parser(subparsers, raw_formatter)
+    add_restore_parser(subparsers, raw_formatter)
 
-    # Backup subcommand
-    backup_parser = subparsers.add_parser("backup", formatter_class=raw_formatter, add_help=False,
-                                          help=f"Creates a backup (can send to remote)")
-    add_snap_options(backup_parser, "Backup to a custom directory (checksum subdir will be created)")
-
-    backup_group = backup_parser.add_argument_group('backup options')
-    backup_group.add_argument("--host", metavar="<host>", help="Destination host to copy backup to (user@hostname)")
-
-    add_cli_options(backup_parser)
-
-    # Restore subcommand
-    restore_parser = subparsers.add_parser("restore", formatter_class=raw_formatter,
-                                           add_help=False, help="Restore from a backup (local or remote)")
-    add_snap_options(restore_parser, "Date directory containing backup (e.g., <root>/backups/YYYY/MM-DD)")
-
-    restore_group = restore_parser.add_argument_group('restore options')
-    restore_group.add_argument("-c", "--checksum", metavar="<hash>", help="Backup checksum prefix (auto-selects latest if omitted)")
-    restore_group.add_argument("-s", "--source-host", metavar="<host>", dest='source', help="Source host to pull backup from (user@hostname)")
-    restore_group.add_argument("-h", "--restore-host", metavar="<host>", dest='host', help="Destination host to restore on (user@hostname)")
-    restore_group.add_argument("--disable-backups", action="store_true", help="Disable automatic backup of existing files (requires confirmation)")
-
-    add_cli_options(restore_parser)
-
-    return main_parser
+    return snap_parser
 
 
 def main():
-    global DRY_RUN, VERBOSE
+    global __dry_run__, __verbose__
 
     parser = setup_parser()
     args = parser.parse_args()
 
+    # Don't need to worry about DRY_RUN here.
+    if args.command == "check":
+        cmd_check(args)
+        return
+
     # Set global flags
-    DRY_RUN = getattr(args, 'dry_run', False)
-    VERBOSE = getattr(args, 'verbose', False)
+    __dry_run__ = getattr(args, "dry_run", False)
+    __verbose__ = getattr(args, "verbose", False)
 
     # Resolve root directory (checks PWD for .snap, then ~/.snap)
     args.root = resolve_root(args.root)
 
-    if DRY_RUN:
-        print("[DRY-RUN] No changes will be made\n")
-
     if args.command == "backup":
-        cmd_backup(args)
+        cmd_func = cmd_backup
+        message = "Starting backup!"
     elif args.command == "restore":
-        cmd_restore(args)
+        cmd_func = cmd_restore
+        message = "Starting restoration!"
+    else:
+        print(f"Error: unknown command {args.command}")
+        sys.exit(1)
 
+    if __dry_run__:
+        message += " (No changes will be made)"
+
+    printd(message, '\n')
+    cmd_func(args)
+    
 
 if __name__ == "__main__":
     main()
-
