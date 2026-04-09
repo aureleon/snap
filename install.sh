@@ -30,16 +30,21 @@ echo
 # Check and install prerequisites
 echo "Checking prerequisites..."
 
-# Check for macOS
-if [[ "$OSTYPE" != "darwin"* ]]; then
-    echo "Error: This script currently only supports macOS"
-    exit 1
-fi
+# Detect OS
+OS="$(uname -s)"
+case "$OS" in
+    Darwin) PLATFORM="macos" ;;
+    Linux)  PLATFORM="linux" ;;
+    *)
+        echo "Error: Unsupported operating system: $OS"
+        exit 1
+        ;;
+esac
 
-# Check Homebrew and Python - run bootstrap if missing
-if ! command -v brew &> /dev/null || ! command -v python3 &> /dev/null; then
-    echo "Error: Homebrew or Python not found"
-    echo "Please install manually or via alternative methods"
+# Check Python
+if ! command -v python3 &> /dev/null; then
+    echo "Error: Python 3 not found"
+    echo "Please install Python 3.11+ before running this script"
     exit 1
 fi
 
@@ -63,14 +68,46 @@ echo "Checking Python dependencies..."
 python3 -m pip install --user -r "$SCRIPT_DIR/requirements.txt"
 echo "✓ Python dependencies installed"
 
-# Check required command-line tools
-if [ ! -f "$SCRIPT_DIR/Brewfile" ]; then
-    echo "Error: Brewfile not found in $SCRIPT_DIR"
-    exit 1
+# Install system dependencies
+echo "Checking system dependencies..."
+if [ "$PLATFORM" = "macos" ]; then
+    if ! command -v brew &> /dev/null; then
+        echo "Error: Homebrew not found"
+        echo "Install from https://brew.sh or install rsync manually"
+        exit 1
+    fi
+    if [ ! -f "$SCRIPT_DIR/Brewfile" ]; then
+        echo "Error: Brewfile not found in $SCRIPT_DIR"
+        exit 1
+    fi
+    brew bundle install --file="$SCRIPT_DIR/Brewfile"
+else
+    if [ ! -f "$SCRIPT_DIR/packages.txt" ]; then
+        echo "Error: packages.txt not found in $SCRIPT_DIR"
+        exit 1
+    fi
+    while IFS= read -r pkg || [ -n "$pkg" ]; do
+        [ -z "$pkg" ] && continue
+        if ! command -v "$pkg" &> /dev/null; then
+            if command -v apt-get &> /dev/null; then
+                sudo apt-get update && sudo apt-get install -y "$pkg"
+            elif command -v dnf &> /dev/null; then
+                sudo dnf install -y "$pkg"
+            elif command -v yum &> /dev/null; then
+                sudo yum install -y "$pkg"
+            elif command -v pacman &> /dev/null; then
+                sudo pacman -S --noconfirm "$pkg"
+            elif command -v zypper &> /dev/null; then
+                sudo zypper install -y "$pkg"
+            else
+                echo "Error: $pkg not found and no supported package manager detected"
+                echo "Please install $pkg manually"
+                exit 1
+            fi
+        fi
+    done < "$SCRIPT_DIR/packages.txt"
 fi
-echo "Checking Homebrew dependencies..."
-brew bundle install --file="$SCRIPT_DIR/Brewfile"
-echo "✓ Homebrew dependencies installed"
+echo "✓ System dependencies installed"
 
 # Check if directory already exists
 if [ -d "$INSTALL_DIR" ]; then
