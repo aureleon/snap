@@ -1,0 +1,60 @@
+# Example migrate configuration
+# Copy to migrate.toml and customize for your needs
+#
+# Migrate captures on the source machine, then restores on the destination.
+# "before" scripts run on the source, "after" scripts run on the destination.
+
+[tarball]
+compress = "gzip"
+checksum = "sha256"
+rollback = ".bak"  # Extension for backing up existing files during restore
+
+#
+# Capture configuration ([capture.*])
+#
+[capture.scripts]
+# Run on SOURCE machine after capture
+after = [
+    "scripts/dump-database.sh",
+    "scripts/stop-services.sh",
+]
+
+# Application code and configuration
+[capture.tar.myapp]
+root = "/opt/myapp"
+link = "$HOME/myapp"  # Creates symlink: ~/myapp -> /opt/myapp
+dirs = ["bin", "lib", "config"]
+
+# System configuration
+[capture.tar.system]
+root = "/etc"
+dirs = ["nginx", "systemd/system"]
+files = ["hosts"]
+
+# User dotfiles
+[capture.tar.dotfiles]
+root = "$HOME"
+files = [
+    ".*rc",
+    ".bash_*",
+    ".gitconfig",
+]
+
+# SSH keys
+[capture.tar.ssh-keys]
+root = "$HOME"
+dirs = [".ssh"]
+
+#
+# Restore configuration ([restore.*])
+#
+[restore.scripts]
+# Run on DESTINATION machine before restore
+before = [
+    "scripts/fix-permissions.sh",
+    "scripts/start-services.sh",
+    "scripts/health-check.sh",
+]
+
+[restore.tar]
+archives = ["*"]

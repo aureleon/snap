@@ -1,10 +1,10 @@
 # snap.py
 
-Backup and restore utility for creating system snapshots.
+Snapshot and restore utility for creating system snapshots.
 
 ## Overview
 
-snap.py creates compressed tar archives of specified directories and files, bundles them into a single backup tarball with checksums, and can deploy/restore to local or remote machines via SSH.
+snap.py creates compressed tar archives of specified directories and files, bundles them into a snapshot with checksums, and can deploy/restore to local or remote machines via SSH.
 
 ## Requirements
 
@@ -38,7 +38,7 @@ The installer will:
 pip install -r requirements.txt
 
 # Create directory structure
-mkdir -p ~/.snap/{configs,scripts,backups}
+mkdir -p ~/.snap/{configs,scripts,captures}
 
 # Copy files
 cp snap.py ~/.snap/
@@ -64,16 +64,17 @@ The installer automatically updates the default root path in snap.py, so you won
 ~/.snap/                         # Default root directory
 ├── snap.py                      # The script
 ├── configs/                        # Configuration files
-│   ├── backup.toml                 # Backup configuration
+│   ├── capture.toml                 # Capture configuration
 │   ├── restore.toml                # Restore configuration
-│   └── deploy.toml                 # Deploy configuration
-├── backups/2024/01-15/             # Backup storage (backups/YYYY/MM-DD)
-│   └── a1b2c3d/                    # Checksum prefix (first 7 chars)
-│       ├── backup.tar              # Backup archive
-│       └── backup.tar.sha256       # Checksum file
+│   ├── deploy.toml                 # Deploy configuration
+│   └── migrate.toml                # Migrate configuration
+├── captures/2024/01-15/             # Snapshot storage (captures/YYYY/MM-DD)
+│   └── a1b2c3d/                     # Checksum prefix (first 7 chars)
+│       ├── category.tar.gz              # Compressed archive per category
+│       └── snapshot.toml                # Metadata with checksums
 └── scripts/                        # Optional scripts directory
-    ├── before-backup.sh
-    ├── after-backup.sh
+    ├── before-capture.sh
+    ├── after-capture.sh
     ├── before-restore.sh
     └── after-restore.sh
 ```
@@ -87,79 +88,103 @@ The script searches for the `.snap` directory in this order:
 
 You can override with `-m/--snap-root <path>`.
 
-The checksum subdirectory allows multiple backups per day and provides a unique identifier for each backup.
+The checksum subdirectory allows multiple snapshots per day and provides a unique identifier for each.
 
-To find your latest backup:
+To find your latest snapshot:
 ```bash
-ls -t ~/.snap/backups/*/*/  # List all backups
-ls ~/.snap/backups/2024/01-15/  # List checksums for specific date
-# Use the checksum directory name with -c flag
+ls -t ~/.snap/captures/*/*/  # List all snapshots
+ls ~/.snap/captures/2024/01-15/  # List checksums for specific date
+# Use the checksum directory name with the -c flag
 ```
 
 ## Usage
 
-### Create Local Backup
+### Create Local Snapshot
 
 ```bash
-./snap.py backup
+./snap.py capture
 ```
 
-Creates backup at `~/.snap/backups/YYYY/MM-DD/`
+Creates snapshot at `~/.snap/captures/YYYY/MM-DD/`
 
-### Create Backup and Send to Remote
+### Create Snapshot and Send to Remote
 
 ```bash
-./snap.py backup --host user@remote.host
+./snap.py capture --host user@remote.host
 ```
 
-### Restore from Local Backup
+### Restore from Local Snapshot
 
 ```bash
-./snap.py restore -b ~/.snap/backups/2024/01-15 -c a1b2c3d
+./snap.py restore -p ~/.snap/captures/2024/01-15 -c a1b2c3d
 ```
 
-### Pull Backup from Remote and Restore
+### Pull Snapshot from Remote and Restore
 
 ```bash
-./snap.py restore -b ~/.snap/backups/2024/01-15 -c a1b2c3d -s user@remote.host
+./snap.py restore -p ~/.snap/captures/2024/01-15 -c a1b2c3d -s user@remote.host
 ```
 
-### Deploy Backup to Remote Machine
+### Deploy Snapshot to Remote Machine
 
 ```bash
-./snap.py restore -b ~/.snap/backups/2024/01-15 -c a1b2c3d -h user@target.host
+./snap.py restore -p ~/.snap/captures/2024/01-15 -c a1b2c3d -h user@target.host
 ```
 
-### Deploy from One Remote to Another
+### Deploy From One Remote to Another
 
 ```bash
-./snap.py restore -b ~/.snap/backups/2024/01-15 -c a1b2c3d -s user@source.host -h user@target.host
+./snap.py restore -p ~/.snap/captures/2024/01-15 -c a1b2c3d -s user@source.host -h user@target.host
 ```
 
-### Restore Latest Backup (Auto-Select)
+### Restore Latest Snapshot (Auto-Select)
 
 ```bash
-# Automatically selects most recent backup in date directory
-./snap.py restore -b ~/.snap/backups/2024/01-15
+# Automatically selects most recent snapshot in date directory
+./snap.py restore -p ~/.snap/captures/2024/01-15
 ```
 
-### Run Scripts with Backup/Restore
+### Migrate Local to Remote
+
+```bash
+./snap.py migrate -h user@target.host
+```
+
+Captures locally, then restores on the target host.
+
+### Migrate Remote to Local
+
+```bash
+./snap.py migrate -s user@source.host
+```
+
+Captures on the source host, pulls the result, then restores locally.
+
+### Migrate Remote to Remote
+
+```bash
+./snap.py migrate -s user@source.host -h user@target.host
+```
+
+Captures on the source host, transfers to the target, then restores there.
+
+### Run Scripts with Capture/Restore
 
 ```bash
 # Run scripts with default config
-./snap.py backup --run-scripts
-./snap.py restore -b ~/.snap/backups/2024/01-15 -c a1b2c3d --run-scripts
+./snap.py capture --run-scripts
+./snap.py restore -p ~/.snap/captures/2024/01-15 -c a1b2c3d --run-scripts
 
 # Run scripts with custom config (--run-scripts is required)
-./snap.py backup --run-scripts -t production.toml
-./snap.py restore -b ~/.snap/backups/2024/01-15 -c a1b2c3d --run-scripts -t production-restore.toml
+./snap.py capture --run-scripts -t production.toml
+./snap.py restore -p ~/.snap/captures/2024/01-15 -c a1b2c3d --run-scripts -t production-restore.toml
 ```
 
 ## Configuration Files
 
-### backup.toml
+### capture.toml
 
-Defines what to backup. Each category becomes a separate archive.
+Defines what to capture. Each category becomes a separate archive.
 
 Supports glob patterns in `files` and `dirs` arrays.
 
@@ -229,9 +254,29 @@ before = ["scripts/stop-services.sh"]
 after = ["scripts/start-services.sh"]
 ```
 
+### migrate.toml
+
+Same structure as capture.toml. Defines what to capture from the source machine.
+The key difference is script execution: `before` scripts run on the source machine
+(before capture), and `after` scripts run on the destination machine (after restore).
+
+```toml
+[tar.ssh-keys]
+root = "$HOME"
+dirs = [".ssh"]
+
+[tar.dotfiles]
+root = "$HOME"
+files = [".*rc", ".gitconfig"]
+
+[scripts]
+before = ["scripts/dump-database.sh"]    # Runs on source
+after = ["scripts/fix-permissions.sh"]   # Runs on destination
+```
+
 ## Glob Patterns
 
-### In Backup Configuration (files/dirs)
+### In Capture Configuration (files/dirs)
 
 Use glob patterns in `files` and `dirs` to match multiple paths:
 
@@ -278,7 +323,7 @@ archives = []                    # Skip archive restoration (scripts only)
 
 ```
 -m, --snap-root <root>       Root directory (default: ~/.snap)
--b, --backup-path <dir>      Backup directory path
+-p, --capture-path <dir>      Snapshot directory path
 --run-scripts                Enable script execution (required to run scripts)
 -t, --config-toml <config>   Specify custom TOML config (used with --run-scripts)
 --dry-run                    Show what would be done without doing it
@@ -286,38 +331,38 @@ archives = []                    # Skip archive restoration (scripts only)
 --help                       Show help message and exit
 ```
 
-### Backup Options
+### Capture Options
 
 ```
---host <host>                Destination host to copy backup to (user@hostname)
+--host <host>                Destination host to copy snapshot to (user@hostname)
 ```
 
 ### Restore Options
 
 ```
--c, --checksum <hash>        Backup checksum prefix (first 7+ chars, auto-selects latest if omitted)
+-c, --checksum <hash>        Snapshot checksum prefix (first 7+ chars, auto-selects latest if omitted)
 -s, --source-host <host>     Source host to pull from (user@hostname)
 -h, --restore-host <host>    Destination host to restore on (user@hostname)
 ```
 
-### Backup Options
+### Capture Options
 
 ```
---host <host>                Send backup to remote host (user@hostname)
+--host <host>                Send snapshot to remote host (user@hostname)
 ```
 
 ### Restore Options
 
 ```
---source <host>              Pull backup from remote host
---host <host>                Deploy backup to remote host
+--source <host>              Pull snapshot from remote host
+--host <host>                Deploy snapshot to remote host
 ```
 
 ## Example Scripts
 
-Scripts run in the backup directory with sudo privileges (on remote if applicable). Place scripts in the `scripts/` directory.
+Scripts run in the capture directory with sudo privileges (on remote if applicable). Place scripts in the `scripts/` directory.
 
-### Backup Scripts
+### Capture Scripts
 
 #### scripts/dump-database.sh
 
@@ -510,7 +555,7 @@ log() {
     echo "[$(date +'%Y-%m-%d %H:%M:%S')] $*"
 }
 
-log "Starting backup process..."
+log "Starting capture process..."
 ```
 
 #### Idempotency
@@ -530,25 +575,25 @@ systemctl enable myapp
 
 ## How It Works
 
-### Backup Process
+### Capture Process
 
-1. Reads backup.toml configuration
+1. Reads capture.toml configuration
 2. For each category, creates compressed tar archive (category.tar.gz)
-3. Bundles all archives into single backup.tar
+3. Bundles all archives into single snapshot archive
 4. Generates SHA-256 checksum
 5. Optionally runs after-scripts
-6. Optionally copies to remote host
+6. Optionally sends to remote host
 
 Archives store relative paths (leading / stripped) for portability.
 
 ### Restore Process
 
-1. Copies backup.tar and checksum from source (local or remote)
+1. Copies snapshot archive and checksum from source (local or remote)
 2. Verifies checksum integrity
 3. Re-executes with sudo if needed
 4. Loads restore configuration
 5. Optionally runs before-scripts
-6. Extracts backup.tar to temporary directory
+6. Extracts snapshot archive to temporary directory
 7. For each selected archive:
    - Shows destination paths
    - Prompts for confirmation
@@ -557,7 +602,7 @@ Archives store relative paths (leading / stripped) for portability.
 
 ### Deploy Process
 
-1. Copies backup files, snap.py, config, and scripts to remote
+1. Copies snapshot files, snap.py, config, and scripts to remote
 2. Runs before-scripts on remote
 3. Executes restore on remote via SSH
 4. Runs after-scripts on remote
@@ -579,14 +624,14 @@ Archives store relative paths (leading / stripped) for portability.
 Preview operations without making changes:
 
 ```bash
-# Preview backup creation
-./snap.py backup -n
+# Preview snapshot creation
+./snap.py capture -n
 
 # Preview restore
-./snap.py restore -b ~/.snap/backups/2024/01-15 -c a1b2c3d -n
+./snap.py restore -p ~/.snap/captures/2024/01-15 -c a1b2c3d -n
 
 # Preview deployment
-./snap.py restore -b ~/.snap/backups/2024/01-15 -c a1b2c3d -h user@remote -n
+./snap.py restore -p ~/.snap/captures/2024/01-15 -c a1b2c3d -h user@remote -n
 ```
 
 Dry-run mode shows:
@@ -603,49 +648,49 @@ No actual operations are performed.
 Show detailed progress information:
 
 ```bash
-# Verbose backup (shows each file added to archives)
-./snap.py backup -v
+# Verbose capture (shows each file added to archives)
+./snap.py capture -v
 
 # Verbose restore (shows rsync progress, extraction details)
-./snap.py restore -b ~/.snap/backups/2024/01-15 -c a1b2c3d -v
+./snap.py restore -p ~/.snap/captures/2024/01-15 -c a1b2c3d -v
 ```
 
 Verbose mode shows:
-- Each file added to archives during backup
+- Each file added to archives during capture
 - rsync transfer progress with bandwidth and ETA
 - Individual files being extracted during restore
 
 Combine with dry-run to see exactly what would happen:
 
 ```bash
-./snap.py backup -nv
+./snap.py capture -nv
 ```
 
 ## Tips
 
-### Custom Backup Location
+### Custom Snapshot Location
 
 ```bash
-# Creates /mnt/external/backup-2024-01-15/CHECKSUM/
-./snap.py backup -b /mnt/external/backup-2024-01-15
+# Creates /mnt/external/snapshot-2024-01-15/CHECKSUM/
+./snap.py capture -p /mnt/external/snapshot-2024-01-15
 ```
 
 ### Using Different Configs
 
 ```bash
-./snap.py backup --run-scripts -t production.toml
-./snap.py restore -b ~/.snap/backups/2024/01-15 -c a1b2c3d --run-scripts -t production-restore.toml
+./snap.py capture --run-scripts -t production.toml
+./snap.py restore -p ~/.snap/captures/2024/01-15 -c a1b2c3d --run-scripts -t production-restore.toml
 ```
 
 ### Finding the Checksum
 
-After creating a backup, the checksum directory is shown in the output:
+After creating a snapshot, the checksum directory is shown in the output:
 ```bash
-./snap.py backup
-# Output: ✓ Backup complete: /Users/you/.snap/backups/2024/01-15/a1b2c3d
+./snap.py capture
+# Output: ✓ Snapshot complete: /Users/you/.snap/captures/2024/01-15/a1b2c3d
 
 # Use the checksum (a1b2c3d) with -c flag:
-./snap.py restore -b ~/.snap/backups/2024/01-15 -c a1b2c3d
+./snap.py restore -p ~/.snap/captures/2024/01-15 -c a1b2c3d
 ```
 
 ### Testing Before Executing
@@ -653,45 +698,45 @@ After creating a backup, the checksum directory is shown in the output:
 Use dry-run mode to preview operations:
 
 ```bash
-# Test backup creation
-./snap.py backup -n
+# Test snapshot creation
+./snap.py capture -n
 
 # Test restore
-./snap.py restore -b ~/.snap/backups/2024/01-15 -c a1b2c3d -n
+./snap.py restore -p ~/.snap/captures/2024/01-15 -c a1b2c3d -n
 
 # Test deployment to remote
-./snap.py restore -b ~/.snap/backups/2024/01-15 -c a1b2c3d -h user@remote -n
+./snap.py restore -p ~/.snap/captures/2024/01-15 -c a1b2c3d -h user@remote -n
 ```
 
 Or manually verify archives:
 
-1. Extract backup.tar manually
+1. Extract snapshot archive manually
 2. Extract individual archives to temporary location
 3. Verify contents before actual restore
 
-### Backup Rotation
+### Snapshot Rotation
 
 ```bash
-# Keep only last 7 date directories (may contain multiple backups each)
-cd ~/.snap/backups
+# Keep only last 7 date directories (may contain multiple snapshots each)
+cd ~/.snap/captures
 ls -t | tail -n +8 | xargs rm -rf
 
-# Keep only one backup per date (remove older checksums)
-for date in ~/.snap/backups/*/*/; do
+# Keep only one snapshot per date (remove older checksums)
+for date in ~/.snap/captures/*/*/; do
   cd "$date"
   ls -t | tail -n +2 | xargs rm -rf
 done
 ```
 
-### Incremental Backups
+### Incremental Snapshots
 
-Not supported. Each backup is full snapshot. Use rsync or other tools for incremental backups.
+Not supported. Each snapshot is a full capture. Use rsync or other tools for incremental operations.
 
 ## Troubleshooting
 
 ### "Checksum verification failed"
 
-Archive corrupted during transfer or storage. Re-create backup.
+Archive corrupted during transfer or storage. Re-create snapshot.
 
 ### "Command timed out"
 
@@ -699,7 +744,7 @@ Increase timeout constants in snap.py or check network connectivity.
 
 ### Archives not extracting to expected location
 
-Ensure backup was created with snap.py (relative paths). Archives from other tools may have different path structure.
+Ensure snapshot was created with snap.py (relative paths). Archives from other tools may have different path structure.
 
 ### Permission denied during restore
 
@@ -715,9 +760,9 @@ Verify:
 
 ## Examples
 
-### Backup SSH Keys and Dotfiles
+### Capture SSH Keys and Dotfiles
 
-backup.toml:
+capture.toml:
 ```toml
 [tar.ssh]
 root = "$HOME"
@@ -729,12 +774,12 @@ files = [".*rc", ".vim*", ".gitconfig"]  # Uses glob patterns
 ```
 
 ```bash
-./snap.py backup
+./snap.py capture
 ```
 
-### Backup All Configuration Directories
+### Capture All Configuration Directories
 
-backup.toml:
+capture.toml:
 ```toml
 [tar.config]
 root = "$HOME"
@@ -746,7 +791,7 @@ dirs = [".local/share/*"]  # All subdirectories in .local/share
 ```
 
 ```bash
-./snap.py backup
+./snap.py capture
 ```
 
 ### Selective Restore
@@ -758,7 +803,7 @@ archives = ["ssh"]  # Only restore SSH keys
 ```
 
 ```bash
-./snap.py restore -b ~/.snap/backups/2024/01-15 -c a1b2c3d
+./snap.py restore -p ~/.snap/captures/2024/01-15 -c a1b2c3d
 ```
 
 ### Application Deployment
@@ -774,12 +819,12 @@ after = ["scripts/start-app.sh", "scripts/reload-nginx.sh"]
 ```
 
 ```bash
-./snap.py restore -b ~/.snap/backups/2024/01-15 -c a1b2c3d -h user@production.server
+./snap.py restore -p ~/.snap/captures/2024/01-15 -c a1b2c3d -h user@production.server
 ```
 
 ### Database Migration
 
-backup.toml:
+migrate.toml:
 ```toml
 [tar.database]
 root = "/var/lib"
@@ -802,9 +847,9 @@ after = ["scripts/fix-permissions.sh", "scripts/start-postgres.sh"]
 
 ## Limitations
 
-- No incremental backups (always full snapshot)
-- No encryption (use encrypted filesystem or encrypt backup.tar separately)
-- No compression of final backup.tar (individual archives are gzipped)
+- No incremental snapshots (always full capture)
+- No encryption (use encrypted filesystem or encrypt snapshot archive separately)
+- No compression of final snapshot archive (individual archives are gzipped)
 - Remote operations require SSH and rsync
 
 ## License

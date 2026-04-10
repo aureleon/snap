@@ -2,7 +2,7 @@
 # Copy this to restore.toml and customize for your needs
 
 [tar]
-# Unarchive selected tarballs specified in backup.toml:
+# Select which archives to restore (names from capture.toml):
 #
 # Skip restore entirely:
 # archives = []

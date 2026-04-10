@@ -16,28 +16,28 @@ This document captures the established patterns and conventions in snap.py to ma
 
 ### 3. **Functional Organization**
 - Related functions grouped with `# --- Section Name --- #` headers
-- Sections: Subprocess Runners, Snap Configuration, Archive Handlers, Checksum Handlers, Backup Logic, Restore Logic, Main Execution
+- Sections: Subprocess Runners, Snap Configuration, Archive Handlers, Checksum Handlers, Capture Logic, Restore Logic, Main Execution
 
 ## Naming Conventions
 
 ### Functions
 - **Pattern**: `verb_noun` or `noun_verb`
   - `archive_create`, `archive_extract`, `archive_select`
-  - `run_scripts`, `load_config`, `verify_backup`
-  - `remote_backup`, `remote_restore`, `remote_deploy`
+  - `run_scripts`, `load_config`, `verify_capture`
+  - `remote_capture`, `remote_restore`, `remote_deploy`
   - `create_symlinks`, `restore_category`
-- **Helpers**: `calculate_checksum`, `generate_tarball_toml`, `archive_entries`, `archive_category`, `expand_path`
-- **Commands**: `cmd_backup`, `cmd_restore` (entry points from CLI)
+- **Helpers**: `calculate_checksum`, `generate_snapshot_toml`, `archive_entries`, `archive_category`, `expand_path`
+- **Commands**: `cmd_capture`, `cmd_restore`, `cmd_migrate` (entry points from CLI)
 
 ### Variables
 - **Constants**: `UPPER_SNAKE_CASE`
   - `COMPRESS_MAP`, `SSH_CONNECT_TIMEOUT`, `MIN_RSYNC_TIMEOUT`
 - **Locals**: `snake_case`
-  - `backup_dir`, `root_dir`, `tarball`, `dest_host`
+  - `capture_dir`, `root_dir`, `tarball`, `dest_host`
 - **Temp vars**: Short names OK in small scopes (`tar`, `f`, `e`)
 
 ### Parameters
-- Descriptive names: `backup_dir`, `dest_host`, `config_name`
+- Descriptive names: `capture_dir`, `dest_host`, `config_name`
 - Avoid abbreviations except standard ones: `chkfile`, `tmpdir`
 
 ## Code Style
@@ -62,7 +62,7 @@ This document captures the established patterns and conventions in snap.py to ma
       result = default_value
   ```
 - **Whitespace**: Use blank lines to separate logical sections within functions
-- **Variable names**: Descriptive over short - `backup_directory` not `bkp_dir`
+- **Variable names**: Descriptive over short - `capture_directory` not `cap_dir`
 
 ### 1. **No Type Hints**
 - Target: Python 3.11+
@@ -128,7 +128,7 @@ def function_name(arg1, arg2):
 - Show relevant context: file sizes, timeouts, working directories
 - Return mock/placeholder values when needed
 - Dedicated dry-run functions for complex cases: `dry_run_create_archive`
-- File listings in backup dry-run only shown in `--verbose` mode
+- File listings in capture dry-run only shown in `--verbose` mode
 
 ## Progress Bar Helper
 
@@ -187,7 +187,7 @@ def dtqdm(total, desc="", unit="item", **kwargs):
   - `extract_archives` "Extraction progress" (with `autorefresh=True`)
   - `rsync_parallel` "Transfer progress" (with `autorefresh=True`)
 - **Nested/sequential bars**: `leave=False` - show during operation, clear when done
-  - `calculate_checksum` (nested under backup) - uses byte format with custom bar_format
+  - `calculate_checksum` (nested under capture) - uses byte format with custom bar_format
 - **No progress bars in parallel workers**: `archive_create` and `archive_extract` don't show individual bars when running in parallel to avoid terminal corruption and empty lines
 
 **Custom bar format**: Use `bar_format='{desc}: {n}/{total} [{elapsed}, {rate_fmt}]'` to remove visual progress bar while keeping timing info. Add `autorefresh=True` for operations where individual items may take a long time.
@@ -313,16 +313,16 @@ if hasattr(os, 'geteuid') and os.geteuid() != 0:
 ## Configuration Handling
 
 ### TOML Structure
-**backup.toml** (input config for creating backups):
-- `[tarball]`: `compress`, `checksum`, `backups` (backup extension)
+**capture.toml** (input config for creating snapshots):
+- `[tarball]`: `compress`, `checksum`, `backups` (rollback extension)
 - `[tar.category]`: `root` (required), `link` (optional), `dirs`, `files`
 - `[scripts]`: `before`, `after`
 
-**tarball.toml** (generated metadata for each backup):
+**snapshot.toml** (generated metadata for each snapshot):
 - `[tarball]`: `compress`, `checksum`, `backups`
 - `[tar.category]`: `root`, `link` (if set), `checksum` (array of chunks)
 
-**Validation**: Separate `verify_backup_config`, `verify_restore_config`
+**Validation**: Separate `verify_capture_config`, `verify_restore_config`
 **Loading**: `load_config` with proper error messages
 
 ### Path Resolution
@@ -340,8 +340,8 @@ root_path = Path(os.path.expandvars(root)).expanduser()
 ## CLI Design
 
 ### Argparse Structure
-- Main parser with subcommands (`backup`, `restore`)
-- Argument groups: `configuration`, `backup options`, `restore options`, `cli options`
+- Main parser with subcommands (`capture`, `restore`, `migrate`)
+- Argument groups: `configuration`, `capture options`, `restore options`, `cli options`
 - No `-h` short option (used for `--restore-host`)
 - `--help` explicitly added to show help
 - Restore options: `--disable-backups` (backups are on by default)
@@ -351,21 +351,21 @@ root_path = Path(os.path.expandvars(root)).expanduser()
 main() → setup_parser() → args parsed
   → Set global flags
   → Resolve root directory
-  → cmd_backup() or cmd_restore()
+  → cmd_capture() or cmd_restore() or cmd_migrate()
 ```
 
 ## File Organization Conventions
 
-### Backup Structure
+### Capture Structure
 ```
-~/.snap/backups/YYYY/MM-DD/CHECKSUM/
+~/.snap/captures/YYYY/MM-DD/CHECKSUM/
     category1.tar.gz     # Individual compressed archives
     category2.tar.gz
     categoryN.tar.gz
-    tarball.toml         # Metadata with per-archive checksums
+    snapshot.toml        # Metadata with per-archive checksums
 ```
-- `CHECKSUM`: First 7 chars of tarball.toml SHA-256 hash
-- tarball.toml contains checksums for each individual archive
+- `CHECKSUM`: First 7 chars of snapshot.toml SHA-256 hash
+- snapshot.toml contains checksums for each individual archive
 
 ### Temp Directory Pattern
 ```python
@@ -403,15 +403,15 @@ COMPRESS_MAP = {
       # Read archive - handles any compression type
   ```
 - **Never guess** compression type - always read from config
-- Flow: `backup.toml` → `tarball.toml` → all restore functions
-- Glob specific type only: `backup_dir.glob(f"*{ext}")` not `*.tar.*`
+- Flow: `capture.toml` → `snapshot.toml` → all restore functions
+- Glob specific type only: `capture_dir.glob(f"*{ext}")` not `*.tar.*`
 
 ## Restore Flow
 
 ### Transactional Restore with Rollback (Default)
-When `backups` extension is specified in tarball.toml (e.g., `.bak`):
+When `backups` extension is specified in snapshot.toml (e.g., `.bak`):
 1. Load `tarball_config` from `verify_archives_from_toml()`
-2. Build `root_map`: `{category: root}` from tarball.toml
+2. Build `root_map`: `{category: root}` from snapshot.toml
 3. For each category, call `restore_category(archive, root, backup_ext, compress)`:
    - **Per-entry interleaving**: backup → remove → extract → next entry
    - **Backup**: `shutil.copytree()` (dirs) or `shutil.copy2()` (files) to `{root}.bak`
@@ -427,7 +427,7 @@ When `backups` extension is specified in tarball.toml (e.g., `.bak`):
 - No backup copies, no rollback protection
 - Still creates symlinks if `link` fields present
 
-### If no backups extension in tarball.toml
+### If no backups extension in snapshot.toml
 - Warning printed, falls back to interactive confirmation mode
 - Same behavior as `--disable-backups`
 
@@ -445,7 +445,7 @@ Passed through: `restore()` → `restore_category()` (transactional) or `extract
 ## Symlink Pattern
 
 ### Configuration
-In `[tar.category]` section of backup.toml:
+In `[tar.category]` section of capture.toml:
 ```toml
 [tar.workplace]
 root = "/Volumes/workplace"
@@ -454,7 +454,7 @@ dirs = ["projects", "repos"]
 ```
 
 ### Behavior
-- `link` propagated to tarball.toml during backup
+- `link` propagated to snapshot.toml during capture
 - During restore, `create_symlinks()` creates: `$HOME/workplace` → `/Volumes/workplace`
 - Skips if symlink exists and points to correct target
 - Errors if path exists but isn't a symlink or points elsewhere
@@ -465,7 +465,7 @@ dirs = ["projects", "repos"]
 
 ### Dry-Run Mode
 - Test all operations without side effects
-- Must work for: backup, restore, deploy
+- Must work for: capture, restore, deploy, migrate
 - Shows what would happen with `[DRY-RUN]` prefix
 
 ### Verbose Mode

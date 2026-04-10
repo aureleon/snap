@@ -125,10 +125,10 @@ echo "Creating directory structure..."
 mkdir -p "$INSTALL_DIR"
 mkdir -p "$INSTALL_DIR/configs"
 mkdir -p "$INSTALL_DIR/scripts"
-mkdir -p "$INSTALL_DIR/backups"
+mkdir -p "$INSTALL_DIR/captures"
 
-# Symlink to make backups accessible as ~/Backups 
-ln -sf "$INSTALL_DIR/backups" "$HOME/Backups" 
+# Symlink to make captures accessible as ~/Snapshots
+ln -sf "$INSTALL_DIR/captures" "$HOME/Snapshots" 
 
 # Copy configuration files
 echo "Installing configuration files..."
@@ -199,7 +199,7 @@ echo "Installation complete!"
 echo
 echo "Next steps:"
 echo "  1. Review and customize configs in: $INSTALL_DIR/configs/"
-echo "  2. Create your first backup: snap backup"
+echo "  2. Create your first snapshot: snap capture"
 echo "  3. For help: snap --help"
 echo
 

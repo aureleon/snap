@@ -1,37 +1,14 @@
 #!/bin/bash
 # Restore Homebrew packages from backup
-# This script expects to run with the backup directory as PWD
+# This script expects to run from the backup directory
 
 set -euo pipefail
 
-FORMULAE_FILE="brew-formulae.txt"
-CASKS_FILE="brew-casks.txt"
+BREWFILE="$PWD/Brewfile"
 
-# Install Homebrew if not present
-if ! command -v brew &>/dev/null; then
-    echo "Installing Homebrew..."
-    /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-fi
+echo "Restoring Homebrew packages ..."
 
-echo "Restoring Homebrew packages from $PWD..."
-
-# Install casks
-if [[ -f "$CASKS_FILE" ]]; then
-    while IFS= read -r cask; do
-        [[ -z "$cask" ]] && continue
-        echo "  Installing cask: $cask"
-        brew install --cask "$cask" || true
-    done < "$CASKS_FILE"
-fi
-
-# Install formulae
-if [[ -f "$FORMULAE_FILE" ]]; then
-    while IFS= read -r formula; do
-        [[ -z "$formula" ]] && continue
-        echo "  Installing formula: $formula"
-        brew install "$formula" || true
-    done < "$FORMULAE_FILE"
-fi
+brew bundle --file="$BREWFILE"
 
 # Remove quarantine attributes on macOS
 if [[ "$(uname)" == "Darwin" ]] && [[ -d /opt/homebrew/bin ]]; then
@@ -39,3 +16,4 @@ if [[ "$(uname)" == "Darwin" ]] && [[ -d /opt/homebrew/bin ]]; then
 fi
 
 echo "✓ Homebrew packages restored"
+

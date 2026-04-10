@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Backup and restore utility for creating system snapshots.
+Snapshot and restore utility.
 """
 
 __version__ = "0.1"
@@ -138,7 +138,7 @@ def rsync_run(source, dest, check=True):
     Returns tuple: (returncode, stdout, stderr)
     """
     # Simple timeout calculation for archives and small files
-    # We transfer: .tar.gz archives, tarball.toml, snap.py, configs, scripts
+    # We transfer: .tar.gz archives, snapshot TOML, snap.py, configs, scripts
     timeout = MIN_RSYNC_TIMEOUT
 
     # Get file size if local for better timeout estimate
@@ -316,7 +316,7 @@ def run_scripts(root_dir, config, when, working_dir, remote_host=None, remote_di
         root_dir: Root directory containing configs and scripts
         config: Loaded config dict
         when: "before" or "after"
-        working_dir: Directory to cd into before running scripts (backup directory)
+        working_dir: Directory to cd into before running scripts (capture directory)
         remote_host: If set, run on remote host
         remote_dir: Remote directory (when remote_host is set)
     """
@@ -347,7 +347,7 @@ def run_scripts(root_dir, config, when, working_dir, remote_host=None, remote_di
         script_name = script_path.name
 
         if remote_host:
-            # Run on remote with sudo, in the remote backup directory
+            # Run on remote with sudo, in the remote capture directory
             # Use proper shell escaping
             escaped_dir = shlex.quote(remote_dir)
             escaped_script = shlex.quote(script_name)
@@ -363,7 +363,7 @@ def run_scripts(root_dir, config, when, working_dir, remote_host=None, remote_di
             if stderr:
                 printd(stderr, end='', file=sys.stderr)
         else:
-            # Run locally in the backup directory
+            # Run locally in the capture directory
             script_cmd = ["bash", str(script_path)]
             if __dry_run__:
                 printd(f"{shlex.join(script_cmd)}")
@@ -402,13 +402,12 @@ def run_scripts(root_dir, config, when, working_dir, remote_host=None, remote_di
 
 DEFAULT_ROOT_SNAP = "~/.snap"
 
-DEFAULT_CONFIG_BACKUP = "configs/backup.toml"
+DEFAULT_CONFIG_CAPTURE = "configs/capture.toml"
 DEFAULT_CONFIG_RESTORE = "configs/restore.toml"
 DEFAULT_CONFIG_DEPLOY = "configs/deploy.toml"
 DEFAULT_CONFIG_MIGRATE = "configs/migrate.toml"
 
-DEFAULT_TARBALL_TOML = "tarball.toml"
-
+DEFAULT_SNAPSHOT_TOML = "snapshot.toml"
 
 def expand_path(path_str):
     """Expand environment variables and user home in a path string."""
@@ -469,8 +468,8 @@ def load_config(root_dir, config_name):
         sys.exit(1)
 
 
-def verify_backup_config(config, config_name):
-    """Verify backup configuration structure."""
+def verify_capture_config(config, config_name):
+    """Verify capture configuration structure."""
     if "tar" not in config:
         printd(f"Error: {config_name} missing required [tar] section", file=sys.stderr)
         sys.exit(1)
@@ -508,13 +507,13 @@ def verify_backup_config(config, config_name):
 
 def verify_restore_config(config, config_name):
     """Verify restore/deploy configuration structure."""
-    if "tarball" not in config:
+    if "tar" not in config:
         printd(
-            f"Error: {config_name} missing required [tarball] section", file=sys.stderr
+            f"Error: {config_name} missing required [tar] section", file=sys.stderr
         )
         sys.exit(1)
 
-    tar_config = config["tarball"]
+    tar_config = config["tar"]
     if not isinstance(tar_config, dict):
         printd(f"Error: {config_name} [tar] section must be a table", file=sys.stderr)
         sys.exit(1)
@@ -535,24 +534,24 @@ def verify_restore_config(config, config_name):
         sys.exit(1)
 
 
-def verify_backup(backup_dir, require_checksum=False):
-    """Validate that a backup directory contains required files."""
-    if not backup_dir.exists():
-        printd(f"Error: Backup directory {backup_dir} does not exist", file=sys.stderr)
+def verify_capture(capture_dir, require_checksum=False):
+    """Validate that a capture directory contains required files."""
+    if not capture_dir.exists():
+        printd(f"Error: Snapshot directory {capture_dir} does not exist", file=sys.stderr)
         sys.exit(1)
 
-    toml_path = backup_dir / DEFAULT_TARBALL_TOML
+    toml_path = capture_dir / DEFAULT_SNAPSHOT_TOML
     if not toml_path.exists():
         printd(
-            f"Error: {DEFAULT_TARBALL_TOML} not found in {backup_dir}", file=sys.stderr
+            f"Error: {DEFAULT_SNAPSHOT_TOML} not found in {capture_dir}", file=sys.stderr
         )
         sys.exit(1)
 
-    # Load compression type from tarball.toml
+    # Load compression type from snapshot TOML
     with open(toml_path, "rb") as f:
-        tarball_config = tomllib.load(f)
+        snapshot_config = tomllib.load(f)
 
-    compress_type = tarball_config.get("tarball", {}).get("compress", "gzip")
+    compress_type = snapshot_config.get("tarball", {}).get("compress", "gzip")
     if compress_type not in COMPRESS_MAP:
         printd(f"Error: Unsupported compression type: {compress_type}", file=sys.stderr)
         sys.exit(1)
@@ -560,9 +559,9 @@ def verify_backup(backup_dir, require_checksum=False):
     ext, _ = COMPRESS_MAP[compress_type]
 
     # Check that at least one tar archive exists
-    archives = list(backup_dir.glob(f"*{ext}"))
+    archives = list(capture_dir.glob(f"*{ext}"))
     if not archives:
-        printd(f"Error: No tar archives found in {backup_dir}", file=sys.stderr)
+        printd(f"Error: No tar archives found in {capture_dir}", file=sys.stderr)
         sys.exit(1)
 
     return toml_path
@@ -579,11 +578,10 @@ COMPRESS_MAP = {
     '': (".tar", "w"),
 }
 
-
-def archive_check_paths(paths, truthy, falsey, cond):
+def archive_classify(paths, truthy, falsey, cond):
     """
-    Formats `paths` into two lists of text, one 'truthy' to stdout, other
-    'falsey' to stderr, decided based on lambda `cond` for each path.
+    Formats `paths` into two lists of text, 'truthy' and 'falsey', 
+    decided based on lambda `cond(path)` for each path in `paths`.
     """
     groups = {truthy: [], falsey: []}
     for path in paths:
@@ -646,7 +644,7 @@ def archive_expand(patterns, root_path):
 
 
 def archive_create(name, root, paths, outdir, compress="gzip"):
-    """Create a compressed tar archive for a backup category."""
+    """Create a compressed tar archive for a category."""
     if compress not in COMPRESS_MAP:
         printd(f"Error: Unsupported compression type: {compress}", file=sys.stderr)
         sys.exit(1)
@@ -660,7 +658,7 @@ def archive_create(name, root, paths, outdir, compress="gzip"):
     expanded_paths, expand_warnings = archive_expand(paths, root_path)
 
     lines = [f"  {archive_path.name} (root: '{root_path}')"]
-    includes, warnings = archive_check_paths(
+    includes, warnings = archive_classify(
         expanded_paths, 'include', 'skipping',
         cond=lambda path: (root_path / path).exists()
     )
@@ -727,10 +725,10 @@ def create_archives(tasks, compress="gzip"):
     return results
 
 
-def generate_tarball_toml(
-    outdir, tasks, compress="gzip", category_meta=None, backups_ext=None
+def generate_snapshot_toml(
+    outdir, tasks, compress="gzip", category_meta=None, roll_ext=None
 ):
-    """Generate tarball.toml with checksums for all archives."""
+    """Generate snapshot TOML with checksums for all archives."""
     if category_meta is None:
         category_meta = {}
 
@@ -741,7 +739,7 @@ def generate_tarball_toml(
 
     ext, _ = COMPRESS_MAP[compress]
 
-    toml_path = outdir / DEFAULT_TARBALL_TOML
+    toml_path = outdir / DEFAULT_SNAPSHOT_TOML
     printd(f"  writing {toml_path.name}")
     printd(f"    added tarball options")
 
@@ -769,11 +767,11 @@ def generate_tarball_toml(
     printd()
 
     # Generate TOML content
-    toml_lines = ["#", "# Backup Configuration TOML", "#", "[tarball]"]
-    if backups_ext:
-        toml_lines += [f'backups = "{backups_ext}"  # backup path extension']
+    toml_lines = ["#", "# Capture Configuration TOML", "#", "[tarball]"]
     if compress != "gzip":
         toml_lines += [f'compress = "{compress}"  # tar compression type']
+    if roll_ext:
+        toml_lines += [f'rollback = "{roll_ext}"  # rollback intermediate extension']
     toml_lines += ['checksum = "sha256"  # checksum digest type']
     toml_lines += ['']
 
@@ -968,10 +966,10 @@ def archive_extract(archive, compress="gzip", root=None):
         return False
 
 
-def restore_category(archive, root, backup_ext, compress="gzip"):
+def restore_category(archive, root, roll_ext, compress="gzip"):
     """Transactionally restore a single category with rollback on failure.
 
-    Interleaves backup and restore per-entry:
+    Interleaves rollback and restore per-entry:
     1. Backs up existing entry (copy, not move)
     2. Removes original
     3. Extracts new entry from archive
@@ -984,7 +982,7 @@ def restore_category(archive, root, backup_ext, compress="gzip"):
         return False
 
     root_path = expand_path(root)
-    backup_dir = Path(str(root_path) + backup_ext)
+    rollbackd = Path(str(root_path) + roll_ext)
 
     # Always open archive and classify entries
     with tarfile.open(archive, "r:*") as tar:
@@ -992,30 +990,30 @@ def restore_category(archive, root, backup_ext, compress="gzip"):
         all_members = tar.getmembers()
 
     # Classify entries: replace (existing) vs extract (new)
-    replaces, extracts = archive_check_paths(
+    replaces, extracts = archive_classify(
         entries, 'replace', 'extract',
         cond=lambda entry: (root_path / entry).exists()
     )
 
     printd(f"  {archive.name} (root: '{root_path}')")
-    for line in replaces:
-        printd(f"    {line}")
     for line in extracts:
         printd(f"    {line}")
+    for line in replaces:
+        printd(f"    {line}", file=sys.stderr)
 
     if __dry_run__:
         return True
 
-    # Handle existing backup directory
-    if backup_dir.exists():
+    # Handle existing rollback directory
+    if rollbackd.exists():
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        old_backup = Path(str(backup_dir) + f"_{timestamp}")
-        backup_dir.rename(old_backup)
+        prevbackd = Path(str(rollbackd) + f"_{timestamp}")
+        rollbackd.rename(prevbackd)
         if __verbose__:
-            printd(f"  Moved existing backup: {backup_dir} -> {old_backup}")
+            printd(f"  Moved existing backup: {rollbackd} -> {prevbackd}")
 
     # Create fresh backup directory
-    backup_dir.mkdir(parents=True, exist_ok=True)
+    rollbackd.mkdir(parents=True, exist_ok=True)
 
     printd(f"  Restoring {category}...")
     restored = []  # Track what we've touched for rollback
@@ -1026,7 +1024,7 @@ def restore_category(archive, root, backup_ext, compress="gzip"):
 
             # Backup existing entry if it exists
             if entry_path.exists():
-                copy_with_ownership(entry_path, backup_dir / entry)
+                copy_with_ownership(entry_path, rollbackd / entry)
                 if entry_path.is_dir():
                     shutil.rmtree(str(entry_path))
                 else:
@@ -1058,7 +1056,7 @@ def restore_category(archive, root, backup_ext, compress="gzip"):
 
         for entry in restored:
             entry_path = root_path / entry
-            backup_path = backup_dir / entry
+            rollback_path = rollbackd / entry
 
             # Remove the partially extracted entry
             if entry_path.exists():
@@ -1068,8 +1066,8 @@ def restore_category(archive, root, backup_ext, compress="gzip"):
                     entry_path.unlink()
 
             # Restore from backup if it exists
-            if backup_path.exists():
-                copy_with_ownership(backup_path, entry_path)
+            if rollback_path.exists():
+                copy_with_ownership(rollback_path, entry_path)
 
         printd(f"✓ Rollback complete for {category}", file=sys.stderr)
         return False
@@ -1129,14 +1127,14 @@ def extract_archives(archives, skip_confirm=False, root_map=None, compress="gzip
 
 
 def restore_archives(
-    backup_dir, selected_archives, compress="gzip", skip_confirm=False, root_map=None
+    capture_dir, selected_archives, compress="gzip", skip_confirm=False, root_map=None
 ):
-    """Restore archives from backup directory.
+    """Restore archives from capture directory.
 
     Args:
-        backup_dir: Directory containing archives
+        capture_dir: Directory containing archives
         selected_archives: List of archive patterns to restore (empty list = all)
-        compress: Compression type from tarball.toml
+        compress: Compression type from snapshot TOML
         skip_confirm: Skip user confirmation if True
         root_map: Dict mapping category name to root path
     """
@@ -1147,7 +1145,7 @@ def restore_archives(
     ext, _ = COMPRESS_MAP[compress]
 
     # Find all available archives with the specified compression type
-    available = list(backup_dir.glob(f"*{ext}"))
+    available = list(capture_dir.glob(f"*{ext}"))
 
     if not available:
         printd("Error: No archives found to restore", file=sys.stderr)
@@ -1158,7 +1156,7 @@ def restore_archives(
 
     # Select which archives to restore based on patterns
     archives_to_restore = archive_select(
-        available, selected_archives, backup_dir, compress
+        available, selected_archives, capture_dir, compress
     )
 
     # Extract selected archives in parallel
@@ -1169,9 +1167,9 @@ def restore_archives(
     printd('\n', f"✓ {success_count}/{len(archives_to_restore)} archive(s) restored")
 
 
-def create_symlinks(tarball_config):
+def create_symlinks(snapshot_config):
     """Create symlinks from link -> root for each category with a link field."""
-    tar_sections = tarball_config.get("tar", {})
+    tar_sections = snapshot_config.get("tar", {})
     if not tar_sections:
         return
 
@@ -1257,22 +1255,22 @@ def calculate_file_checksum(filepath, show=False):
     return sha256.hexdigest()
 
 
-def verify_archives_from_toml(backup_dir):
+def verify_archives_from_toml(capture_dir):
     """Verify all archives using tarball TOML checksums."""
-    toml_path = backup_dir / DEFAULT_TARBALL_TOML
+    toml_path = capture_dir / DEFAULT_SNAPSHOT_TOML
 
     if not toml_path.exists():
         printd(
-            f"Error: {DEFAULT_TARBALL_TOML} not found in {backup_dir}", file=sys.stderr
+            f"Error: {DEFAULT_SNAPSHOT_TOML} not found in {capture_dir}", file=sys.stderr
         )
         sys.exit(1)
 
-    # Load tarball TOML
+    # Load snapshot TOML
     with open(toml_path, "rb") as f:
-        tarball_config = tomllib.load(f)
+        snapshot_config = tomllib.load(f)
 
     # Get tarball options
-    tarball_opts = tarball_config.get("tarball", {})
+    tarball_opts = snapshot_config.get("tarball", {})
     compress_type = tarball_opts.get("compress", "gzip")
     digest_type = tarball_opts.get("checksum")
 
@@ -1286,9 +1284,9 @@ def verify_archives_from_toml(backup_dir):
     # If no checksum specified in options, skip verification
     if not digest_type:
         printd(
-            f"Warning: No checksum type specified in {DEFAULT_TARBALL_TOML}, skipping verification"
+            f"Warning: No checksum type specified in {DEFAULT_SNAPSHOT_TOML}, skipping verification"
         )
-        return tarball_config
+        return snapshot_config
 
     printd("Verifying archive integrity...")
 
@@ -1297,20 +1295,20 @@ def verify_archives_from_toml(backup_dir):
         sys.exit(1)
 
     # Get all tar sections
-    tar_sections = tarball_config.get("tar", {})
+    tar_sections = snapshot_config.get("tar", {})
 
     if not tar_sections:
-        printd(f"Error: No tar sections found in {DEFAULT_TARBALL_TOML}", file=sys.stderr)
+        printd(f"Error: No tar sections found in {DEFAULT_SNAPSHOT_TOML}", file=sys.stderr)
         sys.exit(1)
 
     # List archives to verify
     for category in sorted(tar_sections.keys()):
-        archive_path = backup_dir / f"{category}{archive_ext}"
+        archive_path = capture_dir / f"{category}{archive_ext}"
         printd(f"  verify: {archive_path.name}")
 
     if __dry_run__:
         printd("✓ All archives verified (dry-run)")
-        return tarball_config
+        return snapshot_config
 
     # Verify each archive
     all_valid = True
@@ -1322,7 +1320,7 @@ def verify_archives_from_toml(backup_dir):
         autorefresh=True,
     ) as pbar:
         for category, section_data in tar_sections.items():
-            archive_path = backup_dir / f"{category}{archive_ext}"
+            archive_path = capture_dir / f"{category}{archive_ext}"
 
             if not archive_path.exists():
                 pbar.write(f"Error: Archive {archive_path.name} not found")
@@ -1353,29 +1351,29 @@ def verify_archives_from_toml(backup_dir):
 
     if not all_valid:
         printd(
-            "Error: Checksum verification failed! Backup may be corrupted.",
+            "Error: Checksum verification failed! Snapshot may be corrupted.",
             file=sys.stderr,
         )
         sys.exit(1)
 
     printd("✓ All archives verified")
-    return tarball_config
+    return snapshot_config
 
 
-# --- Backup Logic --- #
+# --- Capture Logic --- #
 
 
-def backup(args, root_dir, outdir, config):
-    """Create backup archives in specified directory."""
+def capture(args, root_dir, outdir, config):
+    """Create archives in specified directory."""
 
     # Run before scripts
     if args.run_scripts:
         run_scripts(root_dir, config, "before", working_dir=outdir)
 
-    # Get compression type and backups extension from config
+    # Get compression type and rollback extension from config
     tarball_opts = config.get("tarball", {})
     compress = tarball_opts.get("compress", "gzip")
-    backups_ext = tarball_opts.get("backups")
+    roll_ext = tarball_opts.get("rollback")
 
     # Collect all archive tasks and build category metadata
     tar_config = config.get("tar", {})
@@ -1402,22 +1400,22 @@ def backup(args, root_dir, outdir, config):
     # Create archives in parallel
     create_archives(tasks, compress)
 
-    # Generate tarball TOML with backup checksum
-    printd(f"Creating tarball metadata...", '\n')
-    toml_path, checksum = generate_tarball_toml(
-        outdir, tasks, compress, category_meta, backups_ext
+    # Generate snapshot TOML with checksum
+    printd(f"Creating snapshot metadata...", '\n')
+    toml_path, checksum = generate_snapshot_toml(
+        outdir, tasks, compress, category_meta, roll_ext
     )
 
-    printd(f"  Backup checksum: '{checksum[:7]}...'")
+    printd(f"  Snapshot checksum: '{checksum[:7]}...'")
 
     # Create checksum-named subdirectory and move files
-    printd('\n', f"Setting up final backup layout...", '\n')
+    printd('\n', f"Setting up final snapshot layout...", '\n')
     dst_dir = outdir.parent / outdir.name / checksum[:7]
 
     ext, _ = COMPRESS_MAP[compress]
     printd(f"  mkdir {dst_dir}")
     printd(f"  mv *{ext} -> {dst_dir.name}/")
-    printd(f"  mv {DEFAULT_TARBALL_TOML} -> {dst_dir.name}/")
+    printd(f"  mv {DEFAULT_SNAPSHOT_TOML} -> {dst_dir.name}/")
 
     if not __dry_run__:
         dst_dir.mkdir(parents=True, exist_ok=False)
@@ -1426,15 +1424,15 @@ def backup(args, root_dir, outdir, config):
         for archive in outdir.glob(f"*{ext}"):
             archive.rename(dst_dir / archive.name)
 
-        # Move tarball.toml to checksum directory
-        toml_path.rename(dst_dir / DEFAULT_TARBALL_TOML)
+        # Move snapshot TOML to checksum directory
+        toml_path.rename(dst_dir / DEFAULT_SNAPSHOT_TOML)
 
-    printd(f"✓ Backup files moved to {dst_dir.name}")
+    printd(f"✓ Snapshot files moved to {dst_dir.name}")
 
-    # Run after-backup scripts if requested
+    # Run after-capture scripts if requested
     if args.run_scripts:
         # Determine which config to use
-        config_name = args.config_toml if args.config_toml else DEFAULT_CONFIG_BACKUP
+        config_name = args.config_toml if args.config_toml else DEFAULT_CONFIG_CAPTURE
         scripts_config = load_config(root_dir, config_name)
         # Skip verification for scripts-only config (may not have [tar] section)
         run_scripts(root_dir, scripts_config, "after", working_dir=dst_dir)
@@ -1442,28 +1440,28 @@ def backup(args, root_dir, outdir, config):
     return dst_dir
 
 
-def remote_backup(backup_dir, dest_host, intended_path):
-    """Copy completed backup directory to remote host."""
-    printd('\n', f"Copying backup to {dest_host}...")
+def capture_deploy(capture_dir, dest_host, intended_path):
+    """Copy capture to remote host."""
+    printd('\n', f"Copying snapshot to {dest_host}...")
 
     # Ensure remote directory exists
     escaped_path = shlex.quote(str(intended_path))
     ssh_run(dest_host, f"mkdir -p {escaped_path}")
 
-    # Copy all tar archives and tarball.toml
+    # Copy all tar archives and snapshot TOML
     transfers = []
 
-    # Add tarball.toml
-    toml_path = backup_dir / DEFAULT_TARBALL_TOML
+    # Add snapshot TOML
+    toml_path = capture_dir / DEFAULT_SNAPSHOT_TOML
     if toml_path.exists():
         transfers.append(
-            (str(toml_path), f"{dest_host}:{intended_path}/", DEFAULT_TARBALL_TOML)
+            (str(toml_path), f"{dest_host}:{intended_path}/", DEFAULT_SNAPSHOT_TOML)
         )
 
-        # Load compression type from tarball.toml
+        # Load compression type from snapshot TOML
         with open(toml_path, "rb") as f:
-            tarball_config = tomllib.load(f)
-        compress_type = tarball_config.get("tarball", {}).get("compress", "gzip")
+            snapshot_config = tomllib.load(f)
+        compress_type = snapshot_config.get("tarball", {}).get("compress", "gzip")
         if compress_type not in COMPRESS_MAP:
             printd(
                 f"Error: Unsupported compression type: {compress_type}", file=sys.stderr
@@ -1472,18 +1470,18 @@ def remote_backup(backup_dir, dest_host, intended_path):
         ext, _ = COMPRESS_MAP[compress_type]
 
         # Add all tar archives with the specified compression type
-        for archive in backup_dir.glob(f"*{ext}"):
+        for archive in capture_dir.glob(f"*{ext}"):
             transfers.append(
                 (str(archive), f"{dest_host}:{intended_path}/", archive.name)
             )
     else:
         printd(
-            f"Error: {DEFAULT_TARBALL_TOML} not found in {backup_dir}", file=sys.stderr
+            f"Error: {DEFAULT_SNAPSHOT_TOML} not found in {capture_dir}", file=sys.stderr
         )
         sys.exit(1)
 
     if not transfers:
-        printd("Error: No backup files found to copy", file=sys.stderr)
+        printd("Error: No snapshot files found to copy", file=sys.stderr)
         sys.exit(1)
 
     success_count = rsync_parallel(transfers)
@@ -1491,32 +1489,165 @@ def remote_backup(backup_dir, dest_host, intended_path):
         printd("Error: Failed to copy all files to remote", file=sys.stderr)
         sys.exit(1)
 
-    printd(f"✓ Backup copied to {dest_host}:{intended_path}")
+    printd(f"✓ Snapshot copied to {dest_host}:{intended_path}")
+
+
+def write_capture_toml(capture_config):
+    """Write capture_config to a temporary capture.toml file."""
+    tmp = Path(tempfile.mktemp(suffix=".toml", prefix="capture-"))
+    lines = []
+
+    tarball = capture_config.get("tarball", {})
+    if tarball:
+        lines.append("[tarball]")
+        for key, val in tarball.items():
+            lines.append(f'{key} = "{val}"' if isinstance(val, str) else f"{key} = {val}")
+        lines.append("")
+
+    for category, data in capture_config.get("tar", {}).items():
+        lines.append(f"[tar.{category}]")
+        for key, val in data.items():
+            if isinstance(val, str):
+                lines.append(f'{key} = "{val}"')
+            elif isinstance(val, list):
+                items = ", ".join(f'"{v}"' for v in val)
+                lines.append(f"{key} = [{items}]")
+        lines.append("")
+
+    scripts = capture_config.get("scripts", {})
+    if scripts:
+        lines.append("[scripts]")
+        for when, script_list in scripts.items():
+            items = ", ".join(f'"{s}"' for s in script_list)
+            lines.append(f'{when} = [{items}]')
+        lines.append("")
+
+    tmp.write_text("\n".join(lines))
+    return tmp
+
+
+def remote_capture(args, root_dir, source_host, capture_config=None):
+    """Execute capture on a remote host and pull results back.
+
+    If capture_config is None, transfers existing capture.toml from root_dir.
+    If capture_config is provided (e.g. from migrate), writes a temp TOML.
+    """
+
+    # Set up remote working directory
+    remote_work_dir = remote_mkdir(source_host, "capture")
+
+    # Determine config to transfer
+    if capture_config:
+        # Migrate path: write in-memory config to temp TOML
+        tmp_capture_toml = write_capture_toml(capture_config)
+        config_name = DEFAULT_CONFIG_CAPTURE
+    else:
+        # Standalone capture: load config for script discovery
+        config_name = getattr(args, "config_toml", None) or DEFAULT_CONFIG_CAPTURE
+        capture_config = load_config(root_dir, config_name)
+        verify_capture_config(capture_config, config_name)
+        tmp_capture_toml = None
+
+    try:
+        config_src = str(tmp_capture_toml) if tmp_capture_toml else str(root_dir / config_name)
+        transfers = [
+            (str(__script__), f"{source_host}:{remote_work_dir}/", __script__.name),
+            (
+                config_src,
+                f"{source_host}:{remote_work_dir}/{DEFAULT_CONFIG_CAPTURE}",
+                DEFAULT_CONFIG_CAPTURE,
+            ),
+        ]
+
+        # Transfer all capture scripts (before and after) to source
+        scripts = capture_config.get("scripts", {})
+        if args.run_scripts:
+            for when in ("before", "after"):
+                for run_script_path in scripts.get(when, []):
+                    script_path = root_dir / run_script_path
+                    if not script_path.exists():
+                        printd(
+                            f"Warning: Script {script_path} not found, skipping",
+                            file=sys.stderr,
+                        )
+                        continue
+                    script_name = Path(run_script_path).name
+                    transfers.append(
+                        (str(script_path), f"{source_host}:{remote_work_dir}/", script_name)
+                    )
+
+        success_count = rsync_parallel(transfers)
+        if success_count < len(transfers):
+            printd("Error: Failed to copy files to source host", file=sys.stderr)
+            sys.exit(1)
+    finally:
+        if tmp_capture_toml and tmp_capture_toml.exists():
+            tmp_capture_toml.unlink()
+
+    # Run capture on source (snap capture handles before/after scripts)
+    escaped_dir = shlex.quote(remote_work_dir)
+    program = f"{sys.executable} {__script__.name}"
+    script_flag = "--run-scripts" if args.run_scripts else ""
+    capture_cmd = (
+        f"cd {escaped_dir} && {program} capture"
+        f" -p {escaped_dir} {script_flag}"
+    )
+    printd('\n', f"Running capture on {source_host}...")
+    printd(f"Command: {capture_cmd}", '\n')
+    ssh_run(source_host, capture_cmd)
+
+    # Pull capture to local temp directory
+    tmpdir = Path(tempfile.mkdtemp(prefix=f"{__script__.stem}-"))
+
+    if not __dry_run__:
+        # Find the capture directory on source (date/checksum structure)
+        result = ssh_run(
+            source_host, f"ls -d {escaped_dir}/*/",
+        )
+        if result is None or result[0] != 0:
+            printd("Error: Failed to find capture on source", file=sys.stderr)
+            shutil.rmtree(tmpdir)
+            sys.exit(1)
+        remote_capture_dir = result[1].strip()
+
+        # Pull capture files
+        host_path = f"{source_host}:{remote_capture_dir}"
+        pull_result = rsync_run(host_path, str(tmpdir) + "/")
+        if pull_result is None or pull_result[0] != 0:
+            printd("Error: Failed to pull capture from source", file=sys.stderr)
+            shutil.rmtree(tmpdir)
+            sys.exit(1)
+
+    # Cleanup source working directory
+    printd('\n', "Cleaning up source directory...")
+    ssh_run(source_host, f"rm -rf {escaped_dir}")
+
+    return tmpdir, tmpdir
 
 
 # --- Restore Logic --- #
 
 
-def restore(args, root_dir, backup_dir=None):
-    """Restore from local backup directory."""
-    if backup_dir is None:
-        # Use combined backup_dir if set (includes checksum), otherwise fall back to dir
-        backup_dir = getattr(args, "backup_dir", args.dir).resolve()
+def restore(args, root_dir, capture_dir=None, restore_config=None):
+    """Restore from local capture directory."""
+    if capture_dir is None:
+        # Use combined capture_dir if set (includes checksum), otherwise fall back to dir
+        capture_dir = getattr(args, "capture_dir", args.dir).resolve()
 
-    toml_path = verify_backup(backup_dir)
+    toml_path = verify_capture(capture_dir)
 
-    # Verify all archives using tarball.toml and load config
-    tarball_config = verify_archives_from_toml(backup_dir)
+    # Verify all archives using snapshot TOML and load config
+    snapshot_config = verify_archives_from_toml(capture_dir)
     printd()
 
-    # Get compression type and backups extension from tarball.toml
-    tarball_opts = tarball_config.get("tarball", {})
+    # Get compression type and rollback extension from snapshot TOML
+    tarball_opts = snapshot_config.get("tarball", {})
     compress = tarball_opts.get("compress", "gzip")
-    backups_ext = tarball_opts.get("backups")
+    roll_ext = tarball_opts.get("rollback")
 
     # Build root_map from tar sections
     root_map = {}
-    tar_sections = tarball_config.get("tar", {})
+    tar_sections = snapshot_config.get("tar", {})
     for category, section_data in tar_sections.items():
         root = section_data.get("root")
         if root:
@@ -1532,15 +1663,16 @@ def restore(args, root_dir, backup_dir=None):
         cmd = ["sudo", sys.executable] + sys.argv
         os.execvp("sudo", cmd)
 
-    # Load restore config
-    config_name = args.config_toml if args.config_toml else DEFAULT_CONFIG_RESTORE
-    restore_config = load_config(root_dir, config_name)
-    verify_restore_config(restore_config, config_name)
+    # Load restore config (use provided or load from file)
+    if restore_config is None:
+        config_name = args.config_toml if args.config_toml else DEFAULT_CONFIG_RESTORE
+        restore_config = load_config(root_dir, config_name)
+        verify_restore_config(restore_config, config_name)
 
     # Get archives from config
     # Semantics: None/[] = skip restore, ["*"] = restore all, [patterns...] = restore matching
     # Patterns support glob matching: ["ssh*", "dotfiles", "*-config"]
-    archives = restore_config.get("tarball", {}).get("archives", None)
+    archives = restore_config.get("tar", {}).get("archives", None)
     if not archives or archives == []:
         archives = None  # Empty list in config means don't restore
     elif archives == ["*"] or "*" in archives:
@@ -1548,27 +1680,27 @@ def restore(args, root_dir, backup_dir=None):
 
     # Run before scripts
     if args.run_scripts:
-        run_scripts(root_dir, restore_config, "before", working_dir=backup_dir)
+        run_scripts(root_dir, restore_config, "before", working_dir=capture_dir)
 
     # Restore archives
     if archives is not None:
         # Find matching archive files
         ext, _ = COMPRESS_MAP[compress]
-        available = list(backup_dir.glob(f"*{ext}"))
-        selected = archive_select(available, archives, backup_dir, compress)
+        available = list(capture_dir.glob(f"*{ext}"))
+        selected = archive_select(available, archives, capture_dir, compress)
 
         if not selected:
             printd("No archives selected for restore")
-        elif getattr(args, "disable_backups", False):
-            # No backup protection - use existing extract_archives with confirmation
+        elif getattr(args, "disable_rollback", False):
+            # No rollback protection - use existing extract_archives with confirmation
             extract_archives(
                 selected, skip_confirm=False, root_map=root_map, compress=compress
             )
         else:
             # Transactional restore with rollback support
-            if not backups_ext:
+            if not roll_ext:
                 printd(
-                    "Warning: No backups extension specified in tarball.toml, falling back to interactive confirmation",
+                    "Warning: No rollback extension specified in snapshot TOML, falling back to interactive confirmation",
                     file=sys.stderr,
                 )
                 extract_archives(
@@ -1586,7 +1718,7 @@ def restore(args, root_dir, backup_dir=None):
                             file=sys.stderr,
                         )
                         continue
-                    success = restore_category(archive, root, backups_ext, compress)
+                    success = restore_category(archive, root, roll_ext, compress)
                     if not success:
                         failed.append(category)
 
@@ -1601,20 +1733,20 @@ def restore(args, root_dir, backup_dir=None):
                     printd('\n', f"✓ Restored {len(selected)} category archive(s)")
 
     # Create symlinks from link -> root
-    create_symlinks(tarball_config)
+    create_symlinks(snapshot_config)
 
     # Run after scripts
     if args.run_scripts:
-        run_scripts(root_dir, restore_config, "after", working_dir=backup_dir)
+        run_scripts(root_dir, restore_config, "after", working_dir=capture_dir)
 
     printd('\n', "✓ Restore completed successfully")
 
 
-def remote_mkdir(dest_host):
+def remote_mkdir(dest_host, purpose="work"):
     """Generate a unique remote work directory path and create it."""
     chars = string.ascii_lowercase + string.digits
     suffix = ''.join(random.choices(chars, k=REMOTE_DIR_SUFFIX_LENGTH))
-    remote_dir = f"/tmp/{__script__.stem}-restore-{suffix}"
+    remote_dir = f"/tmp/{__script__.stem}-{purpose}-{suffix}"
 
     # Create remote directory
     printd("Creating remote directory...")
@@ -1623,57 +1755,63 @@ def remote_mkdir(dest_host):
 
 
 def remote_restore(args, root_dir, source_host):
-    """Pull backup from remote and restore locally."""
-    backup_dir_path = str(args.backup_dir)
-    printd(f"Pulling backup from {source_host}:{backup_dir_path}...", '\n')
+    """Pull snapshot from remote and restore locally."""
+    capture_dir_path = str(args.capture_dir)
+    printd(f"Pulling snapshot from {source_host}:{capture_dir_path}...", '\n')
 
     tmpdir = Path(tempfile.mkdtemp(prefix=f"{__script__.stem}-"))
 
     try:
-        # Rsync entire backup directory (includes all .tar.gz and tarball.toml)
+        # Rsync entire capture directory (includes all .tar.gz and snapshot TOML)
         # Use trailing slash to copy contents into tmpdir
-        host_path = f"{source_host}:{backup_dir_path}/"
+        host_path = f"{source_host}:{capture_dir_path}/"
         result = rsync_run(host_path, str(tmpdir) + "/")
 
         if result is None:  # __dry_run__
             pass
         elif result[0] != 0:
-            printd("Error: Failed to pull backup from remote", file=sys.stderr)
+            printd("Error: Failed to pull snapshot from remote", file=sys.stderr)
             sys.exit(1)
 
-        restore(args, root_dir, backup_dir=tmpdir)
+        restore(args, root_dir, capture_dir=tmpdir)
 
     finally:
         shutil.rmtree(tmpdir)
 
 
-def remote_deploy(args, root_dir, dest_host, source_host=None):
-    """Deploy backup to remote and restore (from local or remote source)."""
+def remote_deploy(
+    args, root_dir, dest_host,
+    source_host=None, deploy_config=None, before_scripts=True,
+):
+    """Deploy snapshot to remote and restore (from local or remote source)."""
 
     # Determine source paths (local or remote)
     if source_host:
-        # Remote source - use combined backup_dir (includes checksum)
-        backup_dir_path = (
-            str(args.backup_dir)
-            if isinstance(args.backup_dir, Path)
-            else args.backup_dir
+        # Remote source - use combined capture_dir (includes checksum)
+        capture_dir_path = (
+            str(args.capture_dir)
+            if isinstance(args.capture_dir, Path)
+            else args.capture_dir
         )
         printd(f"Deploying from {source_host} to {dest_host}...", '\n')
         config_src_base = f"{source_host}:{root_dir}"
-        local_backup = None
+        local_capture = None
     else:
-        # Local source - use combined backup_dir (includes checksum)
-        local_backup = args.backup_dir.resolve()
+        # Local source - use combined capture_dir (includes checksum)
+        local_capture = args.capture_dir.resolve()
         printd(f"Deploying to {dest_host}...", '\n')
 
-        toml_path = verify_backup(local_backup)
+        toml_path = verify_capture(local_capture)
         config_src_base = None
 
-    config_name = args.config_toml if args.config_toml else DEFAULT_CONFIG_DEPLOY
-    deploy_config = load_config(root_dir, config_name)
-    verify_restore_config(deploy_config, config_name)
+    if deploy_config is None:
+        config_name = args.config_toml if args.config_toml else DEFAULT_CONFIG_DEPLOY
+        deploy_config = load_config(root_dir, config_name)
+        verify_restore_config(deploy_config, config_name)
+    else:
+        config_name = None
 
-    remote_dir = remote_mkdir(dest_host)
+    remote_dir = remote_mkdir(dest_host, "restore")
 
     # Collect all transfers to execute in parallel
     transfers = []
@@ -1681,42 +1819,42 @@ def remote_deploy(args, root_dir, dest_host, source_host=None):
     # Add snap.py script
     transfers.append((str(__script__), f"{dest_host}:{remote_dir}/", __script__.name))
 
-    # Add backup files (tarball.toml and all tar archives)
+    # Add archive files (snapshot TOML and all tar archives)
     if source_host:
-        # Remote source - need to fetch tarball.toml first to determine archives
-        printd(f"Fetching backup metadata from {source_host}...")
+        # Remote source - need to fetch snapshot TOML first to determine archives
+        printd(f"Fetching snapshot metadata from {source_host}...")
 
-        # Create temp file for tarball.toml
+        # Create temp file for snapshot TOML
         with tempfile.NamedTemporaryFile(
             mode="wb", suffix=".toml", delete=False
         ) as tmp:
             tmp_toml_path = Path(tmp.name)
 
         try:
-            # Fetch tarball.toml from remote source
-            remote_toml = f"{source_host}:{backup_dir_path}/{DEFAULT_TARBALL_TOML}"
+            # Fetch snapshot TOML from remote source
+            remote_toml = f"{source_host}:{capture_dir_path}/{DEFAULT_SNAPSHOT_TOML}"
             result = rsync_run(remote_toml, str(tmp_toml_path))
 
             if result is None:  # __dry_run__
                 printd(f"Fetch {remote_toml}")
-                printd(f"Enumerate archives from remote tarball.toml")
+                printd(f"Enumerate archives from remote snapshot TOML")
                 compress_type = "gzip"
                 # In dry-run, show placeholder archives
                 tar_sections = {"archive1": {}, "archive2": {}, "archive-N": {}}
             elif result[0] != 0:
                 printd(
-                    f"Error: Failed to fetch {DEFAULT_TARBALL_TOML} from {source_host}",
+                    f"Error: Failed to fetch {DEFAULT_SNAPSHOT_TOML} from {source_host}",
                     file=sys.stderr,
                 )
                 sys.exit(1)
             else:
-                # Load tarball.toml to get compression type and archive list
+                # Load snapshot TOML to get compression type and archive list
                 with open(tmp_toml_path, "rb") as f:
-                    tarball_config = tomllib.load(f)
-                compress_type = tarball_config.get("tarball", {}).get(
+                    snapshot_config = tomllib.load(f)
+                compress_type = snapshot_config.get("tarball", {}).get(
                     "compress", "gzip"
                 )
-                tar_sections = tarball_config.get("tar", {})
+                tar_sections = snapshot_config.get("tar", {})
 
                 if compress_type not in COMPRESS_MAP:
                     printd(
@@ -1729,12 +1867,12 @@ def remote_deploy(args, root_dir, dest_host, source_host=None):
             if tmp_toml_path.exists():
                 tmp_toml_path.unlink()
 
-        # Add tarball.toml transfer
+        # Add snapshot TOML transfer
         transfers.append(
             (
-                f"{source_host}:{backup_dir_path}/{DEFAULT_TARBALL_TOML}",
+                f"{source_host}:{capture_dir_path}/{DEFAULT_SNAPSHOT_TOML}",
                 f"{dest_host}:{remote_dir}/",
-                DEFAULT_TARBALL_TOML,
+                DEFAULT_SNAPSHOT_TOML,
             )
         )
 
@@ -1744,29 +1882,29 @@ def remote_deploy(args, root_dir, dest_host, source_host=None):
             archive_name = f"{category}{ext}"
             transfers.append(
                 (
-                    f"{source_host}:{backup_dir_path}/{archive_name}",
+                    f"{source_host}:{capture_dir_path}/{archive_name}",
                     f"{dest_host}:{remote_dir}/",
                     archive_name,
                 )
             )
     else:
         # Local source - we can enumerate files directly
-        toml_path = local_backup / DEFAULT_TARBALL_TOML
+        toml_path = local_capture / DEFAULT_SNAPSHOT_TOML
         if not toml_path.exists():
             printd(
-                f"Error: {DEFAULT_TARBALL_TOML} not found in {local_backup}",
+                f"Error: {DEFAULT_SNAPSHOT_TOML} not found in {local_capture}",
                 file=sys.stderr,
             )
             sys.exit(1)
 
         transfers.append(
-            (str(toml_path), f"{dest_host}:{remote_dir}/", DEFAULT_TARBALL_TOML)
+            (str(toml_path), f"{dest_host}:{remote_dir}/", DEFAULT_SNAPSHOT_TOML)
         )
 
-        # Load compression type from tarball.toml
+        # Load compression type from snapshot TOML
         with open(toml_path, "rb") as f:
-            tarball_config = tomllib.load(f)
-        compress_type = tarball_config.get("tarball", {}).get("compress", "gzip")
+            snapshot_config = tomllib.load(f)
+        compress_type = snapshot_config.get("tarball", {}).get("compress", "gzip")
         if compress_type not in COMPRESS_MAP:
             printd(
                 f"Error: Unsupported compression type: {compress_type}", file=sys.stderr
@@ -1775,21 +1913,31 @@ def remote_deploy(args, root_dir, dest_host, source_host=None):
         ext, _ = COMPRESS_MAP[compress_type]
 
         # Add all tar archives with the specified compression type
-        for archive in local_backup.glob(f"*{ext}"):
+        for archive in local_capture.glob(f"*{ext}"):
             transfers.append((str(archive), f"{dest_host}:{remote_dir}/", archive.name))
 
-    # Add config transfer
-    if source_host:
-        config_src = f"{config_src_base}/{config_name}"
+    # Add config transfer (remote restore needs a restore config)
+    tmp_config = None
+    if config_name:
+        if source_host:
+            config_src = f"{config_src_base}/{config_name}"
+        else:
+            config_src = str(root_dir / config_name)
+        transfers.append(
+            (config_src, f"{dest_host}:{remote_dir}/{DEFAULT_CONFIG_RESTORE}", config_name)
+        )
     else:
-        config_src = str(root_dir / config_name)
-    transfers.append(
-        (config_src, f"{dest_host}:{remote_dir}/{DEFAULT_CONFIG_RESTORE}", config_name)
-    )
+        # Generate minimal restore config for remote (restore all archives)
+        tmp_config = Path(tempfile.mktemp(suffix=".toml", prefix="restore-"))
+        tmp_config.write_text('[tar]\narchives = ["*"]\n')
+        transfers.append(
+            (str(tmp_config), f"{dest_host}:{remote_dir}/{DEFAULT_CONFIG_RESTORE}", "restore.toml")
+        )
 
     # Add script transfers
+    script_whens = ["before", "after"] if before_scripts else ["after"]
     if deploy_config and "scripts" in deploy_config:
-        for when in ["before", "after"]:
+        for when in script_whens:
             if when in deploy_config["scripts"]:
                 for run_script_path in deploy_config["scripts"][when]:
                     if source_host:
@@ -1817,11 +1965,16 @@ def remote_deploy(args, root_dir, dest_host, source_host=None):
 
     # Execute all transfers in parallel
     success_count = rsync_parallel(transfers)
+
+    # Clean up temp restore config if generated
+    if tmp_config and tmp_config.exists():
+        tmp_config.unlink()
+
     if success_count < len(transfers):
         printd("Error: Failed to copy all files to remote", file=sys.stderr)
         sys.exit(1)
 
-    if args.run_scripts:
+    if args.run_scripts and before_scripts:
         run_scripts(
             root_dir,
             deploy_config,
@@ -1857,7 +2010,41 @@ def remote_deploy(args, root_dir, dest_host, source_host=None):
     printd('\n', f"✓ Deploy completed successfully")
 
 
-# --- Main Execution --- #
+# --- Migrate Logic --- #
+
+
+def split_migrate_config(config, config_name):
+    """Split migrate config into separate capture and restore configs.
+
+    Migrate config has [capture.*] and [restore.*] namespaces with shared
+    [tarball] options. Returns (capture_config, restore_config) dicts
+    compatible with existing capture() and restore() functions.
+    """
+    tarball = config.get("tarball", {})
+    capture_section = config.get("capture", {})
+    restore_section = config.get("restore", {})
+
+    if "tar" not in capture_section:
+        printd(
+            f"Error: {config_name} missing required [capture.tar] section",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    capture_config = {"tarball": tarball, "tar": capture_section.get("tar", {})}
+    if "scripts" in capture_section:
+        capture_config["scripts"] = capture_section["scripts"]
+
+    restore_config = {"tarball": tarball}
+    if "tar" in restore_section:
+        restore_config["tar"] = restore_section["tar"]
+    if "scripts" in restore_section:
+        restore_config["scripts"] = restore_section["scripts"]
+
+    return capture_config, restore_config
+
+
+# --- Command Execution --- #
 
 
 def cmd_check(args):
@@ -1865,36 +2052,34 @@ def cmd_check(args):
     files = getattr(args, "files", []) or []
 
     if not files:
-        print("Error: Specify at least one file with -f/--file", file=sys.stderr)
+        print("Error: Specify at least one file", file=sys.stderr)
         sys.exit(1)
 
-    # Validate all files exist
-    paths = []
-    for file_path in files:
-        path = Path(file_path)
-        if not path.exists():
-            print(f"Error: File {path} does not exist", file=sys.stderr)
-            sys.exit(1)
-        if not path.is_file():
-            print(f"Error: {path} is not a file", file=sys.stderr)
-            sys.exit(1)
-        paths.append(path)
-
-    print(f"Calculating checksums for {len(paths)} file(s)...\n")
+    ignore_invalid = getattr(args, "ignore_invalid", False)
+    full_path = getattr(args, "full_path", False)
+    no_path = getattr(args, "no_path", False)
 
     # Calculate and display checksums
-    for file_path in paths:
-        checksum = calculate_file_checksum(file_path, show=False)
-        print(f"{file_path.name}:")
-        print(f"  {checksum}\n")
+    for file_path in files:
+        path = Path(file_path)
+        if not (path.exists() or path.is_file()):
+            if ignore_invalid: continue
+            checksum = "null"
+        else:
+            checksum = calculate_file_checksum(path, show=False)
+        if no_path:
+            print(checksum)
+        elif full_path:
+            print(f"{path}: {checksum}")
+        else:
+            print(f"{path.name}: {checksum}")
 
 
-def cmd_backup(args):
-    """Execute backup command (local or send to remote)."""
+def cmd_capture(args):
+    """Execute capture command (local or remote source, local or remote destination)."""
     root_dir = args.root
+    source_host = getattr(args, "source", None)
     dest_host = getattr(args, "host", None)
-    config = load_config(root_dir, DEFAULT_CONFIG_BACKUP)
-    verify_backup_config(config, DEFAULT_CONFIG_BACKUP)
 
     # Determine intended destination path
     if args.dir:
@@ -1903,52 +2088,111 @@ def cmd_backup(args):
         now = datetime.now()
         year = now.strftime("%Y")
         month_day = now.strftime("%m-%d")
-        intended_path = root_dir / "backups" / year / month_day
+        intended_path = root_dir / "captures" / year / month_day
 
-    # Always use temp directory for creation (atomic operation)
-    tmpdir = None
-    if __dry_run__:
-        outdir = Path("/tmp/dry-run") / intended_path.name
+    printd(f"Snapshot destination: {intended_path}")
+
+    if source_host:
+        # Run capture on remote host, pull results back
+        dst_dir, tmpdir = remote_capture(args, root_dir, source_host)
     else:
-        tmpdir = Path(tempfile.mkdtemp(prefix=f"{__script__.stem}-"))
-        outdir = tmpdir / intended_path.name
-        outdir.mkdir(parents=True, exist_ok=False)
+        # Local capture
+        config = load_config(root_dir, DEFAULT_CONFIG_CAPTURE)
+        verify_capture_config(config, DEFAULT_CONFIG_CAPTURE)
 
-    printd(f"Backup destination: {intended_path}")
+        tmpdir = None
+        if __dry_run__:
+            outdir = Path("/tmp/dry-run") / intended_path.name
+        else:
+            tmpdir = Path(tempfile.mkdtemp(prefix=f"{__script__.stem}-"))
+            outdir = tmpdir / intended_path.name
+            outdir.mkdir(parents=True, exist_ok=False)
+
+        dst_dir = capture(args, root_dir, outdir, config)
 
     try:
-        # Create backup archives (returns final path with checksum subdirectory)
-        dst_dir = backup(args, root_dir, outdir, config)
-
         if __dry_run__:
             final_dst = intended_path / dst_dir.name
         elif dest_host:
-            # Copy backup to remote host
+            # Copy snapshot to remote destination
             remote_path = intended_path / dst_dir.name
-            remote_backup(dst_dir, dest_host, remote_path)
+            capture_deploy(dst_dir, dest_host, remote_path)
+            final_dst = remote_path
         else:
-            # Move backup to local destination
+            # Move snapshot to local destination
             final_dst = intended_path / dst_dir.name
-
-            # Ensure parent directory exists
             final_dst.parent.mkdir(parents=True, exist_ok=True)
 
-            # Check if destination already exists
             if final_dst.exists():
                 printd(
-                    f"Error: Backup directory {final_dst} already exists",
+                    f"Error: Snapshot directory {final_dst} already exists",
                     file=sys.stderr,
                 )
                 sys.exit(1)
 
-            # Move from temp to final location
             shutil.move(str(dst_dir), str(final_dst))
     finally:
-        # Cleanup temp directory if we created one
         if tmpdir and tmpdir.exists():
             shutil.rmtree(tmpdir)
 
-    printd('\n', f"✓ Backup saved to {final_dst}")
+    printd('\n', f"✓ Snapshot saved to {final_dst}")
+
+
+def cmd_migrate(args):
+    """Execute migrate command: capture on source, restore on destination."""
+    root_dir = args.root
+    source_host = getattr(args, "source", None)
+    dest_host = getattr(args, "host", None)
+
+    if not source_host and not dest_host:
+        printd(
+            "Error: At least one of -s/--source-host or -h/--dest-host is required",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    config_name = args.config_toml if args.config_toml else DEFAULT_CONFIG_MIGRATE
+    config = load_config(root_dir, config_name)
+    capture_config, restore_config = split_migrate_config(config, config_name)
+    verify_capture_config(capture_config, config_name)
+
+    # Phase 1: Capture on source
+    if source_host:
+        printd(f"Migrating from {source_host} to {dest_host or 'local'}...", '\n')
+        capture_dir, tmpdir = remote_capture(
+            args, root_dir, source_host, capture_config
+        )
+    else:
+        printd(f"Migrating from local to {dest_host}...", '\n')
+        tmpdir = None
+        dir_name = datetime.now().strftime("%m-%d")
+        if __dry_run__:
+            outdir = Path("/tmp/dry-run") / dir_name
+        else:
+            tmpdir = Path(tempfile.mkdtemp(prefix=f"{__script__.stem}-"))
+            outdir = tmpdir / dir_name
+            outdir.mkdir(parents=True, exist_ok=False)
+        capture_dir = capture(args, root_dir, outdir, capture_config)
+
+    try:
+        # Phase 2: Restore on destination
+        args.capture_dir = capture_dir
+
+        if dest_host:
+            remote_deploy(
+                args, root_dir, dest_host,
+                deploy_config=restore_config, before_scripts=True,
+            )
+        else:
+            restore(
+                args, root_dir,
+                capture_dir=capture_dir, restore_config=restore_config,
+            )
+
+        printd('\n', f"✓ Migration completed successfully")
+    finally:
+        if tmpdir and tmpdir.exists():
+            shutil.rmtree(tmpdir)
 
 
 def cmd_restore(args):
@@ -1957,38 +2201,34 @@ def cmd_restore(args):
     source_host = getattr(args, "source", None)
     dest_host = getattr(args, "host", None)
 
-    if not args.dir:
-        printd("Error: -b/--backup-path is required", file=sys.stderr)
-        sys.exit(1)
-
-    # Combine date directory with checksum to get full backup path
-    # args.dir is the date directory (e.g., ~/.snap/backups/2024/01-15)
+    # Combine date directory with checksum to get full capture path
+    # args.dir is the date directory (e.g., ~/.snap/captures/2024/01-15)
     # args.checksum is the checksum prefix (e.g., a1b2c3d)
-    # Result: ~/.snap/backups/2024/01-15/a1b2c3d
+    # Result: ~/.snap/captures/2024/01-15/a1b2c3d
 
     # Auto-select most recent checksum if not provided
     if not args.checksum:
         date_dir = args.dir
         if not date_dir.exists():
             printd(
-                f"Error: Backup directory {date_dir} does not exist", file=sys.stderr
+                f"Error: Snapshot directory {date_dir} does not exist", file=sys.stderr
             )
             sys.exit(1)
 
         subdirs = [d for d in date_dir.iterdir() if d.is_dir()]
         if not subdirs:
-            printd(f"Error: No backup found in {date_dir}", file=sys.stderr)
+            printd(f"Error: No snapshot found in {date_dir}", file=sys.stderr)
             sys.exit(1)
 
         # Sort by modification time (most recent first)
         latest = max(subdirs, key=lambda d: d.stat().st_mtime)
         args.checksum = latest.name
-        printd(f"Auto-selected latest backup: {args.checksum}")
+        printd(f"Auto-selected latest snapshot: {args.checksum}")
 
-    backup_path = args.dir / args.checksum
+    capture_path = args.dir / args.checksum
 
     # Store combined path back in args for subfunctions
-    args.backup_dir = backup_path
+    args.capture_dir = capture_path
 
     # Case 1: Remote to remote (source -> dest)
     if source_host and dest_host:
@@ -2016,10 +2256,10 @@ def setup_parser():
             type=Path,
             default=DEFAULT_ROOT_SNAP,
             dest="root",
-            help=f"Root directory for backups, scripts, etc (default: {DEFAULT_ROOT_SNAP})",
+            help=f"Root directory for snapshots, scripts, etc (default: {DEFAULT_ROOT_SNAP})",
         )
         group.add_argument(
-            "-b", "--backup-path", metavar="<dir>", type=Path, dest="dir", help=dir_help
+            metavar="<dir>", type=Path, dest="dir", help=dir_help
         )
         if not skip_toml:
             group.add_argument(
@@ -2053,20 +2293,27 @@ def setup_parser():
         )
 
 
-    # Backup subcommand parser
-    def add_backup_parser(subparsers, formatter):
+    # Capture subcommand parser
+    def add_capture_parser(subparsers, formatter):
         subparser = subparsers.add_parser(
-            "backup", formatter_class=formatter, add_help=False,
-            help=f"Creates a backup (can send to remote)",
+            "capture", formatter_class=formatter, add_help=False,
+            help=f"Create a snapshot (can send to remote)",
         )
         add_snap_options(
-            subparser, "Backup to a custom directory (checksum subdir will be created)"
+            subparser, "Snapshot output directory (checksum subdir will be created)"
         )
-        subgroup = subparser.add_argument_group("backup options")
+        subgroup = subparser.add_argument_group("capture options")
+        subgroup.add_argument(
+            "-s",
+            "--source-host",
+            metavar="<host>",
+            dest="source",
+            help="Remote host to run capture on (user@hostname)",
+        )
         subgroup.add_argument(
             "--host",
             metavar="<host>",
-            help="Destination host to copy backup to (user@hostname)",
+            help="Destination host to copy snapshot to (user@hostname)",
         )
         add_cli_options(subparser)
 
@@ -2077,41 +2324,87 @@ def setup_parser():
             "check", formatter_class=formatter, add_help=False,
             help="Calculate and display file checksums",
         )
+        subparser.add_argument(
+            "files",
+            nargs="*",
+            metavar="file",
+            help="File(s) to checksum",
+        )
         subgroup = subparser.add_argument_group("checksum options")
         subgroup.add_argument(
-            "-f",
-            "--file",
-            metavar="<file>",
-            action="append",
-            dest="files",
-            help="File to checksum (can be specified multiple times)",
+            "--ignore-invalid",
+            action="store_true",
+            help="Ignore and skip any invalid or missing files",
+        )
+        subgroup.add_argument(
+            "--full-path",
+            action="store_true",
+            help="Show full file path instead of just name",
+        )
+        subgroup.add_argument(
+            "--no-path",
+            action="store_true",
+            help="Show only the checksum (no file name)",
         )
         add_cli_options(subparser)
+
+
+    # Migrate subcommand parser
+    def add_migrate_parser(subparsers, formatter):
+        migrate_parser = subparsers.add_parser(
+            "migrate", formatter_class=formatter, add_help=False,
+            help="Capture on source, restore on destination",
+        )
+        add_snap_options(
+            migrate_parser,
+            "Snapshot capture directory (default: temp directory)",
+        )
+        migrate_group = migrate_parser.add_argument_group("migrate options")
+        migrate_group.add_argument(
+            "-s",
+            "--source-host",
+            metavar="<host>",
+            dest="source",
+            help="Source host to migrate from (user@hostname, default: local)",
+        )
+        migrate_group.add_argument(
+            "-h",
+            "--dest-host",
+            metavar="<host>",
+            dest="host",
+            help="Destination host to migrate to (user@hostname, default: local)",
+        )
+        migrate_group.add_argument(
+            "--disable-rollback",
+            action="store_true",
+            help="Disable automatic backup/rollback of existing files on destination",
+        )
+        add_cli_options(migrate_parser)
 
 
     # Restore subcommand parser
     def add_restore_parser(subparsers, formatter):
         subparser = subparsers.add_parser(
             "restore", formatter_class=formatter, add_help=False,
-            help="Restore from a backup (local or remote)",
+            help="Restore from a snapshot (local or remote)",
         )
         add_snap_options(
             subparser,
-            "Date directory containing backup (e.g., <root>/backups/YYYY/MM-DD)",
+            "Directory containing snapshot(s) (default: <root>/captures/YYYY/MM-DD)",
         )
         subgroup = subparser.add_argument_group("restore options")
         subgroup.add_argument(
             "-c",
             "--checksum",
             metavar="<hash>",
-            help="Backup checksum prefix (auto-selects latest if omitted)",
+            help="Snapshot checksum prefix (searches snapshot dir if omitted)",
         )
         subgroup.add_argument(
             "-s",
             "--source-host",
             metavar="<host>",
             dest="source",
-            help="Source host to pull backup from (user@hostname)",
+            help="Source host to pull snapshot from (user@hostname)",
         )
         subgroup.add_argument(
             "-h",
@@ -2121,9 +2414,9 @@ def setup_parser():
             help="Destination host to restore on (user@hostname)",
         )
         subgroup.add_argument(
-            "--disable-backups",
+            "--disable-rollback",
             action="store_true",
-            help="Disable intermediate backup of existing files (requires confirmation)",
+            help="Disable intermediate backup/rollback of existing files (requires confirmation)",
         )
         add_cli_options(subparser)
 
@@ -2133,17 +2426,18 @@ def setup_parser():
     snap_parser = argparse.ArgumentParser(
         add_help=False,
         formatter_class=raw_formatter,
-        description="Backup and restore utility for creating system snapshots",
+        description="Snapshot and restore utility",
     )
     subparsers = snap_parser.add_subparsers(
-        dest="command", required=True, title="commands", metavar=''
+        dest="command", title="commands", metavar=''
     )
     add_cli_options(snap_parser)
 
     # Add subparsers
-    add_backup_parser(subparsers, raw_formatter)
     add_check_parser(subparsers, raw_formatter)
+    add_capture_parser(subparsers, raw_formatter)
     add_restore_parser(subparsers, raw_formatter)
+    add_migrate_parser(subparsers, raw_formatter)
 
     return snap_parser
 
@@ -2153,6 +2447,10 @@ def main():
 
     parser = setup_parser()
     args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help()
+        sys.exit(1)
 
     # Don't need to worry about DRY_RUN here.
     if args.command == "check":
@@ -2166,12 +2464,15 @@ def main():
     # Resolve root directory (checks PWD for .snap, then ~/.snap)
     args.root = resolve_root(args.root)
 
-    if args.command == "backup":
-        cmd_func = cmd_backup
-        message = "Starting backup!"
+    if args.command == "capture":
+        cmd_func = cmd_capture
+        message = "Starting capture!"
     elif args.command == "restore":
         cmd_func = cmd_restore
         message = "Starting restoration!"
+    elif args.command == "migrate":
+        cmd_func = cmd_migrate
+        message = "Starting migration!"
     else:
         print(f"Error: unknown command {args.command}")
         sys.exit(1)

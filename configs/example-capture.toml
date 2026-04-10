@@ -1,13 +1,13 @@
-# Example backup configuration
-# Copy to backup.toml and customize for your needs
+# Example capture configuration
+# Copy to capture.toml and customize for your needs
 
 # Group directories and files under a "selection" to
-# archive, which generates a named tarball in the backup.
+# archive, which generates a named tarball in the snapshot.
 
 [tarball]
 compress = "gzip"
 checksum = "sha256"
-backups = ".bak"  # Extension for backing up existing files during restore
+rollback = ".bak"  # Extension for backing up existing files during restore
 
 # SSH keys and known_hosts
 [tar.ssh-keys]
@@ -87,7 +87,7 @@ files = [
     "nginx/*.log",    # All logs in nginx subdirectory
 ]
 
-# Optional: Run scripts before/after backup
+# Optional: Run scripts before/after capture
 [scripts]
 # before = ["scripts/dump-database.sh"]
-after = ["scripts/backup-brew.sh"]
+after = ["scripts/capture-brew.sh"]
