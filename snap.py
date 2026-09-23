@@ -9,16 +9,22 @@ import sys
 
 # Require Python 3.11+ for tomllib
 if sys.version_info < (3, 11):
-    print("Error: This script requires Python 3.11 or later", file=sys.stderr)
+    print(
+        f"Error: snap.py requires Python 3.11 or later (found {sys.version.split()[0]})",
+        file=sys.stderr,
+    )
     sys.exit(1)
 
 import argparse
+import contextlib
 import fnmatch
 import hashlib
 import json
 import os
+import platform
 import random
 import re
+import select
 import shlex
 import shutil
 import signal
@@ -34,7 +40,13 @@ import concurrent.futures as ccft
 
 from datetime import datetime
 from pathlib import Path
-from tqdm import tqdm
+
+try:
+    from tqdm import tqdm
+except ImportError:
+    print("Error: snap.py requires the tqdm package", file=sys.stderr)
+    print("  Install it with: python3 -m pip install tqdm", file=sys.stderr)
+    sys.exit(1)
 
 # Global flags
 
@@ -53,10 +65,315 @@ def printd(*args, **kwargs):
         print("[DRY-RUN]", **kwargs)
         return
     space = {"\r", "\n", "\r\n"}
-    nargs = [(f"[DRY-RUN]" if arg in space else f"[DRY-RUN] {arg}") for arg in args]
+    nargs = [("[DRY-RUN]" if arg in space else f"[DRY-RUN] {arg}") for arg in args]
     if "sep" not in kwargs:
         kwargs["sep"] = "\n"
     print(*nargs, **kwargs)
+
+
+# --- Output Helpers --- #
+
+INDENT = "  "
+BAR_FORMAT = "  {desc}: {n}/{total} [{elapsed}]"
+
+# Dry-run stand-ins for paths and values a real run would create
+DRY_RUN_DIR = "/tmp/dry-run"
+DRY_RUN_CHECKSUM = "abcd123"
+
+# Display names for the dry-run stand-ins, most specific first
+DRY_RUN_NAMES = [
+    (f"{DRY_RUN_DIR}/remote-capture", "<pulled snapshot>"),
+    (f"{DRY_RUN_DIR}/remote-restore", "<pulled snapshot>"),
+    (DRY_RUN_DIR, "<staging dir>"),
+    ("YYYY/MM-DD/latest", "<latest>"),
+    (DRY_RUN_CHECKSUM, "<checksum>"),
+]
+
+COMPRESS_HELP = "supported: gzip, bzip2, xz, '' (no compression)"
+
+# Non-fatal Error lines printed so far; finish() reports them
+_reported = {"errors": 0}
+
+# emit()'s default stream, sys.stdout at call time; an explicit None (a closed fd) drops text
+_STDOUT = object()
+
+# Keeps each message block whole when worker threads print. tqdm's own lock exists only
+# after the first bar, and making it earlier would start a multiprocessing helper process
+_output_lock = threading.RLock()
+
+# Set, under _output_lock, by the first rsync_run copy that fails; when parallel copies
+# fail together, only that one prints its output and Error block
+_copy_failed = threading.Event()
+
+
+def flush_stream(stream, strict=False):
+    """Flush a stream before other output goes to the same terminal or pipe.
+
+    Most flushes only keep stdout and stderr in order, so a reader that went away is
+    ignored there. A strict flush is one print() and tqdm already made (a bar starting,
+    the sudo re-run), so a broken stream still stops the run at that point.
+    """
+    if stream is None:
+        return  # The fd was closed at startup; there is nothing to flush
+    if strict:
+        stream.flush()
+        return
+    try:
+        stream.flush()
+    except (OSError, ValueError):
+        pass  # The next strict flush, a full buffer or the exit reports the broken pipe
+
+
+def shares_stdout(file):
+    """Check if text for file could show up ahead of buffered stdout text.
+
+    That happens when stdout is a terminal, or when both streams go to the same file or
+    pipe. When the fds can't be checked, assume they share, so the order is kept.
+    """
+    stdout = sys.stdout
+    if stdout is None:
+        return False  # The fd was closed at startup; nothing is buffered
+    try:
+        if stdout.isatty():
+            return True
+        return os.path.samestat(os.fstat(stdout.fileno()), os.fstat(file.fileno()))
+    except (AttributeError, OSError, ValueError):
+        return True  # No usable fd (a StringIO, a closed fd); the flush is harmless
+
+
+def emit(text="", level=0, file=_STDOUT):
+    """Print text through printd, one indented line at a time, without breaking live bars.
+
+    A closed stream (None) drops the text, as print() does. Write and encoding errors
+    stop the run, as they did from print(). Terminals and stderr are line-buffered; a
+    piped stdout stays block-buffered. It is flushed before stderr lines only when the
+    order shows (a terminal, or one file or pipe for both), and before bars, prompts
+    and child processes.
+    """
+    if file is _STDOUT:
+        file = sys.stdout  # looked up per call, so redirects and pytest capsys work
+    if file is None:
+        return  # The fd was closed at startup; print() drops the text too
+    if file is not sys.stdout and shares_stdout(file):
+        flush_stream(sys.stdout)  # keep the order when stdout and stderr share a pipe
+
+    lines = [line.rstrip() for line in str(text).split("\n")]
+
+    # tqdm has its lock only after the first bar; before that there is no bar to clear
+    if hasattr(tqdm, "_lock"):
+        bar_safe = tqdm.external_write_mode(file=file)
+    else:
+        bar_safe = contextlib.nullcontext()
+
+    with _output_lock, bar_safe:
+        for line in lines:
+            if line:
+                printd(INDENT * level + line, file=file)
+            else:
+                printd(file=file)
+
+
+def plural(count, word, many=None):
+    """Format a count with its noun: '1 archive', '2 archives', '3 entries'."""
+    if count != 1:
+        word = many or word + "s"
+    return f"{count} {word}"
+
+
+def labeled(label, value):
+    """Format 'label value' for a detail line, aligning further lines of value under it."""
+    first, *rest = str(value).split("\n")
+    pad = " " * (len(label) + 1)
+    return "\n".join([f"{label} {first}", *(pad + line for line in rest)])
+
+
+def shown(value):
+    """Return a value for display, naming dry-run stand-ins instead of showing them."""
+    text = str(value)
+    if __dry_run__:
+        for placeholder, name in DRY_RUN_NAMES:
+            text = text.replace(placeholder, name)
+    return text
+
+
+def is_placeholder(path):
+    """Check if a path is a dry-run stand-in for something a real run would create."""
+    return __dry_run__ and str(path).startswith(DRY_RUN_DIR)
+
+
+def here():
+    """Name this machine for From/To lines."""
+    return f"{platform.node() or 'localhost'} (this machine)"
+
+
+def banner(noun):
+    """Print a run's first line: 'Starting <noun>[ as root][ (no changes will be made)]'."""
+    title = f"Starting {noun}"
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        title += " as root"
+    if __dry_run__:
+        title += " (no changes will be made)"
+    emit(title)
+
+
+def context(source, dest):
+    """Print the From/To lines under the banner."""
+    emit(f"From: {shown(source)}", 1)
+    emit(f"To:   {shown(dest)}", 1)
+
+
+def step(title):
+    """Start a step: one blank line, then '<title>...' at column 0."""
+    emit()
+    emit(f"{title}...")
+
+
+def step_skipped(what, reason):
+    """Print a skipped step: one blank line, then 'Skipping <what> (<reason>)'."""
+    emit()
+    emit(f"Skipping {what} ({reason})")
+
+
+def note(msg):
+    """Print a 'Note:' line on stdout after one blank line."""
+    emit()
+    emit(f"Note: {msg}")
+
+
+def say(msg, level=1):
+    """Print an item (level 1) or a detail (level 2) on stdout."""
+    emit(msg, level)
+
+
+def echo(argv, level=1, verbose=False):
+    """Show a command as 'run: <shell line>': always in a dry run, with --verbose if asked."""
+    if __dry_run__ or (verbose and __verbose__):
+        emit("run: " + shlex.join(shown(arg) for arg in argv), level)
+
+
+def ok(msg, level=1, dry=None):
+    """Print '✓ msg' in a real run; in a dry run print `dry` without the mark, or nothing."""
+    if not __dry_run__:
+        emit(f"✓ {msg}", level)
+    elif dry:
+        emit(dry, level)
+
+
+def message_block(first, details):
+    """Join a message line and its details, each detail line indented one level."""
+    lines = [first]
+    for detail in details:
+        lines += [INDENT + line for line in str(detail).split("\n")]
+    return "\n".join(lines)
+
+
+def warn(msg, *details):
+    """Print 'Warning: msg' and indented details on stderr; the run continues.
+
+    The block is one emit(), so a live bar is cleared once for it.
+    """
+    emit(message_block(f"Warning: {msg}", details), file=sys.stderr)
+
+
+def error(msg, *details):
+    """Print 'Error: msg' and indented details on stderr, and count it for finish().
+
+    The block is one emit(), so a live bar is cleared once for it.
+    """
+    with _output_lock:
+        _reported["errors"] += 1
+        emit(message_block(f"Error: {msg}", details), file=sys.stderr)
+
+
+def fatal(msg, *details):
+    """Print an error and exit with status 1."""
+    error(msg, *details)
+    sys.exit(1)
+
+
+def compress_error(value, source, stop=True):
+    """Report an unknown [tarball] compress value and where it came from."""
+    report = fatal if stop else error
+    report(f"Unsupported compression '{value}' in {source}", COMPRESS_HELP)
+
+
+def relay(text, level=2, file=_STDOUT):
+    """Print captured child output after it ends, indented; CR redraws keep their last state."""
+    if isinstance(text, bytes):
+        text = text.decode(errors="replace")  # TimeoutExpired output can be bytes
+    text = (text or "").rstrip()
+    if not text:
+        return
+
+    lines = []
+    for raw in text.split("\n"):
+        line = raw.rstrip("\r").rsplit("\r", 1)[-1]
+        if line.strip() or "\r" not in raw:
+            lines.append(line)
+
+    # Leading blank lines would separate the output from the line that introduced it
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    emit("\n".join(lines), level, file)
+
+
+def ask(question, level=2):
+    """Ask a yes/no question; only 'y' or 'yes' (any case) is yes, EOF and Ctrl-C are no."""
+    prompt = f"{question} [y/N]: "
+    if __dry_run__:
+        emit(f"{prompt}y (assumed in a dry run)", level)
+        return True
+
+    # A terminal echoes an answer typed before the prompt appears, so input() won't
+    # show it after the prompt
+    typed_ahead = False
+    try:
+        if sys.stdin.isatty():
+            typed_ahead = bool(select.select([sys.stdin], [], [], 0)[0])
+    except (AttributeError, OSError, ValueError):
+        pass  # No usable stdin; input() below reports it
+
+    flush_stream(sys.stdout)
+    flush_stream(sys.stderr)
+    try:
+        answer = input(INDENT * level + prompt)
+    except (EOFError, KeyboardInterrupt):
+        emit()  # end the prompt line
+        emit("skip: no answer", level)
+        return False
+    except RuntimeError as e:
+        # input() lost stdin, stdout or stderr ('input(): lost sys.stdout'); this exits 1
+        # where the traceback did
+        stream = "stdin"
+        for name in ("stdout", "stderr"):
+            if name in str(e):
+                stream = name
+        fatal(f"Cannot ask '{question}': {stream} is closed")
+
+    # Only a terminal on both ends shows the typed answer after the prompt; otherwise
+    # (piped input, output to a pipe or log, or an answer typed ahead) echo it so the
+    # line ends and logs show it
+    if typed_ahead or not (sys.stdin.isatty() and sys.stdout.isatty()):
+        emit(answer.strip())
+    if answer.strip().lower() in ("y", "yes"):
+        return True
+    emit("skip: declined", level)
+    return False
+
+
+def finish(msg, success=True):
+    """Print the command's one final line after a blank line."""
+    emit()
+    errors = _reported["errors"]
+    if __dry_run__:
+        extra = f" with {plural(errors, 'error')}" if errors else ""
+        emit(f"Dry run completed{extra}; no changes were made")
+    elif errors:
+        emit(f"{msg} ({plural(errors, 'error')} reported above)")
+    elif success:
+        emit(f"✓ {msg}")
+    else:
+        emit(msg)
 
 
 # --- Subprocess Runners --- #
@@ -73,8 +390,20 @@ REMOTE_DIR_SUFFIX_LENGTH = 8
 AVG_DOWNLOAD_RATE = 50
 
 
-def ssh_run(host, *commands, check=True, stdin_data=None, tty=False, quiet=False):
-    """Execute commands on remote host with timeout and proper error handling."""
+def ssh_run(
+    host,
+    *commands,
+    check=True,
+    stdin_data=None,
+    tty=False,
+    quiet=False,
+    desc="Remote command",
+    level=1,
+):
+    """Execute commands on remote host with timeout and proper error handling.
+
+    desc names the action in error lines; level indents the run: echo and relayed output.
+    """
     command_str = " && ".join(commands)
 
     ssh_args = [
@@ -88,22 +417,17 @@ def ssh_run(host, *commands, check=True, stdin_data=None, tty=False, quiet=False
         ssh_args.append("-t")
     ssh_args.extend([host, command_str])
 
+    if not quiet:
+        echo(ssh_args, level, verbose=True)
     if __dry_run__:
-        if quiet:
-            return None
-        printd(f"ssh {host}:")
-        for cmd in commands:
-            printd(f"  {cmd}")
-        if stdin_data:
-            if len(stdin_data) > 100:
-                printd(f"  stdin: {stdin_data[:100]}...")
-            else:
-                printd(f"  stdin: {stdin_data}")
         return None
 
     try:
         # For TTY operations, don't capture output (interactive)
         if tty:
+            # The child writes to the terminal directly; print everything before it first
+            flush_stream(sys.stdout)
+            flush_stream(sys.stderr)
             result = subprocess.run(
                 ssh_args,
                 check=check,
@@ -123,24 +447,28 @@ def ssh_run(host, *commands, check=True, stdin_data=None, tty=False, quiet=False
             capture_output=True,
         )
         return (result.returncode, result.stdout, result.stderr)
-    except subprocess.TimeoutExpired:
-        printd(f"Error: Command timed out on {host}", file=sys.stderr)
-        sys.exit(1)
+    except subprocess.TimeoutExpired as e:
+        # Print what the command wrote before it hung, then the error
+        relay(e.stdout, level)
+        relay(e.stderr, level, sys.stderr)
+        fatal(f"{desc} timed out on {host} after {COMMAND_TIMEOUT}s")
     except subprocess.CalledProcessError as e:
         # Print captured output on error before exiting
-        if e.stdout:
-            printd(e.stdout, end="")
-        if e.stderr:
-            printd(e.stderr, end="", file=sys.stderr)
-        printd(f"Error: SSH command failed on {host}", file=sys.stderr)
-        sys.exit(1)
+        relay(e.stdout, level)
+        relay(e.stderr, level, sys.stderr)
+        if e.returncode == 255:
+            fatal(f"{desc} failed on {host}: ssh error (exit status 255)")
+        fatal(f"{desc} failed on {host} (exit status {e.returncode})")
 
 
-def rsync_run(source, dest, check=True):
+def rsync_run(source, dest, check=True, desc=None):
     """Execute rsync with timeout based on file size.
 
-    Returns tuple: (returncode, stdout, stderr)
+    Returns tuple: (returncode, stdout, stderr). desc names the copy in error lines.
     """
+    if desc is None:
+        desc = Path(source).name
+
     # Simple timeout calculation for archives and small files
     # We transfer: .tar.gz archives, snapshot TOML, snap.py, configs, scripts
     timeout = MIN_RSYNC_TIMEOUT
@@ -161,11 +489,7 @@ def rsync_run(source, dest, check=True):
     rsync_cmd.extend([f"--timeout={timeout}", source, dest])
 
     if __dry_run__:
-        printd(f"{shlex.join(rsync_cmd)}")
-        # Show file size if available
-        if ":" not in source and Path(source).is_file():
-            size_mb = Path(source).stat().st_size / (1024 * 1024)
-            printd(f"  file size: {size_mb:.2f} MB, timeout: {timeout}s")
+        echo(rsync_cmd)
         return None
 
     try:
@@ -177,17 +501,32 @@ def rsync_run(source, dest, check=True):
             text=True,
         )
         return (result.returncode, result.stdout, result.stderr)
-    except subprocess.TimeoutExpired:
-        printd(f"Error: rsync timed out copying {source} to {dest}", file=sys.stderr)
-        sys.exit(1)
+    except subprocess.TimeoutExpired as e:
+        # rsync's stdout holds only --info=progress2 text, which is never shown. One
+        # block, since this can run in an rsync_parallel worker; only the first failed
+        # copy prints it, and the others exit quietly
+        with _output_lock:
+            if _copy_failed.is_set():
+                sys.exit(1)
+            _copy_failed.set()
+            relay(e.stderr, 1, sys.stderr)
+            fatal(
+                f"Copying {desc} timed out after {timeout + TIMEOUT_BUFFER}s",
+                labeled("from:", source),
+                labeled("to:  ", dest),
+            )
     except subprocess.CalledProcessError as e:
-        # Print captured output on error before exiting
-        if e.stdout:
-            printd(e.stdout, end="")
-        if e.stderr:
-            printd(e.stderr, end="", file=sys.stderr)
-        printd(f"Error: rsync failed copying {source} to {dest}", file=sys.stderr)
-        sys.exit(1)
+        # Print rsync's errors before exiting (its stdout is only progress text)
+        with _output_lock:
+            if _copy_failed.is_set():
+                sys.exit(1)
+            _copy_failed.set()
+            relay(e.stderr, 1, sys.stderr)
+            fatal(
+                f"Copying {desc} failed (rsync exit status {e.returncode})",
+                labeled("from:", source),
+                labeled("to:  ", dest),
+            )
 
 
 def dtqdm(total, desc="", unit="item", autorefresh=None, **kwargs):
@@ -210,8 +549,8 @@ def dtqdm(total, desc="", unit="item", autorefresh=None, **kwargs):
         def update(self, n=1):
             pass
 
-        def write(self, msg):
-            printd(msg)
+        def write(self, msg, file=_STDOUT):
+            emit(msg, file=file)
 
     class _AutoRefreshProgress:
         """Wrapper that auto-refreshes progress bar."""
@@ -241,12 +580,22 @@ def dtqdm(total, desc="", unit="item", autorefresh=None, **kwargs):
         def update(self, n=1):
             return self.pbar.update(n)
 
-        def write(self, msg):
-            return self.pbar.write(msg)
+        def write(self, msg, file=_STDOUT):
+            emit(msg, file=file)
 
     if __dry_run__:
         return _dtqdm()
 
+    kwargs.setdefault("bar_format", BAR_FORMAT)
+    kwargs.setdefault("leave", False)  # a finished bar clears its line
+    kwargs.setdefault("disable", None)  # draw only when stderr is a terminal
+    # tqdm drops bar_format on a terminal that reports 0 columns; shutil falls back to 80
+    kwargs.setdefault("ncols", shutil.get_terminal_size().columns)
+
+    # Starting a bar flushes stderr and stdout, as a drawn tqdm bar always has, even when
+    # no bar is drawn; a broken stream stops the run here, as it always has
+    flush_stream(sys.stderr, strict=True)
+    flush_stream(sys.stdout, strict=True)
     pbar = tqdm(total=total, desc=desc, unit=unit, **kwargs)
 
     # Auto-refresh if requested or for unknown totals
@@ -261,39 +610,34 @@ def rsync_parallel(transfers):
     if not transfers:
         return 0
 
-    printd(f"Transferring {len(transfers)} file(s) in parallel...")
+    # A failed copy exits the run, so this starts a new group of copies
+    _copy_failed.clear()
+
+    # A dry run shows each rsync command it skips
+    if __dry_run__:
+        for source, dest, desc in transfers:
+            rsync_run(source, dest, desc=desc)
+        return len(transfers)
+
     if __verbose__:
         for source, dest, desc in transfers:
-            printd(f"  {desc}: {source} -> {dest}")
-
-    if __dry_run__:
-        return len(transfers)
+            say(f"{desc}: {source} -> {dest}")
     success_count = 0
 
-    with dtqdm(
-        len(transfers),
-        "  Transfer progress",
-        " files",
-        bar_format="{desc}: {n}/{total} [{elapsed}, {rate_fmt}]",
-        autorefresh=True,
-    ) as pbar:
+    with dtqdm(len(transfers), "Copying files", autorefresh=True) as pbar:
 
         def transfer_with_desc(transfer):
             source, dest, desc = transfer
             try:
-                if __verbose__:
-                    pbar.write(f"  Starting: {desc}")
-                returncode, stdout, stderr = rsync_run(source, dest)
-                # Print any output after transfer completes
-                if stdout and __verbose__:
-                    pbar.write(stdout.strip())
+                _, _, stderr = rsync_run(source, dest, desc=desc)
+                # Print any problems after the transfer completes, as one block
                 if stderr:
-                    pbar.write(f"  rsync stderr: {stderr.strip()}")
-                if __verbose__:
-                    pbar.write(f"  Completed: {desc}")
+                    with _output_lock:
+                        warn(f"rsync reported problems copying {desc}")
+                        relay(stderr, 1, sys.stderr)
                 return True
             except Exception as e:
-                pbar.write(f"  Error transferring {desc}: {e}")
+                error(f"Cannot copy {desc}: {e}")
                 return False
 
         with ccft.ThreadPoolExecutor(max_workers=len(transfers)) as exc:
@@ -303,17 +647,36 @@ def rsync_parallel(transfers):
                     success_count += 1
                 pbar.update(1)
 
-    printd()
-    if success_count < len(transfers):
-        printd(
-            f"Warning: Only {success_count}/{len(transfers)} transfers succeeded",
-            file=sys.stderr,
-        )
+    # Per-file results print after the bar closes, in transfer order
+    if __verbose__:
+        for future, (_, _, desc) in futures.items():
+            if future.result():
+                ok(f"{desc} copied")
 
     return success_count
 
 
-def run_scripts(root_dir, config, when, working_dir, remote_host=None, remote_dir=None):
+def rsync_copy(source, dest, desc, label=None):
+    """Copy one path with rsync_run; --verbose lists it like rsync_parallel.
+
+    desc names the copy in error lines; label names it in the verbose lines.
+    """
+    label = label or desc
+    if __verbose__ and not __dry_run__:
+        say(labeled(f"{label}:", f"{source} -> {dest}"))
+    _copy_failed.clear()  # a single copy always reports its own failure
+    result = rsync_run(source, dest, desc=desc)
+    if result is not None and result[0] == 0 and result[2].strip():
+        warn(f"rsync reported problems copying {desc}")
+        relay(result[2], 1, sys.stderr)
+    if __verbose__ and result is not None and result[0] == 0:
+        ok(f"{label} copied")
+    return result
+
+
+def run_scripts(
+    root_dir, config, when, working_dir, remote_host=None, remote_dir=None, phase=None
+):
     """Run scripts before or after an operation (local or remote).
 
     Args:
@@ -323,41 +686,44 @@ def run_scripts(root_dir, config, when, working_dir, remote_host=None, remote_di
         working_dir: Directory to cd into before running scripts (capture directory)
         remote_host: If set, run on remote host
         remote_dir: Remote directory (when remote_host is set)
+        phase: Display only; names the migration phase ('capture before scripts')
     """
-    if not config or "scripts" not in config:
-        printd(
-            "\n",
-            f"Config has no [scripts] table, skipping {when} script execution...",
-            "\n",
-        )
-        return
+    what = f"{when} scripts"
+    if phase:
+        what = f"{phase} {what}"
+    if remote_host:
+        what += f" on {remote_host}"
 
-    if when not in config["scripts"]:
-        printd(
-            "\n",
-            f"No {when} list defined in [scripts] table, skipping execution...",
-            "\n",
-        )
-        return
-
-    scripts = config["scripts"][when]
+    scripts = None
+    if config and "scripts" in config and when in config["scripts"]:
+        scripts = config["scripts"][when]
     if not scripts:
-        printd("\n", f"Skipping {when} script execution ([scripts].{when} = [])", "\n")
+        step_skipped(what, "none configured")
+        return
+
+    # With every script missing there is nothing to run under a 'Running' step
+    try:
+        missing = [path for path in scripts if not (root_dir / path).exists()]
+    except (TypeError, OSError):
+        missing = []  # A bad entry fails in the loop below, where it always has
+    if missing and len(missing) == len(scripts):
+        step_skipped(what, "no scripts found")
+        for run_script_path in missing:
+            warn(f"Script {run_script_path} not found in {root_dir}; skipping it")
         return
 
     if remote_host:
-        printd("\n", f"Running {when} scripts on remote...", "\n")
+        step(f"Running {what} with sudo")
     else:
-        printd("\n", f"Running {when} scripts...", "\n")
+        step(f"Running {what}")
 
     for run_script_path in scripts:
         script_path = root_dir / run_script_path
         if not script_path.exists():
-            printd(
-                f"  Warning: Script {script_path} not found, skipping", file=sys.stderr
-            )
+            warn(f"Script {run_script_path} not found in {root_dir}; skipping it")
             continue
         script_name = script_path.name
+        say(script_name)
 
         if remote_host:
             # Run on remote with sudo, in the remote capture directory
@@ -369,21 +735,20 @@ def run_scripts(root_dir, config, when, working_dir, remote_host=None, remote_di
                 f"chmod +x {escaped_script}",
                 f"sudo bash {escaped_script}",
             ]
-            returncode, stdout, stderr = ssh_run(remote_host, *cmds)
+            _, stdout, stderr = ssh_run(
+                remote_host, *cmds, desc=f"Script {script_name}", level=2
+            )
             # Print script output after completion
-            if stdout:
-                printd(stdout, end="")
-            if stderr:
-                printd(stderr, end="", file=sys.stderr)
-            printd(f"return code: {returncode}")
+            relay(stdout, 2)
+            relay(stderr, 2, sys.stderr)
+            ok(f"{script_name} completed")
         else:
             # Run locally in the capture directory
             script_cmd = ["bash", str(script_path)]
             if __dry_run__:
-                printd(f"{shlex.join(script_cmd)}")
+                echo(script_cmd, 2)
                 if working_dir:
-                    printd(f"  cwd: {working_dir}")
-                printd(f"  timeout: {COMMAND_TIMEOUT}s")
+                    say(f"cwd: {shown(working_dir)}", 2)
             else:
                 try:
                     result = subprocess.run(
@@ -395,22 +760,18 @@ def run_scripts(root_dir, config, when, working_dir, remote_host=None, remote_di
                         text=True,
                     )
                     # Print script output after completion
-                    if result.stdout:
-                        printd(result.stdout, end="")
-                    if result.stderr:
-                        printd(result.stderr, end="", file=sys.stderr)
-                    printd(f"return code: {result.returncode}")
-                except subprocess.TimeoutExpired:
-                    printd(f"Error: Script {script_name} timed out", file=sys.stderr)
-                    sys.exit(1)
+                    relay(result.stdout, 2)
+                    relay(result.stderr, 2, sys.stderr)
+                    ok(f"{script_name} completed")
+                except subprocess.TimeoutExpired as e:
+                    relay(e.stdout, 2)
+                    relay(e.stderr, 2, sys.stderr)
+                    fatal(f"Script {script_name} timed out after {COMMAND_TIMEOUT}s")
                 except subprocess.CalledProcessError as e:
                     # Print captured output on error
-                    if e.stdout:
-                        printd(e.stdout, end="")
-                    if e.stderr:
-                        printd(e.stderr, end="", file=sys.stderr)
-                    printd(f"Error: Script {script_name} failed", file=sys.stderr)
-                    sys.exit(1)
+                    relay(e.stdout, 2)
+                    relay(e.stderr, 2, sys.stderr)
+                    fatal(f"Script {script_name} failed (exit status {e.returncode})")
 
 
 # --- Snap Configuration --- #
@@ -425,12 +786,13 @@ DEFAULT_CONFIG_MIGRATE = "configs/migrate.toml"
 DEFAULT_SNAPSHOT_TOML = "snapshot.toml"
 
 
-def parse_remote_arg(value):
+def parse_remote_arg(value, flag=None):
     """Parse a [user@]host:[path], user@host, or local path argument into (host, path).
 
     Returns (None, None) for empty values, (None, path) for local paths,
     or (host, path) for remote. 'user@host' and 'host:' return (host, None).
     A local path containing '@' needs a '/' (e.g. './name@tag').
+    flag names the option the value came from in error lines.
     """
     if not value:
         return None, None
@@ -448,8 +810,11 @@ def parse_remote_arg(value):
     # Reject empty parts and hosts that ssh/rsync would parse as options
     user, at, hostname = host.rpartition("@")
     if not hostname or hostname.startswith("-") or user.startswith("-") or (at and not user):
-        printd(f"Error: Invalid host '{host}'", file=sys.stderr)
-        sys.exit(1)
+        where = f"{flag} '{value}'" if flag else f"'{value}'"
+        fatal(
+            f"Invalid host '{host}' in {where}",
+            "Use [user@]host[:path]; the user and host cannot be empty or start with '-'",
+        )
 
     return host, Path(path) if path else None
 
@@ -457,6 +822,17 @@ def parse_remote_arg(value):
 def expand_path(path_str):
     """Expand environment variables and user home in a path string."""
     return Path(os.path.expandvars(path_str)).expanduser()
+
+
+def root_display(root):
+    """Expand an archive root for display, or show it as given if it can't be expanded.
+
+    Display only: the action that uses the root reports the real error.
+    """
+    try:
+        return expand_path(root) if root else Path("/")
+    except (RuntimeError, KeyError, OSError, TypeError):
+        return Path(str(root))
 
 
 def resolve_root(specified_root, root_host=None):
@@ -495,15 +871,12 @@ def resolve_root(specified_root, root_host=None):
         return home_root.resolve()
 
     # None found - error
-    printd("Error: No .snap directory found", file=sys.stderr)
-    printd(f"  Searched: {pwd_root}", file=sys.stderr)
-    printd(f"  Searched: {home_root}", file=sys.stderr)
-    printd(
-        "\n",
-        "Create a .snap directory manually or specify a custom location with --snap-root",
-        file=sys.stderr,
+    fatal(
+        "No .snap directory found",
+        f"searched: {pwd_root}",
+        f"searched: {home_root.resolve()}",
+        "Create a .snap directory, or pass -r/--snap-root <path>",
     )
-    sys.exit(1)
 
 
 def resolve_snapshot_root(captures_dir):
@@ -512,8 +885,10 @@ def resolve_snapshot_root(captures_dir):
     Tries today first, then scans all YYYY/MM-DD directories for the latest.
     """
     if not captures_dir.exists():
-        printd(f"Error: Captures directory {captures_dir} does not exist", file=sys.stderr)
-        sys.exit(1)
+        fatal(
+            f"Captures directory not found: {captures_dir}",
+            "Run 'snap.py capture' first, or pass --from <snapshot>",
+        )
 
     # Try today first
     now = datetime.now()
@@ -536,10 +911,11 @@ def resolve_snapshot_root(captures_dir):
             break
 
     if not latest:
-        printd(f"Error: No captures found in {captures_dir}", file=sys.stderr)
-        sys.exit(1)
+        fatal(
+            f"No snapshots found in {captures_dir}",
+            "Run 'snap.py capture' first, or pass --from <snapshot>",
+        )
 
-    printd(f"Auto-selected latest date: {latest.relative_to(captures_dir)}")
     return latest
 
 
@@ -558,22 +934,21 @@ def resolve_remote_snapshot(host, captures_dir):
         f" | sort -r | head -1"
     )
 
+    step(f"Finding the latest snapshot on {host}")
+    result = ssh_run(host, find_cmd, check=False, desc="Finding the latest snapshot")
     if __dry_run__:
-        printd(f"Finding latest snapshot on {host}...")
-        ssh_run(host, find_cmd, quiet=True)
         # Return a placeholder path for dry-run
         return captures_dir / "YYYY" / "MM-DD" / "latest"
 
-    result = ssh_run(host, find_cmd, check=False)
     if result is None or result[0] != 0 or not result[1].strip():
-        printd(
-            f"Error: No captures found on {host}:{captures_dir}",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+        if result and result[2]:
+            relay(result[2], 1, sys.stderr)
+        if result and result[0] == 255:
+            fatal(f"Finding the latest snapshot failed on {host}: ssh error (exit status 255)")
+        fatal(f"No snapshots found in {host}:{captures_dir}")
 
     latest = Path(result[1].strip())
-    printd(f"Auto-selected latest snapshot on {host}: {latest.relative_to(captures_dir)}")
+    say(f"latest: {latest.relative_to(captures_dir)}")
     return latest
 
 
@@ -585,11 +960,9 @@ def load_config(root_dir, config_name):
         with open(config_file, "rb") as f:
             return tomllib.load(f)
     except FileNotFoundError:
-        printd(f"Error: Config file {config_file} not found", file=sys.stderr)
-        sys.exit(1)
+        fatal(f"Config file not found: {config_file}")
     except tomllib.TOMLDecodeError as e:
-        printd(f"Error parsing TOML: {e}", file=sys.stderr)
-        sys.exit(1)
+        fatal(f"Cannot parse {config_file}: {e}")
 
 
 def toml_string(value):
@@ -628,128 +1001,116 @@ def load_remote_config(root_host, root_path, config_name):
     remote_src = f"{root_host}:{root_path / config_name}"
     tmp = Path(tempfile.mktemp(suffix=".toml", prefix="remote-config-"))
 
+    step(f"Copying {config_name} from {root_host}")
     try:
+        # A dry run only shows the rsync command, so it has no settings to return
+        result = rsync_copy(
+            remote_src, str(tmp), f"{config_name} from {root_host}", label=config_name
+        )
         if __dry_run__:
-            printd(f"Fetch config from {remote_src}")
+            note(
+                f"A dry run does not read {config_name} from {root_host}; "
+                "its settings are unknown"
+            )
             return {}
 
-        result = rsync_run(remote_src, str(tmp))
         if result is None or result[0] != 0:
-            printd(
-                f"Error: Failed to fetch {config_name} from {root_host}",
-                file=sys.stderr,
-            )
-            sys.exit(1)
+            fatal(f"Cannot copy {config_name} from {root_host}")
 
         with open(tmp, "rb") as f:
             return tomllib.load(f)
     except tomllib.TOMLDecodeError as e:
-        printd(f"Error parsing remote TOML: {e}", file=sys.stderr)
-        sys.exit(1)
+        fatal(f"Cannot parse {config_name} from {root_host}: {e}")
     finally:
         if tmp.exists():
             tmp.unlink()
 
 
-def verify_capture_config(config, config_name):
-    """Verify capture configuration structure."""
+def verify_capture_config(config, config_name, table="tar"):
+    """Verify capture configuration structure.
+
+    table names the [tar] table in error lines (migrate.toml calls it [capture.tar]).
+    """
     if "tar" not in config:
-        printd(f"Error: {config_name} missing required [tar] section", file=sys.stderr)
-        sys.exit(1)
+        fatal(f"{config_name}: missing required [{table}] table")
 
     tar_config = config["tar"]
     if not tar_config or not isinstance(tar_config, dict):
-        printd(
-            f"Error: {config_name} [tar] section is empty or invalid", file=sys.stderr
-        )
-        sys.exit(1)
+        fatal(f"{config_name}: [{table}] must be a non-empty table")
 
     # Verify each category has required fields
     for category, data in tar_config.items():
         if not isinstance(data, dict):
-            printd(
-                f"Error: {config_name} [tar.{category}] must be a table",
-                file=sys.stderr,
-            )
-            sys.exit(1)
+            fatal(f"{config_name}: [{table}.{category}] must be a table")
 
         if "root" not in data:
-            printd(
-                f"Error: {config_name} [tar.{category}] missing required 'root' field",
-                file=sys.stderr,
-            )
-            sys.exit(1)
+            fatal(f"{config_name}: [{table}.{category}] is missing the required 'root' key")
 
         if "dirs" not in data and "files" not in data:
-            printd(
-                f"Error: {config_name} [tar.{category}] must have 'dirs' or 'files' field",
-                file=sys.stderr,
-            )
-            sys.exit(1)
+            fatal(f"{config_name}: [{table}.{category}] needs a 'dirs' or 'files' key")
 
 
 def verify_restore_config(config, config_name):
     """Verify restore/deploy configuration structure."""
     if "tar" not in config:
-        printd(f"Error: {config_name} missing required [tar] section", file=sys.stderr)
-        sys.exit(1)
+        fatal(f"{config_name}: missing required [tar] table")
 
     tar_config = config["tar"]
     if not isinstance(tar_config, dict):
-        printd(f"Error: {config_name} [tar] section must be a table", file=sys.stderr)
-        sys.exit(1)
+        fatal(f"{config_name}: [tar] must be a table")
 
     if "archives" not in tar_config:
-        printd(
-            f"Error: {config_name} [tar] section missing 'archives' field",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+        fatal(f"{config_name}: [tar] is missing the required 'archives' key")
 
     archives = tar_config["archives"]
     if archives is not None and not isinstance(archives, list):
-        printd(
-            f"Error: {config_name} [tar].archives must be a list or null",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+        fatal(f"{config_name}: the 'archives' key in [tar] must be an array of names or patterns")
 
 
-def verify_snapshot(capture_dir):
-    """Validate that a capture directory contains required files."""
-    if __dry_run__ and not capture_dir.exists():
-        return None
+def verify_snapshot(capture_dir, label=None):
+    """Validate that a capture directory contains required files.
+
+    label names the snapshot in error lines (defaults to capture_dir).
+    """
+    if label is None:
+        label = capture_dir
 
     if not capture_dir.exists():
-        printd(
-            f"Error: Snapshot directory {capture_dir} does not exist", file=sys.stderr
+        if is_placeholder(capture_dir):
+            return None
+        if __dry_run__:
+            error(f"Snapshot directory not found: {label}", "A real run stops here")
+            return None
+        fatal(
+            f"Snapshot directory not found: {label}",
+            "Pass --from a snapshot directory (captures/YYYY/MM-DD/<checksum>), "
+            "a date directory, or [user@]host: for a remote snapshot",
         )
-        sys.exit(1)
 
     toml_path = capture_dir / DEFAULT_SNAPSHOT_TOML
     if not toml_path.exists():
-        printd(
-            f"Error: {DEFAULT_SNAPSHOT_TOML} not found in {capture_dir}",
-            file=sys.stderr,
+        fatal(
+            f"{DEFAULT_SNAPSHOT_TOML} not found in {label}",
+            "A snapshot directory looks like captures/YYYY/MM-DD/<checksum>",
         )
-        sys.exit(1)
 
     # Load compression type from snapshot TOML
-    with open(toml_path, "rb") as f:
-        snapshot_config = tomllib.load(f)
+    try:
+        with open(toml_path, "rb") as f:
+            snapshot_config = tomllib.load(f)
+    except tomllib.TOMLDecodeError as e:
+        fatal(f"Cannot parse {label}/{DEFAULT_SNAPSHOT_TOML}: {e}")
 
     compress_type = snapshot_config.get("tarball", {}).get("compress", "gzip")
     if compress_type not in COMPRESS_MAP:
-        printd(f"Error: Unsupported compression type: {compress_type}", file=sys.stderr)
-        sys.exit(1)
+        compress_error(compress_type, DEFAULT_SNAPSHOT_TOML)
 
     ext, _ = COMPRESS_MAP[compress_type]
 
     # Check that at least one tar archive exists
     archives = list(capture_dir.glob(f"*{ext}"))
     if not archives:
-        printd(f"Error: No tar archives found in {capture_dir}", file=sys.stderr)
-        sys.exit(1)
+        fatal(f"No archives found in {label}")
 
     return toml_path
 
@@ -771,6 +1132,7 @@ def archive_classify(paths, truthy, falsey, cond):
     """
     Formats `paths` into two lists of text, 'truthy' and 'falsey',
     decided based on lambda `cond(path)` for each path in `paths`.
+    Each group is one count line, or one sorted line per path with --verbose.
     """
     groups = {truthy: [], falsey: []}
     for path in paths:
@@ -778,22 +1140,14 @@ def archive_classify(paths, truthy, falsey, cond):
             groups[truthy] += [path]
         else:
             groups[falsey] += [path]
-    if not groups[truthy]:
-        return [], []
-    if __verbose__:
-        for prefix in groups:
-            group = groups[prefix]
-            for n, path in enumerate(group):
-                group[n] = f"{prefix}: '{path}'"
-    else:
-        for prefix in groups:
-            if not groups[prefix]:
-                continue
-            length = len(groups[prefix])
-            suffix = "s" * (length > 1)
-            msg = f"{prefix}: {length} path{suffix}"
-            groups[prefix] = [msg]
-    return groups[truthy], groups[falsey]
+
+    lines = {truthy: [], falsey: []}
+    for prefix, group in groups.items():
+        if __verbose__:
+            lines[prefix] = [f"{prefix}: {path}" for path in sorted(group)]
+        elif group:
+            lines[prefix] = [f"{prefix}: {plural(len(group), 'path')}"]
+    return lines[truthy], lines[falsey]
 
 
 def archive_filter(tarinfo):
@@ -823,7 +1177,7 @@ def archive_expand(patterns, root_path):
                         expanded.append(str(rel_path))
                         matched_paths.add(str(rel_path))
             else:
-                warnings += [f"skipped: pattern '{pattern}'"]
+                warnings += [f"skip: pattern '{pattern}' (no match)"]
         else:
             # Literal path - add as-is
             if pattern not in matched_paths:
@@ -833,28 +1187,30 @@ def archive_expand(patterns, root_path):
 
 
 def archive_create(name, root, paths, outdir, compress="gzip"):
-    """Create a compressed tar archive for a category."""
+    """Create a compressed tar archive for a category.
+
+    Returns (archive_path, lines, warnings): the item header and include lines, then the
+    skip lines, for the caller to print.
+    """
     if compress not in COMPRESS_MAP:
-        printd(f"Error: Unsupported compression type: {compress}", file=sys.stderr)
-        sys.exit(1)
+        compress_error(compress, "the capture config's [tarball] table")
 
     ext, mode = COMPRESS_MAP[compress]
     archive_path = outdir / f"{name}{ext}"
     root_path = expand_path(root)
-    warnings = []
 
     # Expand any glob patterns in the paths
     expanded_paths, expand_warnings = archive_expand(paths, root_path)
 
-    lines = [f"  {archive_path.name} (root: '{root_path}')"]
-    includes, warnings = archive_classify(
+    lines = [f"{archive_path.name} (root: {root_path})"]
+    includes, skips = archive_classify(
         expanded_paths,
         "include",
-        "skipping",
+        "skip",
         cond=lambda path: (root_path / path).exists(),
     )
     lines += includes
-    warnings += expand_warnings
+    warnings = [f"{line} (not found)" for line in skips] + expand_warnings
 
     if __dry_run__:
         return archive_path, lines, warnings
@@ -881,17 +1237,17 @@ def create_archives(tasks, compress="gzip"):
     if not tasks:
         return []
 
-    results, buffer = [], {}
-    printd("\n", f"Creating {len(tasks)} archive(s)...", "\n")
+    step(f"Creating {plural(len(tasks), 'archive')}")
+
+    # Check once here, so the workers don't each print the same error
+    if compress not in COMPRESS_MAP:
+        compress_error(compress, "the capture config's [tarball] table")
+    ext, _ = COMPRESS_MAP[compress]
+
+    results, buffer, failed = [], {}, set()
     with ccft.ThreadPoolExecutor(max_workers=len(tasks)) as exc:
         futures = {exc.submit(archive_create, *task, compress): task for task in tasks}
-        with dtqdm(
-            len(tasks),
-            "Overall progress",
-            unit=" archives",
-            bar_format="{desc}: {n}/{total} [{elapsed}, {rate_fmt}]",
-            autorefresh=True,
-        ) as pbar:
+        with dtqdm(len(tasks), "Creating archives", autorefresh=True) as pbar:
             for future in ccft.as_completed(futures):
                 task = futures[future]
                 category = task[0]
@@ -900,19 +1256,30 @@ def create_archives(tasks, compress="gzip"):
                     buffer[archive_path.name] = [*lines, *warnings]
                     results.append(archive_path)
                 except Exception as e:
-                    pbar.write(f"\nError creating archive {category}: {e}")
+                    arcname = f"{category}{ext}"
+                    error(
+                        f"Cannot create {arcname}: {e}",
+                        "The snapshot will be missing this archive or hold part of it",
+                    )
+                    # A failed archive keeps its place in the list below
+                    failed.add(arcname)
+                    buffer[arcname] = [f"{arcname} (root: {root_display(task[1])})"]
                 pbar.update(1)
+
+    # Print each archive's block after the bar closes, in name order
     for arcname in sorted(buffer):
         header, *lines = buffer[arcname]
-        printd(header)
-        if not any("include: " in l for l in lines):
-            lines = ["warning: no files matched"]
-        for line in map(lambda s: f"    {s}", lines):
-            if "include:" in line:
-                printd(line)
-            else:
-                printd(line, file=sys.stderr)
-        printd()
+        say(header)
+        if arcname in failed:
+            say("failed (see the error above)", 2)
+            continue
+        empty = not any(line.startswith("include:") for line in lines)
+        if empty:
+            lines.insert(0, "include: 0 paths")
+        for line in lines:
+            say(line, 2)
+        if empty:
+            warn(f"{arcname}: none of its paths exist; the archive is empty")
     return results
 
 
@@ -925,37 +1292,26 @@ def generate_snapshot_toml(
 
     # Find archives based on compression type
     if compress not in COMPRESS_MAP:
-        printd(f"Error: Unsupported compression type: {compress}", file=sys.stderr)
-        sys.exit(1)
+        compress_error(compress, "the capture config's [tarball] table")
 
     ext, _ = COMPRESS_MAP[compress]
 
     toml_path = outdir / DEFAULT_SNAPSHOT_TOML
-    printd(f"  writing {toml_path.name}")
-    printd(f"    added tarball options")
 
+    # The caller prints the step; a dry run has no archives to checksum
     if __dry_run__:
-        printd(f"    calculated archive checksums")
-        return toml_path, "abcd123"
+        return toml_path, DRY_RUN_CHECKSUM
 
     archives = list(outdir.glob(f"*{ext}"))
 
     # Calculate checksums for all archives
     checksums = {}
-    with dtqdm(
-        len(archives),
-        "  Calculating checksums",
-        " archives",
-        bar_format="{desc}: {n}/{total} [{elapsed}, {rate_fmt}]",
-        autorefresh=True,
-    ) as pbar:
+    with dtqdm(len(archives), "Computing checksums", autorefresh=True) as pbar:
         for archive in archives:
             category = archive_category(archive)
             checksum = calculate_file_checksum(archive, show=False)
             checksums[category] = checksum
             pbar.update(1)
-
-    printd()
 
     # Generate TOML content
     toml_lines = ["#", "# Capture Configuration TOML", "#", "[tarball]"]
@@ -982,7 +1338,6 @@ def generate_snapshot_toml(
     # Write TOML file
     with open(toml_path, "w") as f:
         f.write("\n".join(toml_lines))
-    printd(f"  Done: {toml_path.name}")
 
     # Combined checksum from all archive checksums
     combined = "".join(checksums[cat] for cat in sorted(checksums))
@@ -997,13 +1352,14 @@ def archive_category(archive):
     return archive.stem.replace(".tar", "")
 
 
-def archive_entries(tar, warn=True):
+def archive_entries(tar, report=True):
     """Group archive members by captured path, in archive order.
 
     A captured path is a member with no ancestor member: capturing '.config/nvim'
     yields '.config/nvim', not '.config', so restore never touches its siblings.
     Members below a symlink member are skipped, since extracting them would write
-    through the link into paths that were never backed up.
+    through the link into paths that were never backed up. report prints one Warning
+    per archive for them (their names with --verbose).
     Raises ValueError for absolute or '..' member paths.
     """
     members = tar.getmembers()
@@ -1011,13 +1367,13 @@ def archive_entries(tar, warn=True):
     for member in members:
         path = Path(member.name)
         if path.is_absolute() or ".." in path.parts:
-            raise ValueError(f"unsafe path in archive: '{member.name}'")
+            raise ValueError(f"unsafe path '{member.name}'")
         if path.parts:
             names.add(path)
             if member.issym():
                 links.add(path)
 
-    groups = {}
+    groups, skipped = {}, []
     for member in members:
         path = Path(member.name)
         if not path.parts:
@@ -1026,79 +1382,80 @@ def archive_entries(tar, warn=True):
         # Ancestors from shallowest to deepest, without '.'
         ancestors = list(reversed(path.parents))[1:]
         if any(ancestor in links for ancestor in ancestors):
-            if warn:
-                printd(
-                    f"Warning: skipping '{member.name}' below a symlink in the archive",
-                    file=sys.stderr,
-                )
+            skipped.append(member.name)
             continue
 
         entry = next((a for a in ancestors if a in names), path)
         groups.setdefault(str(entry), []).append(member)
+
+    if report and skipped:
+        archive_name = Path(tar.name or "archive").name
+        entries = plural(len(skipped), "entry", "entries")
+        warn(
+            f"{archive_name}: skipping {entries} below a symlink in the archive",
+            *(skipped if __verbose__ else []),
+        )
     return groups
 
 
 def archive_confirm(archive, compress="gzip", root=None):
     """Ask user for confirmation to extract archive."""
-    name = archive_category(archive)
-
     if compress not in COMPRESS_MAP:
-        printd(f"Error: Unsupported compression type: {compress}", file=sys.stderr)
-        sys.exit(1)
+        compress_error(compress, DEFAULT_SNAPSHOT_TOML)
+
+    # The item header comes first, so an error opening the archive appears under it. A
+    # root that can't be expanded shows as given; archive_extract reports the error
+    root_path = root_display(root)
+    say(f"{archive.name} (root: {root_path})")
 
     # Get captured paths from the archive (auto-detect compression)
     try:
         with tarfile.open(archive, "r:*") as tar:
             entries = archive_entries(tar)
     except (tarfile.TarError, ValueError, OSError) as e:
-        printd(f"Error: Cannot restore {name}: {e}", file=sys.stderr)
+        error(f"Cannot restore {archive.name}: {e}")
+        say("failed (see the error above)", 2)
         return False
 
-    # Format paths for display
-    top_level_dirs = set()
-    for entry in entries:
-        if root:
-            top_level_dirs.add(str(Path(root) / entry))
-        else:
-            top_level_dirs.add("/" + entry)
+    # Show each path the prompt would overwrite, then each it would add, relative to
+    # the root in the header
+    if not entries:
+        say("empty archive, no files to replace or add", 2)
+    names = sorted(entries)
+    existing = {name for name in names if os.path.lexists(root_path / name)}
+    for name in names:
+        if name in existing:
+            say(f"replace: {name}", 2)
+    for name in names:
+        if name not in existing:
+            say(f"add: {name}", 2)
 
-    # Show what will be restored
-    printd("\n", f"{name} will restore to:")
-    for d in sorted(top_level_dirs):
-        printd(f"  {d}")
-
-    if __dry_run__:
-        printd(f"Restore {name}?  [Y/N]: Y")
-        return True
-
-    # Prompt user for confirmation
-    try:
-        msg = f"Restore {name}? This will overwrite any existing files... [Y/N]:"
-        response = input(msg).strip().lower()
-    except (KeyboardInterrupt, EOFError):
-        printd("\n", f"  Skipping {name}")
-        return False
-
-    if response not in ("y", "yes"):
-        printd(f"  Skipping {name}")
-        return False
-
-    return True
+    # Every archive asks once; only 'y' or 'yes' restores, and a dry run assumes yes
+    if not entries:
+        question = f"Restore {archive.name}? It has no files"
+    elif existing:
+        question = f"Restore {archive.name}? Existing files will be overwritten"
+    else:
+        question = f"Restore {archive.name}?"
+    return ask(question)
 
 
 def archive_select(available, selected_archives, tmpdir, compress="gzip"):
-    """Select which archives to restore based on patterns."""
+    """Select which archives to restore based on patterns.
+
+    Returns (archives, unmatched patterns); the caller reports the unmatched ones.
+    """
     if not selected_archives:
-        return available
+        return available, []
 
     if compress not in COMPRESS_MAP:
-        printd(f"Error: Unsupported compression type: {compress}", file=sys.stderr)
-        sys.exit(1)
+        compress_error(compress, DEFAULT_SNAPSHOT_TOML)
 
     ext, _ = COMPRESS_MAP[compress]
 
     archives_to_restore = []
     matched_names = set()
+    unmatched = []
 
     for pattern in selected_archives:
         # Try exact match first
@@ -1113,14 +1470,15 @@ def archive_select(available, selected_archives, tmpdir, compress="gzip"):
             for archive in available:
                 archive_name = archive_category(archive)
                 if fnmatch.fnmatch(archive_name, pattern):
+                    # A match already selected by an earlier pattern still counts
+                    pattern_matched = True
                     if archive_name not in matched_names:
                         archives_to_restore.append(archive)
                         matched_names.add(archive_name)
-                        pattern_matched = True
             if not pattern_matched:
-                printd(f"skipped: pattern '{pattern}'", file=sys.stderr)
+                unmatched.append(pattern)
 
-    return archives_to_restore
+    return archives_to_restore, unmatched
 
 
 def copy_with_ownership(src, dst):
@@ -1216,11 +1574,8 @@ def extract_members(tar, path, members):
 
 def archive_extract(archive, compress="gzip", root=None):
     """Extract an archive without prompting (assumes already confirmed)."""
-    name = archive_category(archive)
-
     if compress not in COMPRESS_MAP:
-        printd(f"Error: Unsupported compression type: {compress}", file=sys.stderr)
-        sys.exit(1)
+        compress_error(compress, DEFAULT_SNAPSHOT_TOML)
 
     # Determine extraction path
     if root:
@@ -1239,13 +1594,25 @@ def archive_extract(archive, compress="gzip", root=None):
         with tarfile.open(archive, "r:*") as tar:
             # Same members as a rollback restore (nothing below a symlink), in archive
             # order; when running as root, tarfile preserves ownership from the archive
-            kept = {id(m) for group in archive_entries(tar, warn=False).values() for m in group}
+            kept = {id(m) for group in archive_entries(tar, report=False).values() for m in group}
             members = [m for m in tar.getmembers() if id(m) in kept]
             extract_members(tar, extract_path, members)
         return True
     except Exception as e:
-        printd("\n", f"Error extracting {name}: {e}", file=sys.stderr)
+        # Runs in a worker thread; error() is safe while the bar is live
+        error(f"Cannot extract {archive.name}: {e}")
         return False
+
+
+def backup_rotation_path(rollbackd):
+    """Pick the unused name an existing backup dir moves to: <dir>_<timestamp>[_<n>]."""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    prevbackd = Path(f"{rollbackd}_{timestamp}")
+    count = 1
+    while prevbackd.exists():
+        prevbackd = Path(f"{rollbackd}_{timestamp}_{count}")
+        count += 1
+    return prevbackd
 
 
 def restore_category(archive, root, roll_ext, compress="gzip"):
@@ -1257,59 +1624,62 @@ def restore_category(archive, root, roll_ext, compress="gzip"):
     3. Extracts the captured path from the archive
     4. On any error or Ctrl-C: restores every touched path from backup
     """
-    category = archive_category(archive)
-
     if compress not in COMPRESS_MAP:
-        printd(f"Error: Unsupported compression type: {compress}", file=sys.stderr)
+        compress_error(compress, DEFAULT_SNAPSHOT_TOML, stop=False)
         return False
 
     root_path = expand_path(root)
     rollbackd = Path(str(root_path) + roll_ext)
+
+    # The item header comes first, so an error opening the archive appears under it
+    say(f"{archive.name} (root: {root_path}, backup: {rollbackd})")
 
     # Always open archive and classify entries
     try:
         with tarfile.open(archive, "r:*") as tar:
             groups = archive_entries(tar)
     except (tarfile.TarError, ValueError, OSError) as e:
-        printd(f"Error: Cannot restore {category}: {e}", file=sys.stderr)
+        error(f"Cannot restore {archive.name}: {e}")
+        say("failed (see the error above)", 2)
         return False
 
-    # Classify entries: replace (existing) vs extract (new)
-    replaces, extracts = archive_classify(
+    # Classify entries: replace (existing) vs add (new)
+    replaces, adds = archive_classify(
         list(groups),
         "replace",
-        "extract",
+        "add",
         cond=lambda entry: os.path.lexists(root_path / entry),
     )
 
-    printd(f"  {archive.name} (root: '{root_path}')")
-    for line in extracts:
-        printd(f"    {line}")
-    for line in replaces:
-        printd(f"    {line}", file=sys.stderr)
+    if not groups:
+        say("empty archive, no files to replace or add", 2)
+    for line in replaces + adds:
+        say(line, 2)
 
     if __dry_run__:
+        # Show the rotation a real run would make; nothing is renamed
+        if __verbose__:
+            try:
+                if rollbackd.exists():
+                    say(f"rotate: {rollbackd} -> {backup_rotation_path(rollbackd)}", 2)
+            except OSError:
+                pass  # A real run reports it when it creates the backup directory
         return True
 
     # Move any existing backup aside, then create a fresh backup directory
     try:
         if rollbackd.exists():
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            prevbackd = Path(f"{rollbackd}_{timestamp}")
-            count = 1
-            while prevbackd.exists():
-                prevbackd = Path(f"{rollbackd}_{timestamp}_{count}")
-                count += 1
+            prevbackd = backup_rotation_path(rollbackd)
             rollbackd.rename(prevbackd)
             if __verbose__:
-                printd(f"  Moved existing backup: {rollbackd} -> {prevbackd}")
+                say(f"rotate: {rollbackd} -> {prevbackd}", 2)
         # Creates rollbackd and any missing parents with their parent's owner
         make_parents(rollbackd / "entry")
     except OSError as e:
-        printd(f"Error: Cannot create backup directory {rollbackd}: {e}", file=sys.stderr)
+        error(f"Cannot create backup directory {rollbackd}: {e.strerror or e}")
+        say("failed (see the error above)", 2)
         return False
 
-    printd(f"  Restoring {category}...")
     touched = []  # (entry, has_backup, created parent dirs) for every changed path
 
     try:
@@ -1334,7 +1704,7 @@ def restore_category(archive, root, roll_ext, compress="gzip"):
             # Hardlinks last, so they link to restored files instead of old ones
             extract_members(tar, root_path, links)
 
-        printd(f"  ✓ {category} restored")
+        ok(f"{archive.name} restored")
         return True
 
     except (Exception, KeyboardInterrupt) as e:
@@ -1344,7 +1714,7 @@ def restore_category(archive, root, roll_ext, compress="gzip"):
         except ValueError:
             previous_sigint = None  # Not in the main thread
         try:
-            restore_rollback(category, root_path, rollbackd, touched, e)
+            restore_rollback(archive.name, root_path, rollbackd, touched, e)
         finally:
             if previous_sigint is not None:
                 signal.signal(signal.SIGINT, previous_sigint)
@@ -1354,12 +1724,12 @@ def restore_category(archive, root, roll_ext, compress="gzip"):
         return False
 
 
-def restore_rollback(category, root_path, rollbackd, touched, error):
-    """Delete touched paths and restore them from backup; exit if that fails."""
-    reason = "interrupted" if isinstance(error, KeyboardInterrupt) else error
-    printd("\n", f"Error restoring {category}: {reason}", file=sys.stderr)
-    printd(f"Rolling back {len(touched)} path(s)...", file=sys.stderr)
+def restore_rollback(name, root_path, rollbackd, touched, cause):
+    """Delete touched paths and restore them from backup; exit if that fails.
 
+    name is the archive file name, used only in messages; cause is the exception.
+    """
+    # Roll back before printing anything, so an output error can't skip the rollback
     failures = []
     for entry, has_backup, created in reversed(touched):
         entry_path = root_path / entry
@@ -1378,18 +1748,22 @@ def restore_rollback(category, root_path, rollbackd, touched, error):
             except OSError:
                 break
 
+    reason = "interrupted" if isinstance(cause, KeyboardInterrupt) else cause
+    error(f"Cannot restore {name}: {reason}")
+    if touched:
+        say(f"rollback: {plural(len(touched), 'path')} from {rollbackd}", 2)
+    else:
+        say("rollback: nothing was changed", 2)
+
     if failures:
         # Stop before a later category rotates these backups away
-        printd(
-            f"Error: Rollback incomplete for {category}, backups are in {rollbackd}",
-            file=sys.stderr,
+        fatal(
+            f"Rollback of {name} is incomplete; backups are in {rollbackd}",
+            *failures,
+            "Stopping the restore so the backups stay in place",
         )
-        for failure in failures:
-            printd(f"  {failure}", file=sys.stderr)
-        printd("Stopping restore so the backups stay in place.", file=sys.stderr)
-        sys.exit(1)
 
-    printd(f"✓ Rollback complete for {category}", file=sys.stderr)
+    ok(f"{name} rolled back")
 
 
 def extract_archives(archives, skip_confirm=False, root_map=None, compress="gzip"):
@@ -1414,8 +1788,7 @@ def extract_archives(archives, skip_confirm=False, root_map=None, compress="gzip
     if not confirmed:
         return 0
 
-    # Extract confirmed archives in parallel
-    printd("\n", f"Extracting {len(confirmed)} archive(s)...")
+    # Extract confirmed archives in parallel (the caller printed the step)
     success_count = 0
 
     with ccft.ThreadPoolExecutor(max_workers=len(confirmed)) as exc:
@@ -1426,32 +1799,37 @@ def extract_archives(archives, skip_confirm=False, root_map=None, compress="gzip
             root = root_map.get(category)
             futures[exc.submit(archive_extract, archive, compress, root)] = archive
 
-        with dtqdm(
-            len(confirmed),
-            "Extraction progress",
-            " archives",
-            bar_format="{desc}: {n}/{total} [{elapsed}, {rate_fmt}]",
-            autorefresh=True,
-        ) as pbar:
+        with dtqdm(len(confirmed), "Extracting archives", autorefresh=True) as pbar:
             for future in ccft.as_completed(futures):
                 archive = futures[future]
                 try:
                     if future.result():
                         success_count += 1
                 except Exception as e:
-                    pbar.write(f"\nError extracting {archive.name}: {e}")
+                    error(f"Cannot extract {archive.name}: {e}")
                 pbar.update(1)
+
+    # Step result: the prompts above have no results of their own
+    total = plural(len(confirmed), "archive")
+    if success_count == len(confirmed):
+        ok(f"{total} extracted")
+    else:
+        say(f"{success_count} of {total} extracted")
 
     return success_count
 
 
 def create_symlinks(snapshot_config):
-    """Create symlinks from link -> root for each category with a link field."""
+    """Create symlinks from link -> root for each category with a link field.
+
+    Returns the number of links created.
+    """
     tar_sections = snapshot_config.get("tar", {})
     if not tar_sections:
-        return
+        return 0
 
     symlinks_created = []
+    started = False
     for category, section_data in tar_sections.items():
         link = section_data.get("link")
         root = section_data.get("root")
@@ -1463,24 +1841,28 @@ def create_symlinks(snapshot_config):
         link_path = expand_path(link)
         root_path = expand_path(root)
 
-        # Check if link already exists
+        # Nothing to do when the link already points at the root
+        if os.path.islink(link_path) and link_path.resolve() == root_path.resolve():
+            continue
+
+        # The step header prints before the first link that needs work
+        if not started:
+            step("Creating symlinks")
+            started = True
+
+        # Never replace an existing file or a link that points elsewhere
+        if os.path.islink(link_path):
+            fatal(
+                f"Cannot create symlink {link_path}: it points to {link_path.resolve()}, "
+                f"not {root_path.resolve()}",
+                f"Set by the 'link' key in the [tar.{category}] table of "
+                f"{DEFAULT_SNAPSHOT_TOML}; fix or remove the existing link, then restore again",
+            )
         if os.path.lexists(link_path):
-            if os.path.islink(link_path):
-                current_target = link_path.resolve()
-                if current_target == root_path.resolve():
-                    continue
-                else:
-                    printd(
-                        f"Error: {link_path} already exists as symlink to {current_target}, expected {root_path}",
-                        file=sys.stderr,
-                    )
-                    sys.exit(1)
-            else:
-                printd(
-                    f"Error: {link_path} already exists and is not a symlink",
-                    file=sys.stderr,
-                )
-                sys.exit(1)
+            fatal(
+                f"Cannot create symlink {link_path}: a file or directory is already there",
+                "Move it aside, then restore again",
+            )
 
         if not __dry_run__:
             make_parents(link_path)
@@ -1490,16 +1872,18 @@ def create_symlinks(snapshot_config):
                 os.chown(link_path, owner.st_uid, owner.st_gid, follow_symlinks=False)
 
         symlinks_created.append(str(link_path))
+        ok(f"{link_path} -> {root_path}", dry=f"{link_path} -> {root_path}")
 
-    if symlinks_created:
-        printd("\n", f"✓ Created {len(symlinks_created)} symlink(s)")
-        for link in symlinks_created:
-            printd(f"  {link}")
+    return len(symlinks_created)
 
 
 # --- Checksum Handlers --- #
 
 CHECKSUM_CHUNK_SIZE = 8192
+
+UNVERIFIED_WARNING = (
+    f"{DEFAULT_SNAPSHOT_TOML} sets no [tarball] checksum; skipping archive verification"
+)
 
 
 def sha256_digest(data):
@@ -1510,27 +1894,14 @@ def sha256_digest(data):
 
 
 def sha256_file_digest(filepath, show=False):
-    """Calculate a SHA-256 digest from a file."""
+    """Calculate a SHA-256 digest from a file.
+
+    show is accepted for existing callers and ignored; callers show their own bar.
+    """
     sha256 = hashlib.sha256()
-    file_size = filepath.stat().st_size
-    if show and file_size > 0:
-        with open(filepath, "rb") as f:
-            with dtqdm(
-                file_size,
-                "  Computing checksum",
-                "B",
-                unit_scale=True,
-                unit_divisor=1024,
-                bar_format="{desc}: {n_fmt}/{total_fmt} [{elapsed}, {rate_fmt}]",
-                leave=False,
-            ) as pbar:
-                for chunk in iter(lambda: f.read(CHECKSUM_CHUNK_SIZE), b""):
-                    sha256.update(chunk)
-                    pbar.update(len(chunk))
-    else:
-        with open(filepath, "rb") as f:
-            for chunk in iter(lambda: f.read(CHECKSUM_CHUNK_SIZE), b""):
-                sha256.update(chunk)
+    with open(filepath, "rb") as f:
+        for chunk in iter(lambda: f.read(CHECKSUM_CHUNK_SIZE), b""):
+            sha256.update(chunk)
     return sha256.hexdigest()
 
 
@@ -1545,20 +1916,21 @@ def calculate_file_checksum(filepath, show=False):
     return sha256_file_digest(filepath, show)
 
 
-def verify_archives_from_toml(capture_dir):
-    """Verify all archives using tarball TOML checksums."""
+def verify_archives_from_toml(capture_dir, warn_unverified=True):
+    """Verify all archives using tarball TOML checksums.
+
+    warn_unverified=False leaves the Warning about a snapshot with no checksum to the
+    caller, so a sudo re-run doesn't print it twice.
+    """
     toml_path = capture_dir / DEFAULT_SNAPSHOT_TOML
 
+    # verify_snapshot already reported a missing path; a pulled snapshot doesn't exist yet
+    # (restore() adds a Note where the restore would run)
     if __dry_run__ and not toml_path.exists():
-        printd("✓ All archives verified (dry-run)")
         return {}
 
     if not toml_path.exists():
-        printd(
-            f"Error: {DEFAULT_SNAPSHOT_TOML} not found in {capture_dir}",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+        fatal(f"{DEFAULT_SNAPSHOT_TOML} not found in {capture_dir}")
 
     # Load snapshot TOML
     with open(toml_path, "rb") as f:
@@ -1571,65 +1943,59 @@ def verify_archives_from_toml(capture_dir):
 
     # Verify compression type
     if compress_type not in COMPRESS_MAP:
-        printd(f"Error: Unsupported compression type: {compress_type}", file=sys.stderr)
-        sys.exit(1)
+        compress_error(compress_type, DEFAULT_SNAPSHOT_TOML)
 
     archive_ext, _ = COMPRESS_MAP[compress_type]
 
     # If no checksum specified in options, skip verification
     if not digest_type:
-        printd(
-            f"Warning: No checksum type specified in {DEFAULT_SNAPSHOT_TOML}, skipping verification"
-        )
+        if warn_unverified:
+            warn(UNVERIFIED_WARNING)
         return snapshot_config
 
-    printd("Verifying archive integrity...")
-
     if digest_type != "sha256":
-        printd(f"Error: Unsupported digest type: {digest_type}", file=sys.stderr)
-        sys.exit(1)
+        fatal(
+            f"Unsupported checksum '{digest_type}' in {DEFAULT_SNAPSHOT_TOML}",
+            "supported: sha256",
+        )
 
     # Get all tar sections
     tar_sections = snapshot_config.get("tar", {})
 
     if not tar_sections:
-        printd(
-            f"Error: No tar sections found in {DEFAULT_SNAPSHOT_TOML}", file=sys.stderr
-        )
-        sys.exit(1)
+        fatal(f"{DEFAULT_SNAPSHOT_TOML} lists no archives (no [tar.<name>] tables)")
+
+    count = plural(len(tar_sections), "archive")
+    step(f"Verifying {count}")
 
     # List archives to verify
-    for category in sorted(tar_sections.keys()):
-        archive_path = capture_dir / f"{category}{archive_ext}"
-        printd(f"  verify: {archive_path.name}")
+    if __verbose__:
+        for category in sorted(tar_sections.keys()):
+            archive_path = capture_dir / f"{category}{archive_ext}"
+            say(f"verify: {archive_path.name}")
 
     if __dry_run__:
-        printd("✓ All archives verified (dry-run)")
+        say("checksums are not checked in a dry run")
         return snapshot_config
 
-    # Verify each archive
-    all_valid = True
-    with dtqdm(
-        len(tar_sections),
-        "  Verifying",
-        " archives",
-        bar_format="{desc}: {n}/{total} [{elapsed}, {rate_fmt}]",
-        autorefresh=True,
-    ) as pbar:
+    # Verify each archive; problems print as one Error block after the bar
+    problems = []
+    bad = 0
+    with dtqdm(len(tar_sections), "Verifying archives", autorefresh=True) as pbar:
         for category, section_data in tar_sections.items():
             archive_path = capture_dir / f"{category}{archive_ext}"
 
             if not archive_path.exists():
-                pbar.write(f"Error: Archive {archive_path.name} not found")
-                all_valid = False
+                problems.append(f"{archive_path.name}: not found")
+                bad += 1
                 pbar.update(1)
                 continue
 
             # Rejoin checksum chunks
             checksum_chunks = section_data.get("checksum", [])
             if not checksum_chunks:
-                pbar.write(f"Error: No checksum found for {category}")
-                all_valid = False
+                problems.append(f"{category}{archive_ext}: no checksum in {DEFAULT_SNAPSHOT_TOML}")
+                bad += 1
                 pbar.update(1)
                 continue
 
@@ -1639,33 +2005,38 @@ def verify_archives_from_toml(capture_dir):
             actual_checksum = calculate_file_checksum(archive_path, show=False)
 
             if actual_checksum != expected_checksum:
-                pbar.write(f"Error: Checksum mismatch for {archive_path.name}")
-                all_valid = False
+                problems.append(f"{archive_path.name}: checksum mismatch")
+                if __verbose__:
+                    problems.append(f"  expected: {expected_checksum}")
+                    problems.append(f"  actual:   {actual_checksum}")
+                bad += 1
 
             pbar.update(1)
 
-    printd()
-
-    if not all_valid:
-        printd(
-            "Error: Checksum verification failed! Snapshot may be corrupted.",
-            file=sys.stderr,
+    if problems:
+        fatal(
+            f"Snapshot verification failed for {bad} of {count}",
+            *problems,
+            "The snapshot may be corrupted; capture a new one or pick another with --from",
         )
-        sys.exit(1)
 
-    printd("✓ All archives verified")
+    ok(f"{count} verified")
     return snapshot_config
 
 
 # --- Capture Logic --- #
 
 
-def capture(args, root_dir, outdir, config):
-    """Create archives in specified directory."""
+def capture(args, root_dir, outdir, config, config_name=DEFAULT_CONFIG_CAPTURE, phase=None):
+    """Create archives in specified directory.
+
+    Display only: config_name names the config in messages; phase ('capture' in a
+    migration) prefixes the script steps.
+    """
 
     # Run before scripts
     if args.run_scripts:
-        run_scripts(root_dir, config, "before", working_dir=outdir)
+        run_scripts(root_dir, config, "before", working_dir=outdir, phase=phase)
 
     # Get compression type and rollback extension from config
     tarball_opts = config.get("tarball", {})
@@ -1695,24 +2066,21 @@ def capture(args, root_dir, outdir, config):
         category_meta[category] = {"root": root, "link": data.get("link")}
 
     # Create archives in parallel
+    if not tasks:
+        warn(f"{config_name}: lists no paths; the snapshot has no archives")
     create_archives(tasks, compress)
 
     # Generate snapshot TOML with checksum
-    printd(f"Creating snapshot metadata...", "\n")
+    step(f"Writing {DEFAULT_SNAPSHOT_TOML}")
     toml_path, checksum = generate_snapshot_toml(
         outdir, compress, category_meta, roll_ext
     )
-
-    printd(f"  Snapshot checksum: '{checksum[:7]}...'")
+    if not __dry_run__:
+        say(f"snapshot id: {checksum[:7]}")
 
     # Create checksum-named subdirectory and move files
-    printd("\n", f"Setting up final snapshot layout...", "\n")
     dst_dir = outdir.parent / outdir.name / checksum[:7]
-
     ext, _ = COMPRESS_MAP[compress]
-    printd(f"  mkdir {dst_dir}")
-    printd(f"  mv *{ext} -> {dst_dir.name}/")
-    printd(f"  mv {DEFAULT_SNAPSHOT_TOML} -> {dst_dir.name}/")
 
     if not __dry_run__:
         dst_dir.mkdir(parents=True, exist_ok=False)
@@ -1727,21 +2095,21 @@ def capture(args, root_dir, outdir, config):
     # Run after-capture scripts if requested
     if args.run_scripts:
         # Determine which config to use
-        config_name = args.config_toml if args.config_toml else DEFAULT_CONFIG_CAPTURE
-        scripts_config = load_config(root_dir, config_name)
+        scripts_config_name = args.config_toml if args.config_toml else DEFAULT_CONFIG_CAPTURE
+        scripts_config = load_config(root_dir, scripts_config_name)
         # Skip verification for scripts-only config (may not have [tar] section)
-        run_scripts(root_dir, scripts_config, "after", working_dir=dst_dir)
+        run_scripts(root_dir, scripts_config, "after", working_dir=dst_dir, phase=phase)
 
     return dst_dir
 
 
 def capture_deploy(capture_dir, dest_host, intended_path):
     """Copy capture to remote host."""
-    printd("\n", f"Copying snapshot to {dest_host}...")
+    step(f"Copying snapshot to {dest_host}")
 
     # Ensure remote directory exists
     escaped_path = shlex.quote(str(intended_path))
-    ssh_run(dest_host, f"mkdir -p {escaped_path}")
+    ssh_run(dest_host, f"mkdir -p {escaped_path}", desc="Creating the snapshot directory")
 
     # Copy all tar archives and snapshot TOML
     transfers = []
@@ -1758,10 +2126,7 @@ def capture_deploy(capture_dir, dest_host, intended_path):
             snapshot_config = tomllib.load(f)
         compress_type = snapshot_config.get("tarball", {}).get("compress", "gzip")
         if compress_type not in COMPRESS_MAP:
-            printd(
-                f"Error: Unsupported compression type: {compress_type}", file=sys.stderr
-            )
-            sys.exit(1)
+            compress_error(compress_type, DEFAULT_SNAPSHOT_TOML)
         ext, _ = COMPRESS_MAP[compress_type]
 
         # Add all tar archives with the specified compression type
@@ -1770,22 +2135,15 @@ def capture_deploy(capture_dir, dest_host, intended_path):
                 (str(archive), f"{dest_host}:{intended_path}/", archive.name)
             )
     else:
-        printd(
-            f"Error: {DEFAULT_SNAPSHOT_TOML} not found in {capture_dir}",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+        fatal(f"{DEFAULT_SNAPSHOT_TOML} not found in {capture_dir}")
 
     if not transfers:
-        printd("Error: No snapshot files found to copy", file=sys.stderr)
-        sys.exit(1)
+        fatal("No snapshot files to copy")
 
     success_count = rsync_parallel(transfers)
     if success_count < len(transfers):
-        printd("Error: Failed to copy all files to remote", file=sys.stderr)
-        sys.exit(1)
-
-    printd(f"✓ Snapshot copied to {dest_host}:{intended_path}")
+        failed = len(transfers) - success_count
+        fatal(f"Copying to {dest_host} failed for {failed} of {plural(len(transfers), 'file')}")
 
 
 def write_capture_toml(capture_config):
@@ -1878,10 +2236,7 @@ def remote_capture(args, root_dir, source_host, capture_config=None):
                     else:
                         script_path = root_dir / run_script_path
                         if not script_path.exists():
-                            printd(
-                                f"Warning: Script {script_path} not found, skipping",
-                                file=sys.stderr,
-                            )
+                            warn(f"Script {run_script_path} not found in {root_dir}; skipping it")
                             continue
                         script_src = str(script_path)
                     script_name = Path(run_script_path).name
@@ -1889,10 +2244,14 @@ def remote_capture(args, root_dir, source_host, capture_config=None):
                         (script_src, f"{source_host}:{remote_work_dir}/", script_name)
                     )
 
+        step(f"Copying {plural(len(transfers), 'file')} to {source_host}")
         success_count = rsync_parallel(transfers)
         if success_count < len(transfers):
-            printd("Error: Failed to copy files to source host", file=sys.stderr)
-            sys.exit(1)
+            failed = len(transfers) - success_count
+            fatal(
+                f"Copying to {source_host} failed for {failed} of "
+                f"{plural(len(transfers), 'file')}"
+            )
     finally:
         if tmp_capture_toml and tmp_capture_toml.exists():
             tmp_capture_toml.unlink()
@@ -1900,43 +2259,59 @@ def remote_capture(args, root_dir, source_host, capture_config=None):
     # Run capture on source (snap capture handles before/after scripts)
     escaped_dir = shlex.quote(remote_work_dir)
     program = f"{sys.executable} {__script__.name}"
-    script_flag = "--run-scripts" if args.run_scripts else ""
-    capture_cmd = (
-        f"cd {escaped_dir} && {program} capture" f" --to {escaped_dir} {script_flag}"
-    )
-    printd("\n", f"Running capture on {source_host}...")
-    ssh_run(source_host, capture_cmd)
+    capture_cmd = f"cd {escaped_dir} && {program} capture --to {escaped_dir}"
+    if args.run_scripts:
+        capture_cmd += " --run-scripts"
+    step(f"Running capture on {source_host}")
+    result = ssh_run(source_host, capture_cmd, check=False, desc="Capture")
+
+    # Show the remote capture's own output: nested under its host when it succeeded, or
+    # ahead of the Error line when it failed
+    if result and result[0] == 0:
+        if result[1].strip() or result[2].strip():
+            say(f"output from {source_host}:")
+        relay(result[1], 2)
+        relay(result[2], 2, sys.stderr)
+    elif result:
+        relay(result[1], 1)
+        relay(result[2], 1, sys.stderr)
+    if result and result[0] == 255:
+        fatal(f"Capture failed on {source_host}: ssh error (exit status 255)")
+    if result and result[0] != 0:
+        fatal(f"Capture failed on {source_host} (exit status {result[0]})")
 
     # Pull capture to local temp directory
     if __dry_run__:
-        tmpdir = Path("/tmp/dry-run/remote-capture")
+        tmpdir = Path(DRY_RUN_DIR) / "remote-capture"
     else:
         tmpdir = Path(tempfile.mkdtemp(prefix=f"{__script__.stem}-"))
 
     # Find the capture directory on source (date/checksum structure)
+    step(f"Copying snapshot from {source_host}")
     result = ssh_run(
         source_host,
         f"ls -d {escaped_dir}/*/",
+        desc="Finding the snapshot",
     )
     if result is not None and result[0] != 0:
-        printd("Error: Failed to find capture on source", file=sys.stderr)
         if tmpdir.exists():
             shutil.rmtree(tmpdir)
-        sys.exit(1)
+        fatal(f"Cannot find the snapshot on {source_host}")
 
     # Pull capture files
     remote_capture_dir = result[1].strip() if result else f"{escaped_dir}/*/"
     host_path = f"{source_host}:{remote_capture_dir}"
-    pull_result = rsync_run(host_path, str(tmpdir) + "/")
+    pull_result = rsync_copy(
+        host_path, str(tmpdir) + "/", f"the snapshot from {source_host}", label="snapshot"
+    )
     if pull_result is not None and pull_result[0] != 0:
-        printd("Error: Failed to pull capture from source", file=sys.stderr)
         if tmpdir.exists():
             shutil.rmtree(tmpdir)
-        sys.exit(1)
+        fatal(f"Cannot copy the snapshot from {source_host}")
 
     # Cleanup source working directory
-    printd("\n", "Cleaning up source directory...")
-    ssh_run(source_host, f"rm -rf {escaped_dir}")
+    step(f"Removing work directory from {source_host}")
+    ssh_run(source_host, f"rm -rf {escaped_dir}", desc="Removing the work directory")
 
     return tmpdir, tmpdir if not __dry_run__ else None
 
@@ -1978,7 +2353,7 @@ def archive_writable(archive, root, roll_ext):
     root_path = expand_path(root) if root else Path("/")
     try:
         with tarfile.open(archive, "r:*") as tar:
-            groups = archive_entries(tar, warn=False)
+            groups = archive_entries(tar, report=False)
     except (tarfile.TarError, ValueError):
         return True  # The restore itself reports the error
     except OSError:
@@ -2010,14 +2385,17 @@ def archive_writable(archive, root, roll_ext):
 
 
 def restore_needs_sudo(selected, root_map, roll_ext, snapshot_config):
-    """Check if restoring the selected archives and links needs sudo."""
+    """Check if restoring the selected archives and links needs sudo.
+
+    Returns what needs it, for messages (an archive file name or 'symlink <path>'), or False.
+    """
     for archive in selected:
         root = root_map.get(archive_category(archive))
         # Rollback restore skips categories without a root
         if roll_ext and not root:
             continue
         if not archive_writable(archive, root, roll_ext):
-            return True
+            return archive.name
 
     # create_symlinks() writes a link for every category with one
     for section in snapshot_config.get("tar", {}).values():
@@ -2025,7 +2403,7 @@ def restore_needs_sudo(selected, root_map, roll_ext, snapshot_config):
         if link and root:
             link_path = expand_path(link)
             if not os.path.lexists(link_path) and not path_writable(link_path.parent):
-                return True
+                return f"symlink {link_path}"
     return False
 
 
@@ -2060,7 +2438,13 @@ def sudo_restore(args, root_dir, capture_dir, restore_config, snapshot_config):
     fd, config_path = tempfile.mkstemp(prefix=f"{__script__.stem}-", suffix=".toml")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(toml_dumps(child_config))
+            try:
+                f.write(toml_dumps(child_config))
+            except (TypeError, AttributeError) as e:
+                fatal(
+                    "Cannot re-run the restore with sudo: the restore config holds an "
+                    f"unsupported value: {e}"
+                )
 
         cmd = ["sudo", "env", *env_args, sys.executable, str(__script__), "restore"]
         cmd += ["--from", str(capture_dir), "-r", root_arg, "-t", config_path]
@@ -2071,8 +2455,14 @@ def sudo_restore(args, root_dir, capture_dir, restore_config, snapshot_config):
         if __verbose__:
             cmd.append("--verbose")
 
-        sys.stdout.flush()
-        sys.stderr.flush()
+        # The child writes to the terminal directly; print everything before it first.
+        # A closed or broken stdout or stderr stops the run here, before sudo, as it
+        # always has
+        echo(cmd, verbose=True)
+        if sys.stdout is None or sys.stderr is None:
+            fatal("Cannot re-run the restore with sudo: stdout or stderr is closed")
+        flush_stream(sys.stdout, strict=True)
+        flush_stream(sys.stderr, strict=True)
         child = subprocess.Popen(cmd)
         while True:
             try:
@@ -2085,19 +2475,56 @@ def sudo_restore(args, root_dir, capture_dir, restore_config, snapshot_config):
         os.unlink(config_path)
 
     # A child killed by a signal reports -N; exit like a shell would (128 + N)
-    sys.exit(128 - returncode if returncode < 0 else returncode)
+    code = 128 - returncode if returncode < 0 else returncode
+
+    # The child printed its own output and final line; add the parent's view of a
+    # failure. A broken stderr drops these lines but does not change the exit code
+    action = "Re-running the restore with sudo"
+    try:
+        if returncode == -signal.SIGINT:
+            error(f"{action} was interrupted")
+        elif returncode < 0:
+            try:
+                name = signal.Signals(-returncode).name
+            except ValueError:
+                name = f"signal {-returncode}"
+            error(f"{action} failed (killed by {name})")
+        elif returncode != 0:
+            error(f"{action} failed (exit status {returncode})")
+    except (OSError, ValueError):
+        # Send the unwritten text to /dev/null, so Python's exit-time flush can't fail
+        # and replace the child's exit code with 120
+        try:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stderr.fileno())
+        except (AttributeError, OSError, ValueError):
+            pass
+    sys.exit(code)
 
 
-def restore(args, root_dir, capture_dir=None, restore_config=None):
-    """Restore from local capture directory."""
+def restore(
+    args, root_dir, capture_dir=None, restore_config=None, label=None, table="tar", phase=None
+):
+    """Restore from local capture directory.
+
+    label names the snapshot in error lines (defaults to capture_dir); table names the
+    restore config's [tar] table in messages (migrate.toml calls it [restore.tar]);
+    phase ('restore' in a migration) prefixes the script steps.
+    Returns (summary, success) for the command's final line.
+    """
     if capture_dir is None:
         capture_dir = args.capture_dir if __dry_run__ else args.capture_dir.resolve()
 
-    verify_snapshot(capture_dir)
+    verify_snapshot(capture_dir, label)
 
-    # Verify all archives using snapshot TOML and load config
-    snapshot_config = verify_archives_from_toml(capture_dir)
-    printd()
+    # Verify all archives using snapshot TOML and load config. Its Warnings print after
+    # the sudo check below, so a sudo re-run doesn't print them twice
+    snapshot_config = verify_archives_from_toml(capture_dir, warn_unverified=False)
+
+    # Only a dry run gets here without the snapshot dir (a pulled snapshot, or a missing
+    # one already reported); a pulled one takes the verify step's place with a Note
+    snapshot_found = capture_dir.exists()
+    if not snapshot_found and is_placeholder(capture_dir):
+        note("A real run would verify and restore the copied snapshot")
 
     # Get compression type and rollback extension from snapshot TOML
     tarball_opts = snapshot_config.get("tarball", {})
@@ -2121,91 +2548,153 @@ def restore(args, root_dir, capture_dir=None, restore_config=None):
     # Get archives from config
     # Semantics: None/[] = skip restore, ["*"] = restore all, [patterns...] = restore matching
     # Patterns support glob matching: ["ssh*", "dotfiles", "*-config"]
-    archives = restore_config.get("tar", {}).get("archives", None)
+    tar_table = restore_config.get("tar", {})
+    archives = tar_table.get("archives", None)
     if not archives or archives == []:
         archives = None  # Empty list in config means don't restore
     elif archives == ["*"] or "*" in archives:
         archives = []  # Wildcard means restore all available
 
-    # Find matching archive files
-    selected = []
-    if archives is not None:
+    # Find matching archive files; without the snapshot dir there is nothing to match
+    selected, available, unmatched = [], [], []
+    if archives is not None and snapshot_found:
         ext, _ = COMPRESS_MAP[compress]
         available = list(capture_dir.glob(f"*{ext}"))
-        selected = archive_select(available, archives, capture_dir, compress)
+        selected, unmatched = archive_select(available, archives, capture_dir, compress)
 
     # Re-run with sudo if any restore target is not writable (Unix only)
     use_rollback = bool(roll_ext) and not getattr(args, "disable_rollback", False)
     can_sudo = hasattr(os, "geteuid") and os.geteuid() != 0
-    if can_sudo and restore_needs_sudo(
-        selected, root_map, roll_ext if use_rollback else None, snapshot_config
-    ):
+    needs_root = False
+    if can_sudo:
+        needs_root = restore_needs_sudo(
+            selected, root_map, roll_ext if use_rollback else None, snapshot_config
+        )
+    if needs_root:
+        # Symlinks are created, archives are restored
+        action = "Creating" if needs_root.startswith("symlink ") else "Restoring"
         if __dry_run__:
-            printd("Note: A real run would re-run with sudo to restore to system locations.")
+            note(f"{action} {needs_root} needs root; a real run would re-run with sudo")
         else:
-            printd(
-                "Note: This script needs sudo privileges to restore files to system locations."
-            )
-            printd("Re-running with sudo...")
+            note(f"{action} {needs_root} needs root")
+            step("Re-running the restore with sudo")
             sudo_restore(args, root_dir, capture_dir, restore_config, snapshot_config)
+
+    # Past the sudo re-run, which exits after the child printed these itself
+    if snapshot_found and not tarball_opts.get("checksum"):
+        warn(UNVERIFIED_WARNING)
+    for pattern in unmatched:
+        warn(f"[{table}] archives pattern '{pattern}' matches no archive in the snapshot")
 
     # Run before scripts
     if args.run_scripts:
-        run_scripts(root_dir, restore_config, "before", working_dir=capture_dir)
+        run_scripts(root_dir, restore_config, "before", working_dir=capture_dir, phase=phase)
+
+    # Name the selection in the step header: '4 archives' or '2 of 4 archives'
+    if len(selected) == len(available):
+        selection = plural(len(selected), "archive")
+    else:
+        selection = f"{len(selected)} of {plural(len(available), 'archive')}"
 
     # Restore archives
-    if archives is not None:
-        if not selected:
-            printd("No archives selected for restore")
-        elif getattr(args, "disable_rollback", False):
-            # No rollback protection - use existing extract_archives with confirmation
-            extract_archives(
-                selected, skip_confirm=False, root_map=root_map, compress=compress
-            )
+    restored = 0
+    if archives is None:
+        if "archives" in tar_table:
+            step_skipped("archive restore", f"[{table}] archives is empty")
         else:
-            # Transactional restore with rollback support
-            if not roll_ext:
-                printd(
-                    "Warning: No rollback extension specified in snapshot TOML, falling back to interactive confirmation",
-                    file=sys.stderr,
-                )
-                extract_archives(
-                    selected, skip_confirm=False, root_map=root_map, compress=compress
-                )
+            step_skipped("archive restore", f"[{table}] has no 'archives' key")
+    elif not selected:
+        # A dry run without the snapshot dir already printed a Note or an Error
+        if snapshot_found:
+            step_skipped("archive restore", f"no archive matches [{table}] archives")
+    elif getattr(args, "disable_rollback", False):
+        # No rollback protection - use existing extract_archives with confirmation
+        step(f"Restoring {selection} without backups")
+        restored = extract_archives(
+            selected, skip_confirm=False, root_map=root_map, compress=compress
+        )
+    elif not roll_ext:
+        # Transactional restore needs a rollback extension; ask per archive instead
+        warn(
+            f"{DEFAULT_SNAPSHOT_TOML} sets no [tarball] rollback; existing files are not "
+            "backed up",
+            "Each archive asks before it is restored; set 'rollback' in the capture "
+            "config's [tarball] table to get backups",
+        )
+        step(f"Restoring {selection} without backups")
+        restored = extract_archives(
+            selected, skip_confirm=False, root_map=root_map, compress=compress
+        )
+    else:
+        # Transactional restore with rollback support
+        step(f"Restoring {selection}")
+        failed, done = [], []
+        for archive in selected:
+            category = archive_category(archive)
+            root = root_map.get(category)
+            if not root:
+                say(archive.name)
+                say(f"skip: no 'root' key in {DEFAULT_SNAPSHOT_TOML}", 2)
+                continue
+            success = restore_category(archive, root, roll_ext, compress)
+            if success:
+                done.append(archive.name)
             else:
-                printd(f"Restoring {len(selected)} category archive(s)...")
-                failed = []
-                for archive in selected:
-                    category = archive_category(archive)
-                    root = root_map.get(category)
-                    if not root:
-                        printd(
-                            f"Warning: No root for {category}, skipping",
-                            file=sys.stderr,
-                        )
-                        continue
-                    success = restore_category(archive, root, roll_ext, compress)
-                    if not success:
-                        failed.append(category)
+                failed.append(archive.name)
 
-                if failed:
-                    printd(
-                        "\n",
-                        f"Error: {len(failed)} category(s) failed: {', '.join(failed)}",
-                        file=sys.stderr,
-                    )
-                    sys.exit(1)
+        if failed:
+            not_run = "not run: symlinks"
+            stops = "stop before the symlinks"
+            if args.run_scripts:
+                not_run += ", after scripts"
+                stops += ", after scripts"
+
+            # A dry run only previewed the others, so it claims nothing was restored; a
+            # real run restores the others first, then stops where this one does
+            if __dry_run__:
+                if done:
+                    hint = f"a real run would restore the others, then {stops}"
                 else:
-                    printd("\n", f"✓ Restored {len(selected)} category archive(s)")
+                    hint = f"a real run would {stops}"
+                # A dry run doesn't check checksums, which a real run checks first
+                if tarball_opts.get("checksum"):
+                    hint = f"If the checksums match, {hint}"
+                else:
+                    hint = hint[0].upper() + hint[1:]
+                fatal(
+                    f"{len(failed)} of {plural(len(selected), 'archive')} cannot be restored: "
+                    f"{', '.join(failed)}",
+                    hint,
+                )
+            fatal(
+                f"{len(failed)} of {plural(len(selected), 'archive')} failed to restore: "
+                f"{', '.join(failed)}",
+                f"restored: {', '.join(done) or 'none'}",
+                not_run,
+            )
+        restored = len(done)
 
     # Create symlinks from link -> root
-    create_symlinks(snapshot_config)
+    links = create_symlinks(snapshot_config)
 
     # Run after scripts
     if args.run_scripts:
-        run_scripts(root_dir, restore_config, "after", working_dir=capture_dir)
+        run_scripts(root_dir, restore_config, "after", working_dir=capture_dir, phase=phase)
 
-    printd("\n", "✓ Restore completed successfully")
+    # Summary for the final line; no ✓ when selected archives ended with none restored
+    success = True
+    if archives is None:
+        summary = "no archives selected"
+    elif restored == 0:
+        summary = "no archives restored"
+        success = False
+    elif restored == len(selected):
+        summary = f"{plural(restored, 'archive')} restored"
+    else:
+        summary = f"{restored} of {plural(len(selected), 'archive')} restored"
+    if links:
+        summary += f", {plural(links, 'symlink')} created"
+    return summary, success
 
 
 def remote_mkdir(dest_host, purpose="work"):
@@ -2215,30 +2704,33 @@ def remote_mkdir(dest_host, purpose="work"):
     remote_dir = f"/tmp/{__script__.stem}-{purpose}-{suffix}"
 
     # Create remote directory
-    printd("Creating remote directory...")
-    ssh_run(dest_host, f"mkdir -p {shlex.quote(remote_dir)}")
+    step(f"Creating work directory on {dest_host}")
+    ssh_run(dest_host, f"mkdir -p {shlex.quote(remote_dir)}", desc="Creating the work directory")
     return remote_dir
 
 
 def remote_restore(args, root_dir, source_host):
-    """Pull snapshot from remote and restore locally."""
+    """Pull snapshot from remote and restore locally; returns restore()'s result."""
     capture_dir_path = str(args.capture_dir)
-    printd(f"Pulling snapshot from {source_host}:{capture_dir_path}...", "\n")
+    step(f"Copying snapshot from {source_host}")
 
     if __dry_run__:
-        tmpdir = Path("/tmp/dry-run/remote-restore")
+        tmpdir = Path(DRY_RUN_DIR) / "remote-restore"
     else:
         tmpdir = Path(tempfile.mkdtemp(prefix=f"{__script__.stem}-"))
 
     try:
         host_path = f"{source_host}:{capture_dir_path}/"
-        result = rsync_run(host_path, str(tmpdir) + "/")
+        result = rsync_copy(
+            host_path, str(tmpdir) + "/", f"the snapshot from {source_host}", label="snapshot"
+        )
 
         if result is not None and result[0] != 0:
-            printd("Error: Failed to pull snapshot from remote", file=sys.stderr)
-            sys.exit(1)
+            fatal(f"Cannot copy the snapshot from {source_host}")
 
-        restore(args, root_dir, capture_dir=tmpdir)
+        # Errors name what the user asked for, not the temp copy
+        label = f"{source_host}:{capture_dir_path}"
+        return restore(args, root_dir, capture_dir=tmpdir, label=label)
 
     finally:
         if not __dry_run__:
@@ -2252,8 +2744,12 @@ def remote_deploy(
     source_host=None,
     deploy_config=None,
     before_scripts=True,
+    phase=None,
 ):
-    """Deploy snapshot to remote and restore (from local or remote source)."""
+    """Deploy snapshot to remote and restore (from local or remote source).
+
+    phase ('restore' in a migration) prefixes the script steps; display only.
+    """
     root_host = getattr(args, "root_host", None)
 
     # Determine source paths (local or remote)
@@ -2264,7 +2760,6 @@ def remote_deploy(
             if isinstance(args.capture_dir, Path)
             else args.capture_dir
         )
-        printd(f"Deploying from {source_host} to {dest_host}...", "\n")
         # Config/scripts come from root_host if set, otherwise source_host
         if root_host:
             config_src_base = f"{root_host}:{root_dir}"
@@ -2274,9 +2769,10 @@ def remote_deploy(
     else:
         # Local source - use combined capture_dir (includes checksum)
         local_capture = args.capture_dir if __dry_run__ else args.capture_dir.resolve()
-        printd(f"Deploying to {dest_host}...", "\n")
 
-        if not __dry_run__:
+        # A dry run reports a missing snapshot dir here, where a real run stops (and
+        # passes over a stand-in for one a real run would create)
+        if not __dry_run__ or not local_capture.exists():
             verify_snapshot(local_capture)
         # Config/scripts from root_host if set, otherwise local
         config_src_base = f"{root_host}:{root_dir}" if root_host else None
@@ -2305,9 +2801,10 @@ def remote_deploy(
     transfers.append((str(__script__), f"{dest_host}:{remote_dir}/", __script__.name))
 
     # Add archive files (snapshot TOML and all tar archives)
+    archives_note = False  # a dry run of a pulled snapshot notes the archives at the copy
     if source_host:
         # Remote source - need to fetch snapshot TOML first to determine archives
-        printd(f"Fetching snapshot metadata from {source_host}...")
+        step(f"Copying {DEFAULT_SNAPSHOT_TOML} from {source_host}")
 
         # Create temp file for snapshot TOML
         with tempfile.NamedTemporaryFile(
@@ -2318,20 +2815,20 @@ def remote_deploy(
         try:
             # Fetch snapshot TOML from remote source
             remote_toml = f"{source_host}:{capture_dir_path}/{DEFAULT_SNAPSHOT_TOML}"
-            result = rsync_run(remote_toml, str(tmp_toml_path))
+            result = rsync_copy(
+                remote_toml,
+                str(tmp_toml_path),
+                f"{DEFAULT_SNAPSHOT_TOML} from {source_host}",
+                label=DEFAULT_SNAPSHOT_TOML,
+            )
 
             if result is None:  # __dry_run__
-                printd(f"Fetch {remote_toml}")
-                printd(f"Enumerate archives from remote snapshot TOML")
+                note(f"A real run would copy the archives listed in {DEFAULT_SNAPSHOT_TOML}")
                 compress_type = "gzip"
-                # In dry-run, show placeholder archives
-                tar_sections = {"archive1": {}, "archive2": {}, "archive-N": {}}
+                # In dry-run, show a placeholder archive
+                tar_sections = {"<archive>": {}}
             elif result[0] != 0:
-                printd(
-                    f"Error: Failed to fetch {DEFAULT_SNAPSHOT_TOML} from {source_host}",
-                    file=sys.stderr,
-                )
-                sys.exit(1)
+                fatal(f"Cannot copy {DEFAULT_SNAPSHOT_TOML} from {source_host}")
             else:
                 # Load snapshot TOML to get compression type and archive list
                 with open(tmp_toml_path, "rb") as f:
@@ -2342,11 +2839,10 @@ def remote_deploy(
                 tar_sections = snapshot_config.get("tar", {})
 
                 if compress_type not in COMPRESS_MAP:
-                    printd(
-                        f"Error: Unsupported compression type: {compress_type}",
-                        file=sys.stderr,
+                    compress_error(
+                        compress_type,
+                        f"{source_host}:{capture_dir_path}/{DEFAULT_SNAPSHOT_TOML}",
                     )
-                    sys.exit(1)
         finally:
             # Clean up temp file
             if tmp_toml_path.exists():
@@ -2377,18 +2873,21 @@ def remote_deploy(
         toml_path = local_capture / DEFAULT_SNAPSHOT_TOML
 
         if __dry_run__ and not toml_path.exists():
-            # Dry-run with placeholder capture dir (e.g. from remote_capture)
-            printd(f"Enumerate archives from {local_capture}")
+            # Dry-run with placeholder capture dir (e.g. from remote_capture), or a
+            # snapshot that a real run would stop at (a missing dir is reported above)
+            if is_placeholder(local_capture):
+                archives_note = True
+            elif local_capture.exists():
+                error(
+                    f"{DEFAULT_SNAPSHOT_TOML} not found in {local_capture}",
+                    "A real run stops before creating the work directory",
+                )
             transfers.append(
                 (str(toml_path), f"{dest_host}:{remote_dir}/", DEFAULT_SNAPSHOT_TOML)
             )
         else:
             if not toml_path.exists():
-                printd(
-                    f"Error: {DEFAULT_SNAPSHOT_TOML} not found in {local_capture}",
-                    file=sys.stderr,
-                )
-                sys.exit(1)
+                fatal(f"{DEFAULT_SNAPSHOT_TOML} not found in {local_capture}")
 
             transfers.append(
                 (str(toml_path), f"{dest_host}:{remote_dir}/", DEFAULT_SNAPSHOT_TOML)
@@ -2399,11 +2898,7 @@ def remote_deploy(
                 snapshot_config = tomllib.load(f)
             compress_type = snapshot_config.get("tarball", {}).get("compress", "gzip")
             if compress_type not in COMPRESS_MAP:
-                printd(
-                    f"Error: Unsupported compression type: {compress_type}",
-                    file=sys.stderr,
-                )
-                sys.exit(1)
+                compress_error(compress_type, DEFAULT_SNAPSHOT_TOML)
             ext, _ = COMPRESS_MAP[compress_type]
 
             # Add all tar archives with the specified compression type
@@ -2434,7 +2929,7 @@ def remote_deploy(
             (
                 str(tmp_config),
                 f"{dest_host}:{remote_dir}/{DEFAULT_CONFIG_RESTORE}",
-                "restore.toml",
+                DEFAULT_CONFIG_RESTORE,
             )
         )
 
@@ -2452,11 +2947,8 @@ def remote_deploy(
                         )
                     else:
                         script_path = root_dir / run_script_path
+                        # run_scripts warns about a missing script when it runs
                         if not script_path.exists():
-                            printd(
-                                f"Warning: Script {script_path} not found, skipping",
-                                file=sys.stderr,
-                            )
                             continue
                         script_name = Path(run_script_path).name
                         transfers.append(
@@ -2468,15 +2960,18 @@ def remote_deploy(
                         )
 
     # Execute all transfers in parallel
+    step(f"Copying {plural(len(transfers), 'file')} to {dest_host}")
     success_count = rsync_parallel(transfers)
+    if archives_note:
+        note("A real run would also copy the snapshot's archives")
 
     # Clean up temp restore config if generated
     if tmp_config and tmp_config.exists():
         tmp_config.unlink()
 
     if success_count < len(transfers):
-        printd("Error: Failed to copy all files to remote", file=sys.stderr)
-        sys.exit(1)
+        failed = len(transfers) - success_count
+        fatal(f"Copying to {dest_host} failed for {failed} of {plural(len(transfers), 'file')}")
 
     if args.run_scripts and before_scripts:
         run_scripts(
@@ -2486,6 +2981,7 @@ def remote_deploy(
             working_dir=None,
             remote_host=dest_host,
             remote_dir=remote_dir,
+            phase=phase,
         )
 
     # Execute restore on remote
@@ -2495,9 +2991,8 @@ def remote_deploy(
         f"cd {escaped_remote_dir} && sudo {program} restore"
         f" --from {escaped_remote_dir}"
     )
-    printd("\n", f"Executing restore on {dest_host}...")
-    printd(f"Command: {remote_cmd}", "\n")
-    ssh_run(dest_host, remote_cmd, tty=True)
+    step(f"Running restore on {dest_host} with sudo")
+    ssh_run(dest_host, remote_cmd, tty=True, desc="Restore")
 
     if args.run_scripts:
         run_scripts(
@@ -2507,12 +3002,11 @@ def remote_deploy(
             working_dir=None,
             remote_host=dest_host,
             remote_dir=remote_dir,
+            phase=phase,
         )
 
-    printd("\n", "Cleaning up remote directory...")
-    ssh_run(dest_host, f"rm -rf {shlex.quote(remote_dir)}")
-
-    printd("\n", f"✓ Deploy completed successfully")
+    step(f"Removing work directory from {dest_host}")
+    ssh_run(dest_host, f"rm -rf {shlex.quote(remote_dir)}", desc="Removing the work directory")
 
 
 # --- Migrate Logic --- #
@@ -2530,11 +3024,7 @@ def split_migrate_config(config, config_name):
     restore_section = config.get("restore", {})
 
     if "tar" not in capture_section:
-        printd(
-            f"Error: {config_name} missing required [capture.tar] section",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+        fatal(f"{config_name}: missing required [capture.tar] table")
 
     capture_config = {"tarball": tarball, "tar": capture_section.get("tar", {})}
     if "scripts" in capture_section:
@@ -2557,11 +3047,10 @@ def require_remote(args, attr, host):
     value = getattr(args, attr, None)
     if value is not None and not host:
         flag = "--from" if attr == "src" else "--to"
-        printd(
-            f"Error: {flag} '{value}' is not a remote host; use user@host or host:",
-            file=sys.stderr,
+        fatal(
+            f"{flag} '{value}' is not a remote host",
+            "Use [user@]host or [user@]host:path (a trailing colon marks a host)",
         )
-        sys.exit(1)
 
 
 def cmd_check(args):
@@ -2569,23 +3058,26 @@ def cmd_check(args):
     files = getattr(args, "files", []) or []
 
     if not files:
-        print("Error: Specify at least one file", file=sys.stderr)
-        sys.exit(1)
+        fatal("No files given", "Usage: snap.py check [options] file [file ...]")
 
     ignore_invalid = getattr(args, "ignore_invalid", False)
     short_hash = getattr(args, "short_hash", False)
     full_path = getattr(args, "full_path", False)
     no_path = getattr(args, "no_path", False)
 
-    # Calculate and display checksums
+    # Calculate and display checksums; the stdout lines are data, problems go to stderr
     for file_path in files:
         path = Path(file_path)
-        if not (path.exists() or path.is_file()):
+        missing = not (path.exists() or path.is_file())
+        if missing:
             if ignore_invalid:
                 continue
             checksum = "null"
         else:
-            checksum = calculate_file_checksum(path, show=False)
+            try:
+                checksum = calculate_file_checksum(path, show=False)
+            except OSError as e:
+                fatal(f"Cannot read {file_path}: {e.strerror or e}")
         if short_hash:
             checksum = checksum[:7]
         if no_path:
@@ -2594,6 +3086,8 @@ def cmd_check(args):
             print(f"{path}: {checksum}")
         else:
             print(f"{path.name}: {checksum}")
+        if missing:
+            warn(f"{file_path} not found")
 
 
 def cmd_capture(args):
@@ -2601,8 +3095,8 @@ def cmd_capture(args):
     root_dir = args.root
     root_host = getattr(args, "root_host", None)
 
-    from_host, _ = parse_remote_arg(getattr(args, "src", None))
-    to_host, to_path = parse_remote_arg(getattr(args, "dst", None))
+    from_host, _ = parse_remote_arg(getattr(args, "src", None), flag="--from")
+    to_host, to_path = parse_remote_arg(getattr(args, "dst", None), flag="--to")
     require_remote(args, "src", from_host)
 
     # Determine intended destination path
@@ -2614,7 +3108,11 @@ def cmd_capture(args):
         month_day = now.strftime("%m-%d")
         intended_path = root_dir / "captures" / year / month_day
 
-    printd(f"Snapshot destination: {intended_path}")
+    banner("capture")
+    if to_host:
+        context(from_host or here(), f"{to_host}:{intended_path}")
+    else:
+        context(from_host or here(), intended_path)
 
     if from_host:
         # Run capture on remote host, pull results back
@@ -2629,13 +3127,13 @@ def cmd_capture(args):
 
         tmpdir = None
         if __dry_run__:
-            outdir = Path("/tmp/dry-run") / intended_path.name
+            outdir = Path(DRY_RUN_DIR) / intended_path.name
         else:
             tmpdir = Path(tempfile.mkdtemp(prefix=f"{__script__.stem}-"))
             outdir = tmpdir / intended_path.name
             outdir.mkdir(parents=True, exist_ok=False)
 
-        dst_dir = capture(args, root_dir, outdir, config)
+        dst_dir = capture(args, root_dir, outdir, config, config_name=DEFAULT_CONFIG_CAPTURE)
 
     try:
         if __dry_run__:
@@ -2648,21 +3146,27 @@ def cmd_capture(args):
         else:
             # Move snapshot to local destination
             final_dst = intended_path / dst_dir.name
-            final_dst.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                final_dst.parent.mkdir(parents=True, exist_ok=True)
+            except FileExistsError:
+                fatal(f"Cannot create {final_dst.parent}: a file is already there")
+            except OSError as e:
+                fatal(f"Cannot create {final_dst.parent}: {e.strerror or e}")
 
             if final_dst.exists():
-                printd(
-                    f"Error: Snapshot directory {final_dst} already exists",
-                    file=sys.stderr,
-                )
-                sys.exit(1)
+                fatal(f"Cannot save the snapshot: {final_dst} already exists")
 
             shutil.move(str(dst_dir), str(final_dst))
     finally:
         if tmpdir and tmpdir.exists():
             shutil.rmtree(tmpdir)
 
-    printd("\n", f"✓ Snapshot saved to {final_dst}")
+    if to_host:
+        if __dry_run__:
+            note(f"A real run would copy the snapshot to {to_host}:{intended_path}/<checksum>")
+        finish(f"Snapshot saved to {to_host}:{final_dst}")
+    else:
+        finish(f"Snapshot saved to {final_dst}")
 
 
 def cmd_migrate(args):
@@ -2670,17 +3174,19 @@ def cmd_migrate(args):
     root_dir = args.root
     root_host = getattr(args, "root_host", None)
 
-    from_host, _ = parse_remote_arg(getattr(args, "src", None))
-    to_host, _ = parse_remote_arg(getattr(args, "dst", None))
+    from_host, _ = parse_remote_arg(getattr(args, "src", None), flag="--from")
+    to_host, _ = parse_remote_arg(getattr(args, "dst", None), flag="--to")
     require_remote(args, "src", from_host)
     require_remote(args, "dst", to_host)
 
     if not from_host and not to_host:
-        printd(
-            "Error: At least one of --from or --to must specify a remote host",
-            file=sys.stderr,
+        fatal(
+            "At least one of --from or --to must be a remote host",
+            "Use [user@]host or [user@]host:path",
         )
-        sys.exit(1)
+
+    banner("migration")
+    context(from_host or here(), to_host or here())
 
     config_name = args.config_toml if args.config_toml else DEFAULT_CONFIG_MIGRATE
     if root_host:
@@ -2688,23 +3194,23 @@ def cmd_migrate(args):
     else:
         config = load_config(root_dir, config_name)
     capture_config, restore_config = split_migrate_config(config, config_name)
-    verify_capture_config(capture_config, config_name)
+    verify_capture_config(capture_config, config_name, table="capture.tar")
 
     # Phase 1: Capture on source
     if from_host:
-        printd(f"Migrating from {from_host} to {to_host or 'local'}...", "\n")
         capture_dir, tmpdir = remote_capture(args, root_dir, from_host, capture_config)
     else:
-        printd(f"Migrating from local to {to_host}...", "\n")
         tmpdir = None
         dir_name = datetime.now().strftime("%m-%d")
         if __dry_run__:
-            outdir = Path("/tmp/dry-run") / dir_name
+            outdir = Path(DRY_RUN_DIR) / dir_name
         else:
             tmpdir = Path(tempfile.mkdtemp(prefix=f"{__script__.stem}-"))
             outdir = tmpdir / dir_name
             outdir.mkdir(parents=True, exist_ok=False)
-        capture_dir = capture(args, root_dir, outdir, capture_config)
+        capture_dir = capture(
+            args, root_dir, outdir, capture_config, config_name=config_name, phase="capture"
+        )
 
     try:
         # Phase 2: Restore on destination
@@ -2717,16 +3223,19 @@ def cmd_migrate(args):
                 to_host,
                 deploy_config=restore_config,
                 before_scripts=True,
+                phase="restore",
             )
+            finish(f"Migration to {to_host} completed")
         else:
-            restore(
+            summary, success = restore(
                 args,
                 root_dir,
                 capture_dir=capture_dir,
                 restore_config=restore_config,
+                table="restore.tar",
+                phase="restore",
             )
-
-        printd("\n", f"✓ Migration completed successfully")
+            finish(f"Migration completed: {summary}", success)
     finally:
         if tmpdir and tmpdir.exists():
             shutil.rmtree(tmpdir)
@@ -2737,17 +3246,30 @@ def cmd_restore(args):
     root_dir = args.root
     root_host = getattr(args, "root_host", None)
 
-    from_host, from_path = parse_remote_arg(getattr(args, "src", None))
-    to_host, _ = parse_remote_arg(getattr(args, "dst", None))
+    from_host, from_path = parse_remote_arg(getattr(args, "src", None), flag="--from")
+    to_host, _ = parse_remote_arg(getattr(args, "dst", None), flag="--to")
     require_remote(args, "dst", to_host)
 
-    # Determine snapshot source path
+    # A local restore reads its configs and snapshots on this machine
+    if root_host and not from_host and not to_host:
+        warn(
+            f"-r/--snap-root host '{root_host}' is ignored by a local restore; "
+            f"reading {root_dir} on this machine"
+        )
+
+    banner("restore")
+    dest = to_host or here()
+
+    # Determine snapshot source path; latest is set when snap.py chose the snapshot
+    latest = False
     if from_host:
         # Remote source: find latest on remote or use provided path
         captures_dir = root_dir / "captures"
         if from_path:
+            context(f"{from_host}:{from_path}", dest)
             capture_path = from_path
         else:
+            context(f"{from_host}:{captures_dir} (latest)", dest)
             capture_path = resolve_remote_snapshot(from_host, captures_dir)
     elif from_path:
         capture_path = from_path.resolve()
@@ -2755,6 +3277,7 @@ def cmd_restore(args):
         # Local default: find latest capture
         captures_dir = root_dir / "captures"
         capture_path = resolve_snapshot_root(captures_dir)
+        latest = True
 
     # For local paths, auto-select latest checksum subdir if path is a date dir
     if not from_host and capture_path.exists() and capture_path.is_dir():
@@ -2762,12 +3285,24 @@ def cmd_restore(args):
         if not toml_check.exists():
             subdirs = [d for d in capture_path.iterdir() if d.is_dir()]
             if not subdirs:
-                printd(f"Error: No snapshot found in {capture_path}", file=sys.stderr)
-                sys.exit(1)
+                # A --from date dir needs a snapshot inside; otherwise there is none yet
+                if getattr(args, "src", None):
+                    hint = (
+                        "Pass --from a snapshot directory (captures/YYYY/MM-DD/<checksum>) "
+                        "or a date directory that holds one"
+                    )
+                else:
+                    hint = "Run 'snap.py capture' first, or pass --from <snapshot>"
+                fatal(f"No snapshots found in {capture_path}", hint)
 
-            latest = max(subdirs, key=lambda d: d.stat().st_mtime)
-            capture_path = latest
-            printd(f"Auto-selected latest snapshot: {latest.name}")
+            capture_path = max(subdirs, key=lambda d: d.stat().st_mtime)
+            latest = True
+
+    if not from_host:
+        if latest:
+            context(f"{capture_path} (latest)", dest)
+        else:
+            context(capture_path, dest)
 
     # Store capture path in args for subfunctions
     args.capture_dir = capture_path
@@ -2775,15 +3310,27 @@ def cmd_restore(args):
     # Case 1: Remote to remote (source -> dest)
     if from_host and to_host:
         remote_deploy(args, root_dir, to_host, source_host=from_host)
+        finish(f"Restore on {to_host} completed")
+        return
     # Case 2: Local to remote (deploy)
-    elif to_host:
+    if to_host:
         remote_deploy(args, root_dir, to_host)
+        finish(f"Restore on {to_host} completed")
+        return
+
     # Case 3: Remote to local (pull and restore)
-    elif from_host:
-        remote_restore(args, root_dir, from_host)
+    if from_host:
+        result = remote_restore(args, root_dir, from_host)
     # Case 4: Local restore
     else:
-        restore(args, root_dir)
+        result = restore(args, root_dir)
+
+    # A stubbed restore may return None
+    summary, success = result or ("", True)
+    if summary:
+        finish(f"Restore completed: {summary}", success)
+    else:
+        finish("Restore completed", success)
 
 
 # --- Argument Parsing --- #
@@ -2791,14 +3338,14 @@ def cmd_restore(args):
 
 def add_cli_options(parser):
     """Add common CLI options (dry-run, verbose, help)."""
-    group = parser.add_argument_group("cli options")
+    group = parser.add_argument_group("output options")
     group.add_argument(
         "--dry-run", action="store_true",
-        help="Show what would be done without doing it",
+        help="Show what would be done without changing anything",
     )
     group.add_argument(
         "--verbose", action="store_true",
-        help="Show detailed progress information",
+        help="Show per-path details, each copied file and the commands run",
     )
     group.add_argument(
         "--help", action="help",
@@ -2812,15 +3359,18 @@ def add_snap_options(parser):
     group.add_argument(
         "-r", "--snap-root", dest="root", metavar="[[user@]host:]root",
         default=DEFAULT_ROOT_SNAP,
-        help=f"Root directory for configs and scripts (default: {DEFAULT_ROOT_SNAP})",
+        help=(
+            "Snap root with configs, scripts and captures "
+            f"(default: ./.snap, then {DEFAULT_ROOT_SNAP})"
+        ),
     )
     group.add_argument(
         "-t", "--config-toml", dest="config_toml", metavar="config",
-        help="Use custom TOML config file",
+        help="Config file, relative to the snap root, instead of the command default",
     )
     group.add_argument(
         "--run-scripts", action="store_true",
-        help="Run before/after scripts, if defined",
+        help="Run the config's before/after scripts (with sudo on remote hosts)",
     )
 
 
@@ -2828,8 +3378,8 @@ def add_host_options(parser, from_help, to_help):
     """Add --from and --to host options."""
     group = parser.add_argument_group(
         "host options",
-        "A local path containing '@' needs a '/' (e.g. ./name@tag), "
-        "or it is read as user@host.",
+        "A local path that contains '@' needs a '/' (for example ./name@tag),\n"
+        "or it is read as user@host",
     )
     group.add_argument(
         "--from", dest="src", metavar="[user@]host[:path]",
@@ -2847,11 +3397,11 @@ def setup_parser():
     parser = argparse.ArgumentParser(
         add_help=False,
         formatter_class=formatter,
-        description="Snapshot and restore utility",
+        description="Capture, restore and migrate file snapshots, locally or over SSH",
     )
 
     subparsers = parser.add_subparsers(
-        dest="command", title="commands", metavar="",
+        dest="command", title="commands", metavar="<command>",
     )
 
     # check
@@ -2861,25 +3411,25 @@ def setup_parser():
     )
     check.add_argument(
         "files", nargs="*", metavar="file",
-        help="File(s) to checksum",
+        help="Files to checksum",
     )
     chk = check.add_argument_group("checksum options")
     chk.add_argument(
         "--ignore-invalid", action="store_true",
-        help="Ignore and skip any invalid or missing files",
+        help="Skip missing files instead of printing 'null'",
     )
     chk.add_argument(
         "--short-hash", action="store_true",
-        help="Generate a shorter 7 character hash",
+        help="Show only the first 7 characters of each checksum",
     )
-    chk_cli = check.add_argument_group("cli options")
+    chk_cli = check.add_argument_group("output options")
     chk_cli.add_argument(
         "--full-path", action="store_true",
-        help="Show full file path instead of just name",
+        help="Show each path as given instead of just the file name",
     )
     chk_cli.add_argument(
         "--no-path", action="store_true",
-        help="Show only the checksum (no file name)",
+        help="Show only the checksum (overrides --full-path)",
     )
     chk_cli.add_argument(
         "--help", action="help",
@@ -2889,49 +3439,55 @@ def setup_parser():
     # capture
     cap = subparsers.add_parser(
         "capture", formatter_class=formatter, add_help=False,
-        help="Create a snapshot (can send to remote)",
+        help="Capture a snapshot (on this machine or a host)",
     )
     add_snap_options(cap)
     add_host_options(
         cap,
-        from_help="Source host to capture from (default: local)",
-        to_help="Destination for snapshot (default: <root>/captures/YYYY/MM-DD)",
+        from_help="Host to capture on (default: this machine)",
+        to_help=(
+            "Where to save the snapshot, a local path or host:path "
+            "(default: <root>/captures/YYYY/MM-DD); a <checksum> subdirectory is created"
+        ),
     )
     add_cli_options(cap)
 
     # restore
     rst = subparsers.add_parser(
         "restore", formatter_class=formatter, add_help=False,
-        help="Restore from a snapshot (local or remote)",
+        help="Restore a snapshot (on this machine or a host)",
     )
     add_snap_options(rst)
     add_host_options(
         rst,
-        from_help="Snapshot source path (default: latest in <root>/captures)",
-        to_help="Destination host to restore to (default: local)",
+        from_help=(
+            "Snapshot, date directory or host to restore from "
+            "(default: latest in <root>/captures)"
+        ),
+        to_help="Host to restore on (default: this machine)",
     )
     rst_group = rst.add_argument_group("restore options")
     rst_group.add_argument(
         "--disable-rollback", action="store_true",
-        help="Disable backup/rollback of existing files",
+        help="Do not back up existing files; ask before restoring each archive",
     )
     add_cli_options(rst)
 
     # migrate
     mig = subparsers.add_parser(
         "migrate", formatter_class=formatter, add_help=False,
-        help="Capture on source, restore on destination",
+        help="Capture on one machine and restore on another (at least one must be a host)",
     )
     add_snap_options(mig)
     add_host_options(
         mig,
-        from_help="Source host to capture from (default: local)",
-        to_help="Destination host to restore to (default: local)",
+        from_help="Host to capture on (default: this machine)",
+        to_help="Host to restore on (default: this machine)",
     )
     mig_group = mig.add_argument_group("migrate options")
     mig_group.add_argument(
         "--disable-rollback", action="store_true",
-        help="Disable backup/rollback of existing files",
+        help="Do not back up existing files; ask before restoring each archive",
     )
     add_cli_options(mig)
 
@@ -2941,12 +3497,17 @@ def setup_parser():
         help="Show this help message and exit",
     )
 
+    # main() reports unknown flags with the subcommand's own usage
+    parser.commands = {"check": check, "capture": cap, "restore": rst, "migrate": mig}
     return parser
 
 
 def main():
     parser = setup_parser()
-    args = parser.parse_args()
+    args, extra = parser.parse_known_args()
+    if extra:
+        command_parser = parser.commands.get(args.command) or parser
+        command_parser.error(f"unrecognized arguments: {' '.join(extra)}")
 
     if not args.command:
         parser.print_help()
@@ -2961,22 +3522,17 @@ def main():
     __verbose__ = getattr(args, "verbose", False)
 
     # Parse --snap-root for remote host support
-    root_host, root_path = parse_remote_arg(args.root)
+    root_host, root_path = parse_remote_arg(args.root, flag="-r/--snap-root")
     args.root_host = root_host
     args.root = resolve_root(root_path if root_host else args.root, root_host=root_host)
 
+    # Each command prints its own banner after checking its arguments
     commands = {
-        "capture": (cmd_capture, "Starting capture!"),
-        "restore": (cmd_restore, "Starting restoration!"),
-        "migrate": (cmd_migrate, "Starting migration!"),
+        "capture": cmd_capture,
+        "restore": cmd_restore,
+        "migrate": cmd_migrate,
     }
-
-    cmd_func, message = commands[args.command]
-    if __dry_run__:
-        message += " (No changes will be made)"
-
-    printd(message, "\n")
-    cmd_func(args)
+    commands[args.command](args)
 
 
 if __name__ == "__main__":

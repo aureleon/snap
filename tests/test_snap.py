@@ -56,6 +56,13 @@ def backup_files(tmp_path, name):
     return [p for p in tmp_path.glob("home.bak*/**/*") if p.name == name]
 
 
+@pytest.fixture(autouse=True)
+def reset_copy_failure():
+    """Clear the module-level copy-failure flag so tests stay order-independent."""
+    yield
+    snap._copy_failed.clear()
+
+
 unprivileged = pytest.mark.skipif(os.geteuid() == 0, reason="needs an unprivileged user")
 unprivileged_only = unprivileged
 
@@ -284,6 +291,25 @@ def test_incomplete_rollback_stops_restore(tmp_path, monkeypatch, capsys):
     assert (tmp_path / "home.bak" / "a" / "orig.txt").read_text() == "a"
 
 
+def test_rollback_runs_even_if_reporting_fails(tmp_path, monkeypatch):
+    src = tmp_path / "src"
+    home = tmp_path / "home"
+    write_files(src, {"a/new.txt": "new", "b/new.txt": "new"})
+    write_files(home, {"a/orig.txt": "a", "b/orig.txt": "b"})
+    archive = make_archive(tmp_path, "cat", src, ["a", "b"])
+
+    fail_on_extract(monkeypatch, "b", OSError("disk full"))
+
+    def broken_stderr(*args, **kwargs):
+        raise BrokenPipeError
+
+    monkeypatch.setattr(snap, "error", broken_stderr)
+
+    with pytest.raises(BrokenPipeError):
+        snap.restore_category(archive, str(home), ".bak")
+    assert list_tree(home) == ["a", "a/orig.txt", "b", "b/orig.txt"]
+
+
 def test_rollback_runs_on_keyboard_interrupt(tmp_path, monkeypatch):
     src = tmp_path / "src"
     home = tmp_path / "home"
@@ -471,6 +497,46 @@ def test_e2e_dry_run_restore_changes_nothing(env, flags):
 
     assert (env.home / ".zshrc").read_text() == "edited"
     assert list_tree(env.tmp / "home") == [".zshrc"]
+    assert not list(env.tmp.glob("home.bak*"))
+
+
+# --- Output problems stop a run where print() and tqdm always did --- #
+
+
+def test_e2e_restore_to_closed_stdout_pipe_changes_nothing(env):
+    write_files(env.home, {".zshrc": "v1"})
+    write_configs(env.root, {"dotfiles": ("$HOME", [".zshrc"])})
+    assert env.run("capture", "-r", str(env.root)).returncode == 0
+    write_files(env.home, {".zshrc": "edited"})
+
+    # The pipe's reader is gone before snap.py writes anything
+    read_fd, write_fd = os.pipe()
+    os.close(read_fd)
+    try:
+        result = subprocess.run(
+            [sys.executable, str(SNAP), "restore", "-r", str(env.root)],
+            cwd=env.tmp, env=env.env, stdin=subprocess.DEVNULL, stdout=write_fd,
+            stderr=subprocess.PIPE, text=True, timeout=120,
+        )
+    finally:
+        os.close(write_fd)
+
+    # The flush at the first bar fails, before any file changes
+    assert result.returncode == 120, result.stderr
+    assert (env.home / ".zshrc").read_text() == "edited"
+    assert not list(env.tmp.glob("home.bak*"))
+
+
+def test_e2e_restore_with_latin1_stdout_changes_nothing(env):
+    write_files(env.home, {".zshrc": "v1"})
+    write_configs(env.root, {"dotfiles": ("$HOME", [".zshrc"])})
+    assert env.run("capture", "-r", str(env.root)).returncode == 0
+    write_files(env.home, {".zshrc": "edited"})
+
+    # '✓ 1 archive verified' cannot be encoded, before any file changes
+    result = env.run("restore", "-r", str(env.root), extra_env={"PYTHONIOENCODING": "latin-1"})
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert (env.home / ".zshrc").read_text() == "edited"
     assert not list(env.tmp.glob("home.bak*"))
 
 
@@ -868,3 +934,151 @@ def test_e2e_restore_to_non_host_is_rejected(env):
     assert result.returncode == 1
     assert "is not a remote host" in result.stderr
     assert (env.home / ".zshrc").read_text() == "edited"
+
+
+# --- Output: display code never crashes, and each failure prints once --- #
+
+
+NO_SUCH_USER_ROOT = "~snap-test-no-such-user/root"
+
+
+def unexpandable_root():
+    """Return a root that expand_path() cannot expand (an unknown user's home)."""
+    try:
+        snap.expand_path(NO_SUCH_USER_ROOT)
+    except RuntimeError:
+        return NO_SUCH_USER_ROOT
+    pytest.skip("the test user name exists on this machine")
+
+
+def test_create_archives_failure_shows_unexpandable_root(tmp_path, capsys):
+    root = unexpandable_root()
+    outdir = tmp_path / "out"
+    outdir.mkdir()
+
+    assert snap.create_archives([("cat", root, [".zshrc"], outdir)]) == []
+
+    captured = capsys.readouterr()
+    assert "Error: Cannot create cat.tar.gz: " in captured.err
+    assert f"  cat.tar.gz (root: {root})\n    failed (see the error above)\n" in captured.out
+    assert list(outdir.iterdir()) == []
+
+
+def test_archive_confirm_shows_unexpandable_root(tmp_path, monkeypatch, capsys):
+    root = unexpandable_root()
+    write_files(tmp_path / "src", {".zshrc": "x"})
+    archive = make_archive(tmp_path, "cat", tmp_path / "src", [".zshrc"])
+    monkeypatch.setattr(snap, "__dry_run__", True)
+
+    # The header shows the root as given; the extraction reports the real error
+    assert snap.extract_archives([archive], root_map={"cat": root}) == 0
+
+    captured = capsys.readouterr()
+    assert f"cat.tar.gz (root: {root})" in captured.out
+    assert "add: .zshrc" in captured.out
+    assert "Error: Cannot extract cat.tar.gz: " in captured.err
+
+
+def test_archive_confirm_prompt_matches_the_targets(tmp_path, monkeypatch, capsys):
+    write_files(tmp_path / "src", {".zshrc": "x", ".vimrc": "y"})
+    archive = make_archive(tmp_path, "cat", tmp_path / "src", [".zshrc", ".vimrc"])
+    empty = make_archive(tmp_path, "empty", tmp_path / "src", [".missing"])
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(snap, "__dry_run__", True)
+
+    # Every entry is new: no overwrite warning, and paths relative to the root
+    assert snap.archive_confirm(archive, root=str(home))
+    out = capsys.readouterr().out
+    assert "     add: .vimrc\n" in out
+    assert "     add: .zshrc\n" in out
+    assert "Restore cat.tar.gz? [y/N]: y (assumed in a dry run)" in out
+    assert "Existing files" not in out
+
+    # One entry exists
+    write_files(home, {".zshrc": "old"})
+    assert snap.archive_confirm(archive, root=str(home))
+    out = capsys.readouterr().out
+    assert "     replace: .zshrc\n" in out
+    assert "     add: .vimrc\n" in out
+    assert "Restore cat.tar.gz? Existing files will be overwritten [y/N]: " in out
+
+    # No entries at all
+    assert snap.archive_confirm(empty, root=str(home))
+    assert "Restore empty.tar.gz? It has no files [y/N]: " in capsys.readouterr().out
+
+
+def test_rsync_parallel_reports_only_the_first_failed_copy(tmp_path, monkeypatch, capsys):
+    def failing_rsync(cmd, **kwargs):
+        raise subprocess.CalledProcessError(23, cmd, output="", stderr=f"rsync: bad {cmd[-2]}\n")
+
+    monkeypatch.setattr(snap.subprocess, "run", failing_rsync)
+    monkeypatch.setattr(snap, "__dry_run__", False)
+    transfers = [(str(tmp_path / f"f{i}"), "host:/tmp/work/", f"f{i}") for i in range(4)]
+
+    with pytest.raises(SystemExit) as exit_info:
+        snap.rsync_parallel(transfers)
+
+    assert exit_info.value.code == 1
+    err = capsys.readouterr().err
+    assert err.count("Error: ") == 1
+    assert err.count("rsync: bad ") == 1
+
+    # The next group of copies reports its own failure again
+    with pytest.raises(SystemExit):
+        snap.rsync_parallel(transfers[:1])
+    assert capsys.readouterr().err.count("Error: Copying f0 failed (rsync exit status 23)") == 1
+
+
+def test_run_scripts_skips_the_step_when_every_script_is_missing(tmp_path, capsys):
+    (tmp_path / "scripts").mkdir()
+    config = {"scripts": {"before": ["scripts/a.sh", "scripts/b.sh"]}}
+
+    snap.run_scripts(tmp_path, config, "before", working_dir=tmp_path)
+
+    captured = capsys.readouterr()
+    assert "Skipping before scripts (no scripts found)" in captured.out
+    assert "Running" not in captured.out
+    assert captured.err.count("Warning: Script scripts/") == 2
+
+
+def test_run_scripts_names_the_migration_phase(tmp_path, monkeypatch, capsys):
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts" / "a.sh").write_text("true\n")
+    config = {"scripts": {"before": ["scripts/a.sh"]}}
+    monkeypatch.setattr(snap, "__dry_run__", True)
+
+    snap.run_scripts(tmp_path, config, "before", working_dir=tmp_path, phase="capture")
+    snap.run_scripts(tmp_path, config, "after", working_dir=tmp_path, phase="restore")
+
+    out = capsys.readouterr().out
+    assert "Running capture before scripts..." in out
+    assert "Skipping restore after scripts (none configured)" in out
+
+
+def test_sudo_restore_exit_code_survives_a_broken_stderr(tmp_path, monkeypatch):
+    class FakePopen:
+        def __init__(self, cmd):
+            pass
+
+        def wait(self):
+            # The child ran; now the parent's stderr is gone
+            broken = io.StringIO()
+            broken.close()
+            monkeypatch.setattr(snap.sys, "stderr", broken)
+            return 3
+
+    monkeypatch.setattr(snap.subprocess, "Popen", FakePopen)
+
+    with pytest.raises(SystemExit) as exit_info:
+        snap.sudo_restore(argparse.Namespace(root_host=None), tmp_path, tmp_path, {}, {})
+
+    assert exit_info.value.code == 3
+
+
+def test_stdout_is_flushed_before_stderr_only_when_they_share(tmp_path, monkeypatch):
+    with open(tmp_path / "out", "w") as out, open(tmp_path / "err", "w") as err:
+        monkeypatch.setattr(snap.sys, "stdout", out)
+        assert not snap.shares_stdout(err)
+        with open(tmp_path / "out", "a") as same:
+            assert snap.shares_stdout(same)
