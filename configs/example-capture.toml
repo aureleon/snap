@@ -1,18 +1,25 @@
 # Example capture configuration
-# Copy to capture.toml and customize for your needs
+# install.sh installs this as configs/capture.toml (only when that file doesn't exist yet).
+# Try it with 'snap capture --dry-run' before the first real capture.
 
-# Group directories and files under a "selection" to
-# archive, which generates a named tarball in the snapshot.
+# Each [tar.<name>] table becomes one archive, <name>.tar.gz, in the snapshot.
 
 [tarball]
-compress = "gzip"
-checksum = "sha256"
-rollback = ".bak"  # Extension for backing up existing files during restore
+compress = "gzip"   # gzip, bzip2, xz, or "" (none)
+checksum = "sha256"     # always sha256 (the only supported value)
+rollback = ".bak"   # A restore moves replaced files to <root>.bak/<name>
+
+# Who can decrypt the archives that set 'encrypt = true' (see the age section in README.md).
+# Needs the age CLI (brew install age, or apt install age).
+# [age]
+# recipients = ["age1..."]                          # age public keys
+# recipients_file = "~/.config/age/recipients.txt"  # a file of them, expanded like a root
 
 # SSH keys and known_hosts
 [tar.ssh-keys]
 root = "$HOME"
 dirs = [".ssh"]
+# encrypt = true    # Encrypt this archive with age, for the [age] recipients
 
 # Shell dotfiles using glob patterns
 [tar.dotfiles]
@@ -30,64 +37,77 @@ root = "$HOME"
 dirs = [
     ".config/*",      # All subdirs: nvim, fish, i3, etc.
 ]
+# Left out of the archive: a pattern matches the path relative to root, or any one part of it
+exclude = [
+    "node_modules",   # anything named node_modules, at any depth
+    "*.log",          # any name ending in .log
+    "*/Cache/*",      # everything below a Cache directory
+]
+
+# The tables below are examples for other kinds of data. Uncomment and adapt the ones you
+# need: they name paths that don't exist on most machines, and restoring system paths
+# (/etc, /usr/local) needs sudo.
 
 # Application data
-[tar.local]
-root = "$HOME/.local/share"
-dirs = [
-    "applications",
-    "fonts",
-]
+# [tar.local]
+# root = "$HOME/.local/share"
+# dirs = [
+#     "applications",
+#     "fonts",
+# ]
 
-# Development tools
-[tar.dev-tools]
-root = "$HOME"
-dirs = [
-    ".cargo",
-    ".rustup",
-    ".npm",
-]
+# Development tools (large)
+# [tar.dev-tools]
+# root = "$HOME"
+# dirs = [
+#     ".cargo",
+#     ".rustup",
+#     ".npm",
+# ]
+# exclude = [".cargo/registry/cache", ".npm/_cacache"]
 
-# Homebrew (macOS)
-[tar.homebrew]
-root = "/usr/local"
-dirs = ["Cellar", "Caskroom"]
-files = ["bin/brew"]
+# Homebrew (macOS, Intel); scripts/capture-brew.sh saves a Brewfile instead
+# [tar.homebrew]
+# root = "/usr/local"
+# dirs = ["Cellar", "Caskroom"]
+# files = ["bin/brew"]
 
 # Custom application with symlink
-# The 'link' field creates a symlink during restore: link -> root
-[tar.myapp]
-root = "/opt/myapp"
-link = "$HOME/myapp"  # Creates symlink: ~/myapp -> /opt/myapp
-dirs = ["bin", "lib", "config"]
+# The 'link' key creates a symlink during restore: link -> root
+# [tar.myapp]
+# root = "/opt/myapp"
+# link = "$HOME/myapp"  # Creates symlink: ~/myapp -> /opt/myapp
+# dirs = ["bin", "lib", "config"]
 
 # External volume with symlink
-[tar.workspace]
-root = "/Volumes/workplace"
-link = "$HOME/workplace"  # Creates symlink: ~/workplace -> /Volumes/workplace
-dirs = ["projects", "repos"]
+# [tar.workspace]
+# root = "/Volumes/workplace"
+# link = "$HOME/workplace"  # Creates symlink: ~/workplace -> /Volumes/workplace
+# dirs = ["projects", "repos"]
 
-# System configuration (requires sudo)
-[tar.system]
-root = "/etc"
-dirs = [
-    "nginx",
-    "systemd/system",
-]
-files = [
-    "hosts",
-    "fstab",
-]
+# System configuration (restoring it needs sudo)
+# [tar.system]
+# root = "/etc"
+# dirs = [
+#     "nginx",
+#     "systemd/system",
+# ]
+# files = [
+#     "hosts",
+#     "fstab",
+# ]
 
 # Log files using patterns
-[tar.logs]
-root = "/var/log"
-files = [
-    "*.log",          # All .log files in /var/log
-    "nginx/*.log",    # All logs in nginx subdirectory
-]
+# [tar.logs]
+# root = "/var/log"
+# files = [
+#     "*.log",          # All .log files in /var/log
+#     "nginx/*.log",    # All logs in nginx subdirectory
+# ]
 
-# Optional: Run scripts before/after capture
+# Scripts to run before/after the capture, with 'snap capture --run-scripts'.
+# Paths are relative to the snap root; after scripts run in the new snapshot directory,
+# so capture-brew.sh saves the Brewfile in the snapshot
 [scripts]
 # before = ["scripts/dump-database.sh"]
 after = ["scripts/capture-brew.sh"]

@@ -17,6 +17,7 @@ if sys.version_info < (3, 11):
 
 import argparse
 import contextlib
+import errno
 import fnmatch
 import hashlib
 import json
@@ -36,7 +37,7 @@ import tomllib
 
 import concurrent.futures as ccft
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path, PurePosixPath
 
 # tqdm is optional: without it, dtqdm() hands out no-op bars, so the sudo re-run and
@@ -84,6 +85,7 @@ DRY_RUN_NAMES = [
     (DRY_RUN_WORK_DIR, "<work dir>"),
     (f"{DRY_RUN_DIR}/remote-capture", "<pulled snapshot>"),
     (f"{DRY_RUN_DIR}/remote-restore", "<pulled snapshot>"),
+    (f"{DRY_RUN_DIR}/decrypted", "<decrypted dir>"),
     (DRY_RUN_DIR, "<staging dir>"),
     ("YYYY/MM-DD/latest", "<latest>"),
     (DRY_RUN_CHECKSUM, "<checksum>"),
@@ -1112,6 +1114,53 @@ def verify_capture_config(config, config_name, table="tar"):
         if "dirs" not in data and "files" not in data:
             fatal(f"{config_name}: [{table}.{category}] needs a 'dirs' or 'files' key")
 
+        exclude = data.get("exclude", [])
+        if not isinstance(exclude, list) or not all(isinstance(p, str) for p in exclude):
+            fatal(
+                f"{config_name}: the 'exclude' key in [{table}.{category}] must be an "
+                "array of patterns"
+            )
+
+        if not isinstance(data.get("encrypt", False), bool):
+            fatal(
+                f"{config_name}: the 'encrypt' key in [{table}.{category}] must be "
+                "true or false"
+            )
+
+    verify_age_recipients(config, config_name, table)
+
+
+def verify_age_recipients(config, config_name, table="tar"):
+    """Verify the [age] table of a capture config: every encrypted archive needs recipients.
+
+    table names the [tar] table in error lines; the [age] table next to it is named the
+    same way ('capture.age' in migrate.toml).
+    """
+    age_table = table[: -len("tar")] + "age"
+    age_config = config.get("age", {})
+    if not isinstance(age_config, dict):
+        fatal(f"{config_name}: [{age_table}] must be a table")
+
+    recipients = age_config.get("recipients", [])
+    if not isinstance(recipients, list) or not all(
+        isinstance(recipient, str) and recipient for recipient in recipients
+    ):
+        fatal(
+            f"{config_name}: the 'recipients' key in [{age_table}] must be an array of "
+            "age public keys"
+        )
+    recipients_file = age_config.get("recipients_file")
+    if recipients_file is not None and not (isinstance(recipients_file, str) and recipients_file):
+        fatal(f"{config_name}: the 'recipients_file' key in [{age_table}] must be a path")
+
+    encrypted = [name for name, data in config["tar"].items() if data.get("encrypt") is True]
+    if encrypted and not recipients and not recipients_file:
+        fatal(
+            f"{config_name}: [{table}.{encrypted[0]}] sets 'encrypt', but [{age_table}] has "
+            "no 'recipients' or 'recipients_file' key",
+            f"Add your age public key: [{age_table}] recipients = [\"age1...\"]",
+        )
+
 
 def verify_restore_config(config, config_name):
     """Verify restore/deploy configuration structure."""
@@ -1170,8 +1219,8 @@ def verify_snapshot(capture_dir, label=None):
 
     ext, _ = COMPRESS_MAP[compress_type]
 
-    # Check that at least one tar archive exists
-    archives = list(capture_dir.glob(f"*{ext}"))
+    # Check that at least one tar archive exists (encrypted ones end in .age)
+    archives = list(capture_dir.glob(f"*{ext}")) + list(capture_dir.glob(f"*{ext}{AGE_EXT}"))
     if not archives:
         fatal(f"No archives found in {label}")
 
@@ -1213,14 +1262,85 @@ def archive_classify(paths, truthy, falsey, cond):
     return lines[truthy], lines[falsey]
 
 
+def metadata_file(name):
+    """Check if a member path names a macOS metadata file ('._*' or .DS_Store, any depth).
+
+    Only on macOS; elsewhere such files are ordinary data.
+    """
+    if sys.platform != "darwin":
+        return False
+    basename = PurePosixPath(name).name
+    return basename == ".DS_Store" or basename.startswith("._")
+
+
 def archive_filter(tarinfo):
     """Filters metadata files from archives."""
-    if sys.platform == "darwin":
-        # Skip ._* resource fork files and .DS_Store
-        re_metadata = r"^(?:\._.*)|(?:.*/?.DS_Store)$"
-        if re.match(re_metadata, tarinfo.name):
-            return None
+    if metadata_file(tarinfo.name):
+        return None
     return tarinfo
+
+
+def exclude_match(name, patterns):
+    """Return the first exclude pattern that matches a member path, or None.
+
+    name is relative to the archive root. A pattern (an fnmatch glob) matches the whole
+    path or any single component of it, so 'node_modules', '*.log' and '.cache/*' work.
+    """
+    path = PurePosixPath(name)
+    for pattern in patterns:
+        if fnmatch.fnmatch(str(path), pattern):
+            return pattern
+        if any(fnmatch.fnmatch(part, pattern) for part in path.parts):
+            return pattern
+    return None
+
+
+def exclude_filter(patterns, excluded):
+    """Return a tar.add filter that skips metadata files and members an exclude matches.
+
+    Each excluded member is added to `excluded` as (name, pattern). An excluded dir is
+    skipped with everything below it.
+    """
+
+    def member_filter(tarinfo):
+        if metadata_file(tarinfo.name):
+            return None
+        pattern = exclude_match(tarinfo.name, patterns)
+        if pattern:
+            excluded.append((str(PurePosixPath(tarinfo.name)), pattern))
+            return None
+        return tarinfo
+
+    return member_filter
+
+
+def excluded_members(root_path, paths, patterns):
+    """List the (name, pattern) pairs a capture excludes below paths, without archiving.
+
+    It walks the paths as tar.add does (symlinks are not followed), for a dry run.
+    """
+    found = []
+
+    def visit(full_path, name):
+        if metadata_file(name):
+            return
+        pattern = exclude_match(name, patterns)
+        if pattern:
+            found.append((name, pattern))
+            return
+        if full_path.is_dir() and not full_path.is_symlink():
+            try:
+                children = sorted(os.listdir(full_path))
+            except OSError:
+                return  # A real run reports it when it reads the dir
+            for child in children:
+                visit(full_path / child, f"{name}/{child}")
+
+    for path in paths:
+        full_path = root_path / path
+        if os.path.lexists(full_path):
+            visit(full_path, str(PurePosixPath(path)))
+    return found
 
 
 def archive_expand(patterns, root_path):
@@ -1249,11 +1369,12 @@ def archive_expand(patterns, root_path):
     return expanded, warnings
 
 
-def archive_create(name, root, paths, outdir, compress="gzip"):
+def archive_create(name, root, paths, outdir, compress="gzip", exclude=()):
     """Create a compressed tar archive for a category.
 
-    Returns (archive_path, lines, warnings): the item header and include lines, then the
-    skip lines, for the caller to print.
+    exclude holds fnmatch patterns for members to leave out (see exclude_match).
+    Returns (archive_path, lines, warnings): the item header, include and (with
+    --verbose) exclude lines, then the skip lines, for the caller to print.
     """
     if compress not in COMPRESS_MAP:
         compress_error(compress, "the capture config's [tarball] table")
@@ -1265,9 +1386,19 @@ def archive_create(name, root, paths, outdir, compress="gzip"):
     # Expand any glob patterns in the paths
     expanded_paths, expand_warnings = archive_expand(paths, root_path)
 
+    # A listed path that an exclude matches is an exclude, not an include
+    excluded = []
+    kept = []
+    for path in expanded_paths:
+        pattern = exclude_match(path, exclude) if exclude else None
+        if pattern and (root_path / path).exists():
+            excluded.append((str(PurePosixPath(path)), pattern))
+        else:
+            kept.append(path)
+
     lines = [f"{archive_path.name} (root: {root_path})"]
     includes, skips = archive_classify(
-        expanded_paths,
+        kept,
         "include",
         "skip",
         cond=lambda path: (root_path / path).exists(),
@@ -1276,25 +1407,38 @@ def archive_create(name, root, paths, outdir, compress="gzip"):
     warnings = [f"{line} (not found)" for line in skips] + expand_warnings
 
     if __dry_run__:
+        if __verbose__ and exclude:
+            excluded += excluded_members(root_path, kept, exclude)
+            lines += exclude_lines(excluded)
         return archive_path, lines, warnings
 
     # Don't show individual progress bars during parallel creation
     # (avoids terminal corruption and empty lines)
+    member_filter = exclude_filter(exclude, excluded)
     with tarfile.open(archive_path, mode) as tar:
-        for path in expanded_paths:
+        for path in kept:
             full_path = root_path / path
             if not full_path.exists():
                 continue
-            tar.add(full_path, arcname=str(path), filter=archive_filter)
+            tar.add(full_path, arcname=str(path), filter=member_filter)
+    # Private to the user; the staging dir it is written in is 0700 already
+    os.chmod(archive_path, PRIVATE_FILE_MODE)
 
+    if __verbose__:
+        lines += exclude_lines(excluded)
     return archive_path, lines, warnings
+
+
+def exclude_lines(excluded):
+    """Format --verbose 'exclude:' detail lines, one per excluded member, sorted."""
+    return [f"exclude: {name} (pattern '{pattern}')" for name, pattern in sorted(set(excluded))]
 
 
 def create_archives(tasks, compress="gzip"):
     """Create multiple archives in parallel.
 
     Args:
-        tasks: List of (category, root, paths, outdir) tuples
+        tasks: List of (category, root, paths, outdir[, exclude patterns]) tuples
         compress: Compression type to use for all archives
     """
     if not tasks:
@@ -1309,7 +1453,12 @@ def create_archives(tasks, compress="gzip"):
 
     results, buffer, failed = [], {}, set()
     with ccft.ThreadPoolExecutor(max_workers=len(tasks)) as exc:
-        futures = {exc.submit(archive_create, *task, compress): task for task in tasks}
+        futures = {}
+        for task in tasks:
+            category, root, paths, outdir = task[:4]
+            exclude = task[4] if len(task) > 4 else ()
+            future = exc.submit(archive_create, category, root, paths, outdir, compress, exclude)
+            futures[future] = (category, root)
         with dtqdm(len(tasks), "Creating archives", autorefresh=True) as pbar:
             for future in ccft.as_completed(futures):
                 task = futures[future]
@@ -1344,6 +1493,184 @@ def create_archives(tasks, compress="gzip"):
     return results
 
 
+# --- Encryption --- #
+
+# An encrypted archive is <name><ext>.age, written by the age CLI (https://age-encryption.org)
+AGE_EXT = ".age"
+AGE_INSTALL_HINT = "Install age (brew install age, or apt install age)"
+
+
+def archive_file(category, ext, encrypted=False):
+    """Return an archive's file name in a snapshot: <name><ext>, plus .age when encrypted."""
+    name = f"{category}{ext}"
+    if encrypted:
+        name += AGE_EXT
+    return name
+
+
+def snapshot_files(directory, ext):
+    """List the archive files in a directory: <name><ext> and encrypted <name><ext>.age."""
+    return sorted(directory.glob(f"*{ext}")) + sorted(directory.glob(f"*{ext}{AGE_EXT}"))
+
+
+def age_missing(names, verb):
+    """Stop with an Error when the age CLI is not on PATH; names are the archive file names."""
+    if shutil.which("age"):
+        return
+    fatal(f"Cannot {verb} {', '.join(names)}: age not found", AGE_INSTALL_HINT)
+
+
+def age_recipient_options(config, names):
+    """Return age's -r/-R options from a capture config's [age] table.
+
+    names are the archives to encrypt, for the Error when age is missing. Recipients are
+    public keys, so nothing here is secret. recipients_file is expanded like a root.
+    """
+    age_missing(names, "encrypt")
+    age_config = config.get("age", {})
+    options = []
+    for recipient in age_config.get("recipients", []):
+        options += ["-r", recipient]
+    recipients_file = age_config.get("recipients_file")
+    if recipients_file:
+        path = expand_path(recipients_file)
+        if not path.is_file():
+            fatal(
+                f"Recipients file not found: {path}",
+                "Set 'recipients_file' in the [age] table to a file of age public keys",
+            )
+        options += ["-R", str(path)]
+    return options
+
+
+def encrypt_archives(archives, options):
+    """Encrypt archives in parallel with age, each to <archive>.age, removing the plaintext.
+
+    A dry run only shows the age commands. Any failure stops the capture; the caller
+    removes the staging dir, and the plaintext with it.
+    """
+    count = plural(len(archives), "archive")
+    step(f"Encrypting {count}")
+
+    commands = []
+    for archive in archives:
+        target = archive.with_name(archive.name + AGE_EXT)
+        commands.append((archive, ["age", "-e", *options, "-o", str(target), str(archive)]))
+    for _, argv in commands:
+        echo(argv, verbose=True)
+    if __dry_run__:
+        return
+
+    def encrypt(command):
+        archive, argv = command
+        result = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True)
+        if result.returncode == 0:
+            archive.unlink()
+        return result
+
+    failures = []
+    with dtqdm(len(commands), "Encrypting archives", autorefresh=True) as pbar:
+        with ccft.ThreadPoolExecutor(max_workers=len(commands)) as exc:
+            futures = {exc.submit(encrypt, command): command[0] for command in commands}
+            for future in ccft.as_completed(futures):
+                try:
+                    result = future.result()
+                    if result.returncode != 0:
+                        failures.append((futures[future], result))
+                except OSError as e:
+                    failures.append((futures[future], e))
+                pbar.update(1)
+
+    if not failures:
+        ok(f"{count} encrypted")
+        return
+    for archive, result in sorted(failures, key=lambda failure: failure[0].name):
+        if isinstance(result, OSError):
+            error(f"Cannot encrypt {archive.name}: {result}")
+            continue
+        with _output_lock:
+            relay(result.stderr, 1, sys.stderr)
+            error(f"Encrypting {archive.name} failed (exit status {result.returncode})")
+    fatal(
+        f"Capture failed: {len(failures)} of {count} could not be encrypted; "
+        "no snapshot was saved"
+    )
+
+
+def age_identity(restore_config, names, table="tar"):
+    """Return the age identity file from a restore config's [age] table, checked.
+
+    names are the encrypted archives, for the Error lines; table names the restore
+    config's [tar] table ('restore.tar' in migrate.toml), and so its [age] table.
+    """
+    age_table = table[: -len("tar")] + "age"
+    age_config = restore_config.get("age", {})
+    identity = age_config.get("identity") if isinstance(age_config, dict) else None
+    if not identity:
+        fatal(
+            f"Cannot decrypt {', '.join(names)}: no age identity is set",
+            f"Set 'identity' in the restore config's [{age_table}] table to your age "
+            "identity (private key) file",
+        )
+    if not isinstance(identity, str):
+        fatal(f"The 'identity' key in [{age_table}] must be a path")
+    age_missing(names, "decrypt")
+
+    path = expand_path(identity)
+    if not path.is_file():
+        fatal(
+            f"Age identity not found: {path}",
+            f"Set 'identity' in the restore config's [{age_table}] table to your age "
+            "identity file",
+        )
+    return path
+
+
+def decrypt_archives(archives, identity, scratch):
+    """Decrypt the .age archives among `archives` into a new private (0700) temp dir.
+
+    Returns the list with each one replaced by its plaintext copy, <name><ext>, which
+    the restore reads like any other archive. The temp dir is added to `scratch`; the
+    caller always removes it. A dry run only shows the age commands, and names
+    placeholders a real run would create. They run one at a time, since age may ask for
+    the identity's passphrase on the terminal.
+    """
+    encrypted = [archive for archive in archives if archive.name.endswith(AGE_EXT)]
+    count = plural(len(encrypted), "archive")
+    step(f"Decrypting {count}")
+
+    if __dry_run__:
+        plain_dir = Path(DRY_RUN_DIR) / "decrypted"
+    else:
+        plain_dir = Path(tempfile.mkdtemp(prefix=f"{__script__.stem}-decrypt-"))
+        scratch.append(plain_dir)
+
+    plain = {}
+    for archive in encrypted:
+        target = plain_dir / archive.name[: -len(AGE_EXT)]
+        argv = ["age", "-d", "-i", str(identity), "-o", str(target), str(archive)]
+        echo(argv, verbose=True)
+        plain[archive] = target
+        if __dry_run__:
+            continue
+
+        flush_stream(sys.stdout)
+        flush_stream(sys.stderr)
+        try:
+            result = subprocess.run(argv, capture_output=True, text=True)
+        except OSError as e:
+            fatal(f"Cannot decrypt {archive.name}: {e}")
+        if result.returncode != 0:
+            relay(result.stderr, 1, sys.stderr)
+            fatal(
+                f"Decrypting {archive.name} failed (exit status {result.returncode})",
+                "Check that the [age] identity matches a recipient the capture used",
+            )
+
+    ok(f"{count} decrypted")
+    return [plain.get(archive, archive) for archive in archives]
+
+
 def generate_snapshot_toml(
     outdir, compress="gzip", category_meta=None, roll_ext=None
 ):
@@ -1363,15 +1690,17 @@ def generate_snapshot_toml(
     if __dry_run__:
         return toml_path, DRY_RUN_CHECKSUM
 
-    archives = list(outdir.glob(f"*{ext}"))
+    archives = snapshot_files(outdir, ext)
 
-    # Calculate checksums for all archives
-    checksums = {}
+    # Calculate checksums for all archives; an encrypted archive's is over its .age file
+    checksums, encrypted = {}, set()
     with dtqdm(len(archives), "Computing checksums", autorefresh=True) as pbar:
         for archive in archives:
             category = archive_category(archive)
             checksum = calculate_file_checksum(archive, show=False)
             checksums[category] = checksum
+            if archive.name.endswith(AGE_EXT):
+                encrypted.add(category)
             pbar.update(1)
 
     # [tarball]: the compression (when not gzip), the rollback extension and the digest.
@@ -1393,6 +1722,8 @@ def generate_snapshot_toml(
             table["root"] = str(meta["root"])
         if meta.get("link"):
             table["link"] = str(meta["link"])
+        if category in encrypted:
+            table["encrypted"] = True
         table["checksum"] = checksums[category]
         tar_tables[category] = table
 
@@ -1400,10 +1731,12 @@ def generate_snapshot_toml(
     if tar_tables:
         snapshot["tar"] = tar_tables
 
-    # tomllib reads TOML as UTF-8, whatever the locale
-    with open(toml_path, "w", encoding="utf-8") as f:
+    # tomllib reads TOML as UTF-8, whatever the locale. The file is private (0600)
+    fd = os.open(toml_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, PRIVATE_FILE_MODE)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write("# Snapshot written by snap.py capture\n")
         f.write(toml_dumps(snapshot))
+    os.chmod(toml_path, PRIVATE_FILE_MODE)
 
     # Combined checksum from all archive checksums
     combined = "".join(checksums[cat] for cat in sorted(checksums))
@@ -1414,13 +1747,18 @@ def generate_snapshot_toml(
 
 
 def archive_category(archive):
-    """Return an archive's [tar.<name>] name: its file name without the tar extension."""
+    """Return an archive's [tar.<name>] name: its file name without the tar extension.
+
+    An encrypted archive loses its .age extension too.
+    """
     name = Path(archive).name
+    if name.endswith(AGE_EXT) and len(name) > len(AGE_EXT):
+        name = name[: -len(AGE_EXT)]
     # Longest extensions first, so 'x.tar.gz' loses '.tar.gz', not just '.gz'
     for ext in sorted((ext for ext, _ in COMPRESS_MAP.values()), key=len, reverse=True):
         if name.endswith(ext) and len(name) > len(ext):
             return name[: -len(ext)]
-    return Path(archive).stem
+    return Path(name).stem
 
 
 def archive_entries(tar, report=True):
@@ -1483,6 +1821,11 @@ def archive_confirm(archive, compress="gzip", root=None):
     root_path = root_display(root)
     say(f"{archive.name} (root: {root_path})")
 
+    # A dry run doesn't decrypt, so an encrypted archive's paths are unknown
+    if is_placeholder(archive):
+        say("encrypted; a dry run does not list its paths", 2)
+        return ask(f"Restore {archive.name}?")
+
     # Get captured paths from the archive (auto-detect compression)
     try:
         with tarfile.open(archive, "r:*") as tar:
@@ -1522,12 +1865,13 @@ def snapshot_archives(capture_dir, snapshot_config, ext):
     the checksum check or extract without a root.
     """
     available = []
-    for name in snapshot_config.get("tar", {}):
+    for name, table in snapshot_config.get("tar", {}).items():
         # A name with a '/' would point outside the snapshot dir, and '.' or '..' would
         # put its backups outside the backup directory
         if name in ("", ".", ".."):
             continue
-        archive = capture_dir / f"{name}{ext}"
+        encrypted = isinstance(table, dict) and table.get("encrypted") is True
+        archive = capture_dir / archive_file(name, ext, encrypted)
         if archive.parent == capture_dir and archive.is_file():
             available.append(archive)
     return available
@@ -1568,6 +1912,7 @@ def archive_select(available, patterns):
 def copy_with_ownership(src, dst):
     """Copy a file, symlink, or directory tree, preserving ownership when running as root.
 
+    Modes and timestamps are kept, and xattrs where Python can copy them (Linux).
     Symlinks are copied as links, never followed.
     """
     src_path = Path(src)
@@ -1576,6 +1921,10 @@ def copy_with_ownership(src, dst):
 
     if src_path.is_symlink():
         os.symlink(os.readlink(src_path), dst_path)
+        try:
+            shutil.copystat(src_path, dst_path, follow_symlinks=False)
+        except OSError:
+            pass  # Not every platform can set a link's own times or mode
     elif src_path.is_dir():
         shutil.copytree(src_path, dst_path, symlinks=True)
     else:
@@ -1592,6 +1941,25 @@ def copy_with_ownership(src, dst):
     for path in copied:
         src_stat = (src_path / path.relative_to(dst_path)).lstat()
         os.chown(path, src_stat.st_uid, src_stat.st_gid, follow_symlinks=False)
+
+
+def move_path(src, dst):
+    """Move a path to dst, creating dst's missing parents (see make_parents).
+
+    A rename keeps the same inode, so every attribute stays exactly as it was: mode,
+    ownership, timestamps, xattrs, ACLs and hardlinks. Only when dst is on another
+    filesystem (EXDEV) is src copied instead (copy_with_ownership); the caller then
+    removes src. Returns True for a rename, False for a copy.
+    """
+    make_parents(dst)
+    try:
+        os.rename(src, dst)
+        return True
+    except OSError as e:
+        if e.errno != errno.EXDEV:
+            raise
+    copy_with_ownership(src, dst)
+    return False
 
 
 def make_parents(path, created=None):
@@ -1708,10 +2076,11 @@ def restore_category(archive, root, roll_ext, compress="gzip", rotated=None):
     """Transactionally restore a single category with rollback on failure.
 
     Replaces only the paths captured in the archive, one at a time:
-    1. Backs up the existing path (copy, not move) to <root><roll_ext>/<archive name>
-    2. Removes the original
+    1. Backs up the existing path by moving it to <root><roll_ext>/<archive name>
+       (a rename, so it keeps every attribute; a copy only across filesystems)
+    2. Removes what is left of the original (only after a copy)
     3. Extracts the captured path from the archive
-    4. On any error or Ctrl-C: restores every touched path from backup
+    4. On any error or Ctrl-C: moves every touched path back from backup
 
     rotated is the set of backup directories already moved aside in this restore run.
     The first archive with a given root moves that root's old backup directory aside;
@@ -1731,27 +2100,32 @@ def restore_category(archive, root, roll_ext, compress="gzip", rotated=None):
     # The item header comes first, so an error opening the archive appears under it
     say(f"{archive.name} (root: {root_path}, backup: {rollbackd})")
 
-    # Always open archive and classify entries
-    try:
-        with tarfile.open(archive, "r:*") as tar:
-            groups = archive_entries(tar)
-    except (tarfile.TarError, ValueError, OSError) as e:
-        error(f"Cannot restore {archive.name}: {e}")
-        say("failed (see the error above)", 2)
-        return False
+    if is_placeholder(archive):
+        # A dry run doesn't decrypt, so an encrypted archive's paths are unknown
+        say("encrypted; a dry run does not list its paths", 2)
+        groups = {}
+    else:
+        # Always open archive and classify entries
+        try:
+            with tarfile.open(archive, "r:*") as tar:
+                groups = archive_entries(tar)
+        except (tarfile.TarError, ValueError, OSError) as e:
+            error(f"Cannot restore {archive.name}: {e}")
+            say("failed (see the error above)", 2)
+            return False
 
-    # Classify entries: replace (existing) vs add (new)
-    replaces, adds = archive_classify(
-        list(groups),
-        "replace",
-        "add",
-        cond=lambda entry: os.path.lexists(root_path / entry),
-    )
+        # Classify entries: replace (existing) vs add (new)
+        replaces, adds = archive_classify(
+            list(groups),
+            "replace",
+            "add",
+            cond=lambda entry: os.path.lexists(root_path / entry),
+        )
 
-    if not groups:
-        say("empty archive, no files to replace or add", 2)
-    for line in replaces + adds:
-        say(line, 2)
+        if not groups:
+            say("empty archive, no files to replace or add", 2)
+        for line in replaces + adds:
+            say(line, 2)
 
     # The same root can be spelled two ways (a symlink, '..'); rotate it once all the same
     rotation_key = os.path.realpath(backups)
@@ -1793,11 +2167,15 @@ def restore_category(archive, root, roll_ext, compress="gzip", rotated=None):
                 entry_path = root_path / entry
                 has_backup = os.path.lexists(entry_path)
 
-                # Back up the existing path, then remove it
-                if has_backup:
-                    copy_with_ownership(entry_path, rollbackd / entry)
+                # Back up the existing path by moving it; a copy across filesystems
+                # leaves the original, which goes once the backup is recorded
+                # Ctrl-C waits until the move is recorded, so the rollback always
+                # knows about a path it moved
                 created = []
-                touched.append((entry, has_backup, created))
+                with sigint_deferred():
+                    if has_backup:
+                        move_path(entry_path, rollbackd / entry)
+                    touched.append((entry, has_backup, created))
                 remove_path(entry_path)
                 make_parents(entry_path, created)
 
@@ -1828,8 +2206,25 @@ def restore_category(archive, root, roll_ext, compress="gzip", rotated=None):
         return False
 
 
+@contextlib.contextmanager
+def sigint_deferred():
+    """Hold a Ctrl-C until the block ends, then raise it, so it can't split a step."""
+    received = []
+    try:
+        previous = signal.signal(signal.SIGINT, lambda signum, frame: received.append(signum))
+    except ValueError:
+        yield  # Not in the main thread; signals only reach the main thread anyway
+        return
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGINT, previous)
+        if received:
+            raise KeyboardInterrupt
+
+
 def restore_rollback(name, root_path, rollbackd, touched, cause):
-    """Delete touched paths and restore them from backup; exit if that fails.
+    """Delete touched paths and move them back from backup; exit if that fails.
 
     name is the archive file name, used only in messages; cause is the exception.
     """
@@ -1840,7 +2235,8 @@ def restore_rollback(name, root_path, rollbackd, touched, cause):
         try:
             remove_path(entry_path)
             if has_backup:
-                copy_with_ownership(rollbackd / entry, entry_path)
+                # A copy back (across filesystems) leaves the backup in place too
+                move_path(rollbackd / entry, entry_path)
         except OSError as rollback_error:
             failures.append(f"{entry}: {rollback_error}")
             continue
@@ -2095,8 +2491,8 @@ def verify_archives_from_toml(capture_dir, warn_unverified=True):
     # List archives to verify
     if __verbose__:
         for category in sorted(tar_sections.keys()):
-            archive_path = capture_dir / f"{category}{archive_ext}"
-            say(f"verify: {archive_path.name}")
+            encrypted = tar_sections[category].get("encrypted") is True
+            say(f"verify: {archive_file(category, archive_ext, encrypted)}")
 
     if __dry_run__:
         say("checksums are not checked in a dry run")
@@ -2107,7 +2503,9 @@ def verify_archives_from_toml(capture_dir, warn_unverified=True):
     bad = 0
     with dtqdm(len(tar_sections), "Verifying archives", autorefresh=True) as pbar:
         for category, section_data in tar_sections.items():
-            archive_path = capture_dir / f"{category}{archive_ext}"
+            # An encrypted archive's checksum is over its .age file
+            encrypted = section_data.get("encrypted") is True
+            archive_path = capture_dir / archive_file(category, archive_ext, encrypted)
 
             if not archive_path.exists():
                 problems.append(f"{archive_path.name}: not found")
@@ -2118,7 +2516,7 @@ def verify_archives_from_toml(capture_dir, warn_unverified=True):
             # Rejoin checksum chunks
             checksum_chunks = section_data.get("checksum", [])
             if not checksum_chunks:
-                problems.append(f"{category}{archive_ext}: no checksum in {DEFAULT_SNAPSHOT_TOML}")
+                problems.append(f"{archive_path.name}: no checksum in {DEFAULT_SNAPSHOT_TOML}")
                 bad += 1
                 pbar.update(1)
                 continue
@@ -2189,12 +2587,28 @@ def remote_workdir(host, purpose, subdirs=()):
     return work_dir
 
 
-def remote_workdir_remove(host, work_dir, report=True):
+def remote_stop_command(work_dir, command):
+    """Build a shell line that stops 'snap.py <command> -r <work_dir>' on a host.
+
+    pkill -f matches the snap.py run and the shell that started it. The '[.]' keeps the
+    pattern from matching the shell that runs this pkill. It sends SIGINT, like Ctrl-C,
+    so snap.py there removes its own staging dir (which holds plaintext archives) before
+    it exits. It waits a moment when it stopped something, and its exit status is never
+    used.
+    """
+    escaped = re.sub(r"([.+])", r"\\\1", str(work_dir))
+    pattern = f"snap[.]py {command} -r {escaped}( |$)"
+    return f"pkill -INT -f {shlex.quote(pattern)} && sleep 2"
+
+
+def remote_workdir_remove(host, work_dir, report=True, running=None):
     """Remove a work directory from a host, best effort.
 
     After a run that went well (report=True) it prints its step, and a failed rm is a
     Warning. After a failure or Ctrl-C (report=False) it prints nothing, so the run still
-    ends with its own Error block, and never raises for ssh problems.
+    ends with its own Error block, and never raises for ssh problems. running names the
+    snap.py command that may still run in the work dir then ('capture'); it is stopped
+    first, so it can't recreate files there.
     """
     command = f"rm -rf {shlex.quote(str(work_dir))}"
 
@@ -2211,6 +2625,8 @@ def remote_workdir_remove(host, work_dir, report=True):
 
     if __dry_run__:
         return  # Nothing was created
+    if running:
+        command = f"{remote_stop_command(work_dir, running)}; {command}"
     try:
         subprocess.run(
             ssh_argv(host, command),
@@ -2309,19 +2725,31 @@ def restore_child_config(restore_config, table="tar"):
     """Return what restore() reads from a restore config, for a snap.py run with -t.
 
     That is the [tar] 'archives' key (a missing or empty one becomes [], which skips the
-    archive restore just the same) and the before and after [scripts]. table is the name
-    the user's config gives the [tar] table ('restore.tar' in migrate.toml); it goes in
-    [snap] so the other run's messages name it the same way.
+    archive restore just the same), the before and after [scripts], and the [age]
+    identity's path. table is the name the user's config gives the [tar] table
+    ('restore.tar' in migrate.toml); it goes in [snap] so the other run's messages name
+    it the same way. A missing 'archives' key is noted in [snap] too, so the other run
+    reports it as a local run does.
     """
-    archives = restore_config.get("tar", {}).get("archives") or []
+    tar_table = restore_config.get("tar", {})
+    archives = tar_table.get("archives") or []
     child_config = {"tar": {"archives": archives}}
+    snap_table = {}
     if table != "tar":
-        child_config["snap"] = {"table": table}
+        snap_table["table"] = table
+    if "archives" not in tar_table:
+        snap_table["no_archives_key"] = True
+    if snap_table:
+        child_config["snap"] = snap_table
     if "scripts" in restore_config:
         scripts = restore_config["scripts"]
         child_config["scripts"] = {
             when: scripts[when] for when in ("before", "after") if when in scripts
         }
+    # Only the identity's path: the key itself never leaves the machine it is on
+    age_config = restore_config.get("age")
+    if isinstance(age_config, dict) and "identity" in age_config:
+        child_config["age"] = {"identity": age_config["identity"]}
     return child_config
 
 
@@ -2341,6 +2769,53 @@ def write_config_toml(config, config_name, purpose):
     return Path(tmp)
 
 
+# --- Private Snapshots --- #
+
+# Everything capture writes is private to the user: new dirs 0700, files 0600
+PRIVATE_DIR_MODE = 0o700
+PRIVATE_FILE_MODE = 0o600
+
+# The umask for shell commands that create a snapshot's dirs on a host
+PRIVATE_UMASK = "umask 077"
+
+
+def mkdir_private(path):
+    """Create a dir and its missing parents, each 0700; existing dirs are left as they are.
+
+    Raises FileExistsError when a file is where the dir should be, as Path.mkdir does.
+    """
+    path = Path(path)
+    missing = []
+    existing = path
+    while not os.path.lexists(existing) and existing.parent != existing:
+        missing.append(existing)
+        existing = existing.parent
+    if not missing and not existing.is_dir():
+        raise FileExistsError(errno.EEXIST, os.strerror(errno.EEXIST), str(path))
+
+    for directory in reversed(missing):
+        directory.mkdir(mode=PRIVATE_DIR_MODE)
+        os.chmod(directory, PRIVATE_DIR_MODE)  # the umask can't widen it, but be exact
+
+
+def snapshot_private(snapshot_dir):
+    """Make a snapshot dir 0700 and everything in it private: files 0600, dirs 0700.
+
+    That covers files after-capture scripts wrote there (a Brewfile). Symlinks are left
+    alone, and never followed.
+    """
+    os.chmod(snapshot_dir, PRIVATE_DIR_MODE)
+    for parent, dirs, files in os.walk(snapshot_dir):
+        for name in dirs:
+            path = os.path.join(parent, name)
+            if not os.path.islink(path):
+                os.chmod(path, PRIVATE_DIR_MODE)
+        for name in files:
+            path = os.path.join(parent, name)
+            if not os.path.islink(path):
+                os.chmod(path, PRIVATE_FILE_MODE)
+
+
 # --- Capture Logic --- #
 
 
@@ -2350,18 +2825,27 @@ def capture(args, root_dir, outdir, config, config_name=DEFAULT_CONFIG_CAPTURE, 
     Display only: config_name names the config in messages; phase ('capture' in a
     migration) prefixes the script steps.
     """
-
-    # Run before scripts
-    if args.run_scripts:
-        run_scripts(root_dir, config, "before", working_dir=outdir, phase=phase)
-
     # Get compression type and rollback extension from config
     tarball_opts = config.get("tarball", {})
     compress = tarball_opts.get("compress", "gzip")
     roll_ext = tarball_opts.get("rollback")
 
-    # Collect all archive tasks and build category metadata
+    # Archives to encrypt: age and its recipients are checked before anything runs
     tar_config = config.get("tar", {})
+    ext = COMPRESS_MAP[compress][0] if compress in COMPRESS_MAP else ""
+    encrypted = [
+        name for name, data in tar_config.items()
+        if isinstance(data, dict) and data.get("encrypt") is True
+    ]
+    age_options = []
+    if encrypted:
+        age_options = age_recipient_options(config, [f"{name}{ext}" for name in encrypted])
+
+    # Run before scripts
+    if args.run_scripts:
+        run_scripts(root_dir, config, "before", working_dir=outdir, phase=phase)
+
+    # Collect all archive tasks and build category metadata
     tasks = []
     category_meta = {}
     for category, data in tar_config.items():
@@ -2377,7 +2861,7 @@ def capture(args, root_dir, outdir, config, config_name=DEFAULT_CONFIG_CAPTURE, 
         if not paths:
             continue
 
-        tasks.append((category, root, paths, outdir))
+        tasks.append((category, root, paths, outdir, data.get("exclude", [])))
 
         # Store root and link for tarball TOML
         category_meta[category] = {"root": root, "link": data.get("link")}
@@ -2395,6 +2879,11 @@ def capture(args, root_dir, outdir, config, config_name=DEFAULT_CONFIG_CAPTURE, 
             )
         fatal(f"Capture failed: {count} could not be created; no snapshot was saved")
 
+    # Encrypt in the private staging dir; only the .age files go into the snapshot
+    to_encrypt = [archive for archive in created if archive_category(archive) in encrypted]
+    if to_encrypt:
+        encrypt_archives(sorted(to_encrypt), age_options)
+
     # Generate snapshot TOML with checksum
     step(f"Writing {DEFAULT_SNAPSHOT_TOML}")
     toml_path, checksum = generate_snapshot_toml(
@@ -2405,13 +2894,12 @@ def capture(args, root_dir, outdir, config, config_name=DEFAULT_CONFIG_CAPTURE, 
 
     # Create checksum-named subdirectory and move files
     dst_dir = outdir.parent / outdir.name / checksum[:7]
-    ext, _ = COMPRESS_MAP[compress]
 
     if not __dry_run__:
-        dst_dir.mkdir(parents=True, exist_ok=False)
+        mkdir_private(dst_dir)
 
-        # Move all tar archives to checksum directory
-        for archive in outdir.glob(f"*{ext}"):
+        # Move all tar archives, encrypted ones included, to checksum directory
+        for archive in snapshot_files(outdir, ext):
             archive.rename(dst_dir / archive.name)
 
         # Move snapshot TOML to checksum directory
@@ -2420,6 +2908,10 @@ def capture(args, root_dir, outdir, config, config_name=DEFAULT_CONFIG_CAPTURE, 
     # Run after-capture scripts from the same config as the archives and before scripts
     if args.run_scripts:
         run_scripts(root_dir, config, "after", working_dir=dst_dir, phase=phase)
+
+    # Everything in the snapshot is private, the files those scripts wrote included
+    if not __dry_run__:
+        snapshot_private(dst_dir)
 
     return dst_dir
 
@@ -2434,9 +2926,14 @@ def capture_deploy(capture_dir, dest_host, intended_path):
 
     step(f"Copying snapshot to {dest_host}")
 
-    # rsync creates only the last directory of its destination
+    # rsync creates only the last directory of its destination. New dirs are private
+    # (0700); rsync -a gives the snapshot's own dir and files their modes (0700, 0600)
     escaped_path = shlex.quote(str(intended_path))
-    ssh_run(dest_host, f"mkdir -p {escaped_path}", desc="Creating the snapshot directory")
+    ssh_run(
+        dest_host,
+        f"{PRIVATE_UMASK} && mkdir -p {escaped_path}",
+        desc="Creating the snapshot directory",
+    )
     rsync_copy(
         f"{capture_dir}/",
         f"{dest_host}:{intended_path}/",
@@ -2565,6 +3062,9 @@ def remote_capture(args, root_dir, source_host, capture_config=None):
             f"the snapshot from {source_host}",
             label="snapshot",
         )
+        # snap.py on the host made it private and rsync -a kept the modes; make sure
+        if not __dry_run__ and snapshot.is_dir():
+            snapshot_private(snapshot)
         done = True
     finally:
         if tmp_capture_toml and tmp_capture_toml.exists():
@@ -2573,7 +3073,7 @@ def remote_capture(args, root_dir, source_host, capture_config=None):
         if not done and tmpdir and not __dry_run__ and tmpdir.exists():
             shutil.rmtree(tmpdir)
         if work_dir is not None:
-            remote_workdir_remove(source_host, work_dir, report=done)
+            remote_workdir_remove(source_host, work_dir, report=done, running="capture")
 
     return snapshot, tmpdir if not __dry_run__ else None
 
@@ -2583,10 +3083,49 @@ def remote_capture(args, root_dir, source_host, capture_config=None):
 
 def path_writable(path):
     """Check if a path, or its nearest existing parent when missing, is writable."""
+    return os.access(nearest_existing(path), os.W_OK)
+
+
+def nearest_existing(path):
+    """Return a path, or its nearest existing parent when it is missing."""
     path = Path(path)
     while not os.path.lexists(path) and path.parent != path:
         path = path.parent
-    return os.access(path, os.W_OK)
+    return path
+
+
+def path_device(path):
+    """Return the device (filesystem) of a path, or of its nearest existing parent."""
+    return nearest_existing(path).stat().st_dev
+
+
+def entry_movable(path, backup_device):
+    """Check if the current user can move an existing path into the backup dir and back.
+
+    A rename needs write and search on the path's parent (and, in a sticky dir such as
+    /tmp, owning the path or the dir); a dir also needs write on itself, for its '..'.
+    The backup dir is inside a fresh dir this user creates, so it is writable. When
+    the backup dir is on another filesystem (backup_device differs), the path is copied
+    and then deleted instead, which needs read access to everything below it.
+    """
+    path = Path(path)
+    parent = path.parent
+    if not os.access(parent, os.W_OK | os.X_OK):
+        return False
+    try:
+        info = path.lstat()
+        parent_info = parent.stat()
+    except OSError:
+        return False
+    euid = os.geteuid() if hasattr(os, "geteuid") else None
+    if parent_info.st_mode & stat.S_ISVTX and euid not in (info.st_uid, parent_info.st_uid):
+        return False
+
+    if info.st_dev != backup_device:
+        return tree_replaceable(path)
+    if stat.S_ISDIR(info.st_mode) and not os.access(path, os.W_OK):
+        return False
+    return True
 
 
 def tree_replaceable(path):
@@ -2624,12 +3163,18 @@ def archive_writable(archive, root, roll_ext):
     if roll_ext:
         # Rotating and creating <root><roll_ext> happen in its parent; each archive's
         # subdirectory is then created inside the fresh one
-        if not path_writable(backup_dir(root_path, roll_ext).parent):
+        backups = backup_dir(root_path, roll_ext)
+        if not path_writable(backups.parent):
             return False
+        try:
+            # The fresh backup dir is created in its parent (an old one is moved aside)
+            backup_device = path_device(backups.parent)
+        except OSError:
+            return False  # An unsearchable parent, which root can search
         for entry in groups:
             entry_path = root_path / entry
             if os.path.lexists(entry_path):
-                if not tree_replaceable(entry_path):
+                if not entry_movable(entry_path, backup_device):
                     return False
             elif not path_writable(entry_path.parent):
                 return False
@@ -2654,8 +3199,9 @@ def restore_needs_sudo(selected, root_map, roll_ext, snapshot_config):
     """
     for archive in selected:
         root = root_map.get(archive_category(archive))
-        # Rollback restore skips categories without a root
-        if roll_ext and not root:
+        # Rollback restore skips categories without a root; a dry run has no plaintext
+        # for an encrypted archive
+        if (roll_ext and not root) or is_placeholder(archive):
             continue
         if not archive_writable(archive, root, roll_ext):
             return archive.name
@@ -2701,6 +3247,12 @@ def sudo_restore(args, root_dir, capture_dir, restore_config, snapshot_config, t
     # from migrate.toml)
     child_config = restore_child_config(restore_config, table)
 
+    # The root run is on this machine: give it the identity's expanded path, so it
+    # doesn't depend on variables sudo doesn't pass
+    identity = child_config.get("age", {}).get("identity")
+    if isinstance(identity, str) and identity:
+        child_config["age"]["identity"] = str(expand_path(identity))
+
     fd, config_path = tempfile.mkstemp(prefix=f"{__script__.stem}-", suffix=".toml")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -2712,7 +3264,8 @@ def sudo_restore(args, root_dir, capture_dir, restore_config, snapshot_config, t
                     f"unsupported value: {e}"
                 )
 
-        cmd = ["sudo", "env", *env_args, sys.executable, str(__script__), "restore"]
+        # -s: no user site-packages in the root run (PYTHONPATH is never passed either)
+        cmd = ["sudo", "env", *env_args, sys.executable, "-s", str(__script__), "restore"]
         cmd += ["--from", str(capture_dir), "-r", str(root_dir), "-t", config_path]
         if getattr(args, "disable_rollback", False):
             cmd.append("--disable-rollback")
@@ -2802,16 +3355,40 @@ def restore_stop(args, selected, done, failed, checked):
     )
 
 
-def restore(
-    args, root_dir, capture_dir=None, restore_config=None, label=None, table="tar", phase=None
+def restore(args, root_dir, **options):
+    """Restore from local capture directory (see restore_snapshot).
+
+    The temp dirs holding decrypted archives are removed however the restore ends,
+    after a sudo re-run too.
+    """
+    scratch = []
+    try:
+        return restore_snapshot(args, root_dir, scratch=scratch, **options)
+    finally:
+        for directory in scratch:
+            shutil.rmtree(directory, ignore_errors=True)
+
+
+def restore_snapshot(
+    args,
+    root_dir,
+    capture_dir=None,
+    restore_config=None,
+    label=None,
+    table="tar",
+    phase=None,
+    scratch=None,
 ):
     """Restore from local capture directory.
 
     label names the snapshot in error lines (defaults to capture_dir); table names the
     restore config's [tar] table in messages (migrate.toml calls it [restore.tar]);
-    phase ('restore' in a migration) prefixes the script steps.
+    phase ('restore' in a migration) prefixes the script steps. Encrypted archives are
+    decrypted into temp dirs added to scratch, which the caller removes.
     Returns (summary, success) for the command's final line.
     """
+    if scratch is None:
+        scratch = []
     if capture_dir is None:
         capture_dir = args.capture_dir if __dry_run__ else args.capture_dir.resolve()
 
@@ -2845,7 +3422,8 @@ def restore(
         config_name = args.config_toml if args.config_toml else DEFAULT_CONFIG_RESTORE
         restore_config = load_config(root_dir, config_name)
         verify_restore_config(restore_config, config_name)
-        # A config written for this run by another snap.py names the user's table
+        # A config written for this run by another snap.py names the user's table, and
+        # says when the user's config had no 'archives' key
         table = restore_config.get("snap", {}).get("table", table)
 
     # Get archives from config
@@ -2865,6 +3443,13 @@ def restore(
         ext, _ = COMPRESS_MAP[compress]
         available = snapshot_archives(capture_dir, snapshot_config, ext)
         selected, unmatched = archive_select(available, archives)
+
+    # Decrypt the selected .age archives into a private temp dir; the rest of the
+    # restore (the sudo check included) reads the plaintext copies
+    encrypted = [archive.name for archive in selected if archive.name.endswith(AGE_EXT)]
+    if encrypted:
+        identity = age_identity(restore_config, encrypted, table)
+        selected = decrypt_archives(selected, identity, scratch)
 
     # Re-run with sudo if any restore target is not writable (Unix only)
     use_rollback = bool(roll_ext) and not getattr(args, "disable_rollback", False)
@@ -2904,8 +3489,9 @@ def restore(
 
     # Restore archives; done and failed collect the archives restored and failed
     done, failed = [], []
+    no_archives_key = restore_config.get("snap", {}).get("no_archives_key", False)
     if archives is None:
-        if "archives" in tar_table:
+        if "archives" in tar_table and not no_archives_key:
             step_skipped("archive restore", f"[{table}] archives is empty")
         else:
             step_skipped("archive restore", f"[{table}] has no 'archives' key")
@@ -3148,16 +3734,316 @@ def split_migrate_config(config, config_name):
         fatal(f"{config_name}: missing required [capture.tar] table")
 
     capture_config = {"tarball": tarball, "tar": capture_section.get("tar", {})}
-    if "scripts" in capture_section:
-        capture_config["scripts"] = capture_section["scripts"]
+    for key in ("scripts", "age"):
+        if key in capture_section:
+            capture_config[key] = capture_section[key]
 
     restore_config = {"tarball": tarball}
-    if "tar" in restore_section:
-        restore_config["tar"] = restore_section["tar"]
-    if "scripts" in restore_section:
-        restore_config["scripts"] = restore_section["scripts"]
+    for key in ("tar", "scripts", "age"):
+        if key in restore_section:
+            restore_config[key] = restore_section[key]
 
     return capture_config, restore_config
+
+
+# --- Snapshot List and Prune --- #
+
+# A rotated backup dir's name: <root><rollback>_YYYYmmdd_HHMMSS, plus _<n> when taken
+ROTATED_SUFFIX = re.compile(r"_(\d{8}_\d{6})(?:_\d+)?")
+
+
+def snapshots_find(captures_dir):
+    """List the snapshots in a captures directory, newest first.
+
+    A snapshot is a captures/YYYY/MM-DD/<id> dir with a snapshot.toml, and a real date.
+    Symlinked dirs are left out, so nothing outside captures_dir is ever listed or
+    pruned. Each is a Namespace: path, rel (YYYY/MM-DD/<id>), date, config (the parsed
+    snapshot.toml, or None when it can't be read). Newest is the latest date, then the
+    latest snapshot.toml.
+    """
+    if not captures_dir.is_dir():
+        return []
+
+    snapshots = []
+    for toml_path in captures_dir.glob(SNAPSHOT_TOML_GLOB):
+        path = toml_path.parent
+        if any(os.path.islink(p) for p in (path, path.parent, path.parent.parent)):
+            continue
+        try:
+            date = datetime.strptime(f"{path.parent.parent.name}-{path.parent.name}", "%Y-%m-%d")
+            mtime = toml_path.stat().st_mtime
+        except (ValueError, OSError):
+            continue
+        try:
+            with open(toml_path, "rb") as f:
+                config = tomllib.load(f)
+        except (OSError, tomllib.TOMLDecodeError):
+            config = None
+        rel = path.relative_to(captures_dir).as_posix()
+        snapshots.append(
+            argparse.Namespace(path=path, rel=rel, date=date.date(), mtime=mtime, config=config)
+        )
+    snapshots.sort(key=lambda found: (found.date, found.mtime, found.rel), reverse=True)
+    return snapshots
+
+
+def snapshot_tables(snapshot):
+    """Return a snapshot's [tar.<name>] tables (empty when snapshot.toml can't be read)."""
+    tables = (snapshot.config or {}).get("tar", {})
+    if not isinstance(tables, dict):
+        return {}
+    return {name: table for name, table in tables.items() if isinstance(table, dict)}
+
+
+def backup_dirs_find(snapshots):
+    """List the backup dirs of the roots the snapshots name, one Namespace per root.
+
+    Each has base (<root><rollback>), current (base when it exists) and rotated, the
+    <base>_<timestamp>[_n] dirs as (path, timestamp), newest first. Only absolute roots
+    count, and symlinks are never listed.
+    """
+    bases = {}
+    for snapshot in snapshots:
+        tarball = (snapshot.config or {}).get("tarball", {})
+        roll_ext = tarball.get("rollback") if isinstance(tarball, dict) else None
+        if not isinstance(roll_ext, str) or not roll_ext or "/" in roll_ext:
+            continue
+        for table in snapshot_tables(snapshot).values():
+            root = table.get("root")
+            if not isinstance(root, str) or not root:
+                continue
+            root_path = expand_path(root)
+            if not root_path.is_absolute() or root_path == Path(root_path.anchor):
+                continue  # An unset variable, or '/': no backup dir snap.py would use
+            base = backup_dir(root_path, roll_ext)
+            bases.setdefault(os.path.realpath(base), base)
+
+    found = []
+    for base in bases.values():
+        current = base if base.is_dir() and not base.is_symlink() else None
+        rotated = []
+        try:
+            names = os.listdir(base.parent)
+        except OSError:
+            names = []
+        for name in names:
+            match = ROTATED_SUFFIX.fullmatch(name[len(base.name):])
+            if not name.startswith(base.name) or not match:
+                continue
+            path = base.parent / name
+            if path.is_symlink() or not path.is_dir():
+                continue
+            try:
+                stamp = datetime.strptime(match.group(1), "%Y%m%d_%H%M%S")
+            except ValueError:
+                continue
+            rotated.append((path, stamp))
+        rotated.sort(key=lambda item: (item[1], item[0].name), reverse=True)
+        if current or rotated:
+            found.append(argparse.Namespace(base=base, current=current, rotated=rotated))
+    found.sort(key=lambda backups: str(backups.base))
+    return found
+
+
+def tree_size(path):
+    """Return the total size of the files below a path (symlinks not followed).
+
+    The second value is False when part of the tree can't be read, so the size is low.
+    """
+    errors = []
+    total = 0
+    for parent, dirs, files in os.walk(path, onerror=errors.append):
+        for name in files + [d for d in dirs if os.path.islink(os.path.join(parent, d))]:
+            try:
+                total += os.lstat(os.path.join(parent, name)).st_size
+            except OSError as e:
+                errors.append(e)
+    return total, not errors
+
+
+def format_size(size):
+    """Format a byte count for display: '512 B', '4.0 KB', '12.3 MB'."""
+    units = ["B", "KB", "MB", "GB", "TB"]
+    value = float(size)
+    unit = 0
+    while value >= 1024 and unit < len(units) - 1:
+        value /= 1024
+        unit += 1
+    if unit == 0:
+        return f"{size} B"
+    return f"{value:.1f} {units[unit]}"
+
+
+def size_shown(path):
+    """Return a dir's size for display, marked when part of it can't be read."""
+    size, complete = tree_size(path)
+    if complete:
+        return format_size(size)
+    return f"{format_size(size)}+ (partly unreadable)"
+
+
+def tree_removable(path):
+    """Check if the current user can delete a dir and everything below it without sudo.
+
+    That needs write and search on its parent (and, in a sticky dir, owning it or the
+    parent), and every dir inside readable, writable and searchable, or owned (so
+    remove_path can make it writable).
+    """
+    path = Path(path)
+    parent = path.parent
+    if not os.access(parent, os.W_OK | os.X_OK):
+        return False
+    euid = os.geteuid() if hasattr(os, "geteuid") else None
+    try:
+        info, parent_info = path.lstat(), parent.stat()
+    except OSError:
+        return False
+    if parent_info.st_mode & stat.S_ISVTX and euid not in (info.st_uid, parent_info.st_uid):
+        return False
+
+    errors = []
+    for directory, _, _ in os.walk(path, onerror=errors.append):
+        if os.access(directory, os.R_OK | os.W_OK | os.X_OK):
+            continue
+        try:
+            if os.lstat(directory).st_uid != euid:
+                return False
+        except OSError:
+            return False
+    return not errors
+
+
+def prune_select(items, keep, cutoff):
+    """Pick the items prune deletes, from (date, item) pairs listed newest first.
+
+    --keep N keeps the newest N; --older-than keeps those dated on or after cutoff. An
+    item goes only when no rule that was given keeps it.
+    """
+    doomed = []
+    for index, (day, item) in enumerate(items):
+        if keep is not None and index < keep:
+            continue
+        if cutoff is not None and day >= cutoff:
+            continue
+        doomed.append(item)
+    return doomed
+
+
+def columns(rows):
+    """Format rows of cells as lines, each column padded to its widest cell."""
+    widths = {}
+    for row in rows:
+        for index, cell in enumerate(row):
+            widths[index] = max(widths.get(index, 0), len(cell))
+    lines = []
+    for row in rows:
+        cells = [cell.ljust(widths[index]) for index, cell in enumerate(row)]
+        lines.append("  ".join(cells).rstrip())
+    return lines
+
+
+def removable_or_warn(path):
+    """Check that a dir can be deleted without sudo; if not, warn with the command to run."""
+    if tree_removable(path):
+        return True
+    warn(
+        f"{path} needs root to delete; it is kept",
+        f"Run: sudo rm -rf {shlex.quote(str(path))}",
+    )
+    return False
+
+
+def prune_snapshots(snapshots, keep, cutoff):
+    """Print the snapshot part of a prune plan; return the snapshots to delete."""
+    step(f"Checking {plural(len(snapshots), 'snapshot')}")
+    doomed = prune_select([(snapshot.date, snapshot) for snapshot in snapshots], keep, cutoff)
+    deletable = []
+    for snapshot in doomed:
+        if removable_or_warn(snapshot.path):
+            say(f"delete: {snapshot.rel} ({size_shown(snapshot.path)})")
+            deletable.append(snapshot)
+
+    kept = [snapshot for snapshot in snapshots if snapshot not in deletable]
+    if __verbose__:
+        for snapshot in kept:
+            say(f"keep: {snapshot.rel}")
+    elif kept:
+        say(f"keep: {plural(len(kept), 'snapshot')}")
+    return deletable
+
+
+def prune_backups(backups, keep, cutoff):
+    """Print the backup part of a prune plan; return the rotated backup dirs to delete.
+
+    The rules apply to each root's rotated dirs by their timestamp; the current
+    <root><rollback> is always kept.
+    """
+    rotated = sum(len(root.rotated) for root in backups)
+    step(f"Checking {plural(rotated, 'rotated backup dir')}")
+    deletable, kept = [], []
+    for root in backups:
+        if root.current:
+            kept.append(f"{root.current} (current)")
+        items = [(stamp.date(), path) for path, stamp in root.rotated]
+        doomed = prune_select(items, keep, cutoff)
+        for path, _ in root.rotated:
+            if path in doomed and removable_or_warn(path):
+                say(f"delete: {path} ({size_shown(path)})")
+                deletable.append(path)
+            else:
+                kept.append(str(path))
+
+    if __verbose__:
+        for line in kept:
+            say(f"keep: {line}")
+    elif kept:
+        say(f"keep: {plural(len(kept), 'backup dir')}")
+    return deletable
+
+
+def prune_counts(snapshots, backups, with_backups):
+    """Name what a prune deletes: '2 snapshots and 1 backup dir'."""
+    text = plural(snapshots, "snapshot")
+    if with_backups:
+        text += f" and {plural(backups, 'backup dir')}"
+    return text
+
+
+def prune_delete(captures_dir, snapshots, backups):
+    """Delete the planned snapshots and backup dirs; return how many of each went.
+
+    A dir that can't be deleted is an Error, and the rest still go. Date dirs that the
+    deleted snapshots leave empty are removed too; captures_dir itself stays.
+    """
+    deleted_snapshots = 0
+    for snapshot in snapshots:
+        try:
+            remove_path(snapshot.path)
+            deleted_snapshots += 1
+            ok(f"{snapshot.rel} deleted")
+        except OSError as e:
+            error(f"Cannot delete {snapshot.path}: {e.strerror or e}")
+
+        # The MM-DD dir, then the YYYY dir, when nothing is left in them
+        for directory in (snapshot.path.parent, snapshot.path.parent.parent):
+            if directory == captures_dir or captures_dir not in directory.parents:
+                break
+            try:
+                directory.rmdir()
+            except OSError:
+                break  # Not empty (or already gone)
+            if __verbose__:
+                say(f"removed: {directory.relative_to(captures_dir).as_posix()} (empty)", 2)
+
+    deleted_backups = 0
+    for path in backups:
+        try:
+            remove_path(path)
+            deleted_backups += 1
+            ok(f"{path} deleted")
+        except OSError as e:
+            error(f"Cannot delete {path}: {e.strerror or e}")
+    return deleted_snapshots, deleted_backups
 
 
 # --- Command Execution --- #
@@ -3262,7 +4148,7 @@ def cmd_capture(args):
             else:
                 tmpdir = Path(tempfile.mkdtemp(prefix=f"{__script__.stem}-"))
                 outdir = tmpdir / intended_path.name
-                outdir.mkdir(parents=True, exist_ok=False)
+                mkdir_private(outdir)
 
             dst_dir = capture(args, root_dir, outdir, config, config_name=config_name)
 
@@ -3273,10 +4159,11 @@ def cmd_capture(args):
             final_dst = intended_path / dst_dir.name
             capture_deploy(dst_dir, to_host, final_dst)
         else:
-            # Move snapshot to local destination
+            # Move snapshot to local destination; the dirs created for it are private
+            # (0700), and existing ones are left as they are
             final_dst = intended_path / dst_dir.name
             try:
-                final_dst.parent.mkdir(parents=True, exist_ok=True)
+                mkdir_private(final_dst.parent)
             except FileExistsError:
                 fatal(f"Cannot create {final_dst.parent}: a file is already there")
             except OSError as e:
@@ -3285,7 +4172,13 @@ def cmd_capture(args):
             if final_dst.exists():
                 fatal(f"Cannot save the snapshot: {final_dst} already exists")
 
-            shutil.move(str(dst_dir), str(final_dst))
+            # Across filesystems the move is a copy; umask 077 keeps it private while
+            # it is written (copystat then sets the exact modes)
+            previous_umask = os.umask(0o077)
+            try:
+                shutil.move(str(dst_dir), str(final_dst))
+            finally:
+                os.umask(previous_umask)
     finally:
         if tmpdir and tmpdir.exists():
             shutil.rmtree(tmpdir)
@@ -3296,6 +4189,99 @@ def cmd_capture(args):
         finish(f"Snapshot saved to {to_host}:{final_dst}")
     else:
         finish(f"Snapshot saved to {final_dst}")
+
+
+def cmd_list(args):
+    """List the snapshots in the snap root's captures directory, and their backup dirs."""
+    captures_dir = args.root / "captures"
+    snapshots = snapshots_find(captures_dir)
+    if not snapshots:
+        emit(f"No snapshots found in {captures_dir}")
+        return
+
+    emit(f"Snapshots in {captures_dir}, newest first:")
+    rows = []
+    for snapshot in snapshots:
+        row = [snapshot.date.isoformat(), snapshot.path.name]
+        if snapshot.config is None:
+            row += ["", size_shown(snapshot.path), f"{DEFAULT_SNAPSHOT_TOML} unreadable"]
+        else:
+            tables = snapshot_tables(snapshot)
+            row += [plural(len(tables), "archive"), size_shown(snapshot.path)]
+            encrypted = [table for table in tables.values() if table.get("encrypted") is True]
+            if encrypted:
+                row.append(f"{len(encrypted)} encrypted")
+        rows.append(row)
+    for line in columns(rows):
+        say(line)
+
+    backups = backup_dirs_find(snapshots)
+    count = sum(bool(root.current) + len(root.rotated) for root in backups)
+    emit()
+    if not backups:
+        emit("No backup dirs found for the roots in these snapshots")
+    else:
+        emit("Backup dirs, newest first per root:")
+        rows = []
+        for root in backups:
+            if root.current:
+                rows.append([str(root.current), size_shown(root.current), "current"])
+            for path, stamp in root.rotated:
+                rows.append([str(path), size_shown(path), stamp.strftime("%Y-%m-%d %H:%M:%S")])
+        for line in columns(rows):
+            say(line)
+
+    finish(f"{plural(len(snapshots), 'snapshot')}, {plural(count, 'backup dir')}", False)
+
+
+def cmd_prune(args):
+    """Delete old snapshots and, with --backups, old rotated backup dirs, after asking."""
+    keep = args.keep
+    older_than = args.older_than
+    if keep is None and older_than is None:
+        fatal(
+            "Nothing to prune by: pass --keep N, --older-than DAYS, or both",
+            "Usage: snap.py prune [--keep N] [--older-than DAYS] [--backups] [--yes]",
+        )
+
+    banner("prune")
+    cutoff = None
+    if older_than is not None:
+        cutoff = (datetime.now() - timedelta(days=older_than)).date()
+
+    captures_dir = args.root / "captures"
+    snapshots = snapshots_find(captures_dir)
+    if snapshots:
+        doomed = prune_snapshots(snapshots, keep, cutoff)
+    else:
+        emit()
+        emit(f"No snapshots found in {captures_dir}")
+        doomed = []
+
+    # Backup dirs are found through the roots the snapshots name
+    backups = backup_dirs_find(snapshots)
+    doomed_backups = []
+    if args.backups:
+        doomed_backups = prune_backups(backups, keep, cutoff)
+    elif any(root.rotated for root in backups):
+        step_skipped("rotated backup dirs", "pass --backups to prune them")
+
+    if not doomed and not doomed_backups:
+        finish("Prune completed: nothing to delete", False)
+        return
+
+    what = prune_counts(len(doomed), len(doomed_backups), args.backups)
+    if not args.yes and not ask(f"Delete {what}?", 1):
+        finish("Prune completed: nothing deleted", False)
+        return
+    if __dry_run__:
+        finish("")
+        return
+
+    step(f"Deleting {what}")
+    deleted = prune_delete(captures_dir, doomed, doomed_backups)
+    summary = prune_counts(*deleted, args.backups)
+    finish(f"Prune completed: {summary} deleted", success=any(deleted))
 
 
 def cmd_migrate(args):
@@ -3334,7 +4320,7 @@ def cmd_migrate(args):
             else:
                 tmpdir = Path(tempfile.mkdtemp(prefix=f"{__script__.stem}-"))
                 outdir = tmpdir / dir_name
-                outdir.mkdir(parents=True, exist_ok=False)
+                mkdir_private(outdir)
             capture_dir = capture(
                 args, root_dir, outdir, capture_config, config_name=config_name, phase="capture"
             )
@@ -3473,18 +4459,39 @@ def add_cli_options(parser):
     )
 
 
-def add_snap_options(parser):
-    """Add shared snap configuration options."""
-    group = parser.add_argument_group("snap options")
+def add_root_option(group, local=False):
+    """Add the -r/--snap-root option; local=True for commands that take only a local root."""
+    if local:
+        metavar = "root"
+        where = ""
+    else:
+        metavar = "[[user@]host:]root"
+        where = f"; on a host, {DEFAULT_REMOTE_ROOT} in its login directory"
     group.add_argument(
-        "-r", "--snap-root", dest="root", metavar="[[user@]host:]root",
+        "-r", "--snap-root", dest="root", metavar=metavar,
         default=DEFAULT_ROOT_SNAP,
         help=(
             "Snap root with configs, scripts and captures "
-            f"(default: ./.snap, then {DEFAULT_ROOT_SNAP}; on a host, "
-            f"{DEFAULT_REMOTE_ROOT} in its login directory)"
+            f"(default: ./.snap, then {DEFAULT_ROOT_SNAP}{where})"
         ),
     )
+
+
+def non_negative(value):
+    """Parse a whole number of zero or more, for argparse."""
+    try:
+        number = int(value)
+    except ValueError:
+        number = -1
+    if number < 0:
+        raise argparse.ArgumentTypeError(f"'{value}' is not a whole number of 0 or more")
+    return number
+
+
+def add_snap_options(parser):
+    """Add shared snap configuration options."""
+    group = parser.add_argument_group("snap options")
+    add_root_option(group)
     group.add_argument(
         "-t", "--config-toml", dest="config_toml", metavar="config",
         help="Config file, relative to the snap root, instead of the command default",
@@ -3518,7 +4525,10 @@ def setup_parser():
     parser = argparse.ArgumentParser(
         add_help=False,
         formatter_class=formatter,
-        description="Capture, restore and migrate file snapshots, locally or over SSH",
+        description=(
+            "Capture, restore and migrate file snapshots, locally or over SSH; "
+            "list and prune them"
+        ),
     )
 
     subparsers = parser.add_subparsers(
@@ -3612,6 +4622,51 @@ def setup_parser():
     )
     add_cli_options(mig)
 
+    # list
+    lst = subparsers.add_parser(
+        "list", formatter_class=formatter, add_help=False,
+        help="List the snapshots in the snap root and the backup dirs of their roots",
+    )
+    add_root_option(lst.add_argument_group("snap options"), local=True)
+    lst.add_argument_group("output options").add_argument(
+        "--help", action="help",
+        help="Show this help message and exit",
+    )
+
+    # prune
+    prn = subparsers.add_parser(
+        "prune", formatter_class=formatter, add_help=False,
+        help="Delete old snapshots (and old backup dirs), after asking",
+        description=(
+            "Delete old snapshots from the snap root's captures directory. A snapshot is\n"
+            "deleted only when no rule you give keeps it: --keep N keeps the newest N, and\n"
+            "--older-than DAYS keeps those from the last DAYS days. With --backups, the\n"
+            "same rules apply to each root's rotated backup dirs (<root><rollback>_<time>),\n"
+            "by their timestamp; the current <root><rollback> is never deleted. It lists\n"
+            "what it will delete and asks first, unless --yes. Dirs that need root to\n"
+            "delete are kept and reported with the sudo command to run."
+        ),
+    )
+    add_root_option(prn.add_argument_group("snap options"), local=True)
+    prn_group = prn.add_argument_group("prune options")
+    prn_group.add_argument(
+        "--keep", type=non_negative, metavar="N",
+        help="Keep the newest N snapshots (and, with --backups, N rotated dirs per root)",
+    )
+    prn_group.add_argument(
+        "--older-than", dest="older_than", type=non_negative, metavar="DAYS",
+        help="Keep only what is from the last DAYS days; older ones are deleted",
+    )
+    prn_group.add_argument(
+        "--backups", action="store_true",
+        help="Also delete rotated backup dirs of the roots in the snapshots",
+    )
+    prn_group.add_argument(
+        "--yes", action="store_true",
+        help="Delete without asking",
+    )
+    add_cli_options(prn)
+
     # Top-level help only
     parser.add_argument(
         "--help", action="help",
@@ -3619,11 +4674,22 @@ def setup_parser():
     )
 
     # main() reports unknown flags with the subcommand's own usage
-    parser.commands = {"check": check, "capture": cap, "restore": rst, "migrate": mig}
+    parser.commands = {
+        "check": check, "capture": cap, "restore": rst, "migrate": mig,
+        "list": lst, "prune": prn,
+    }
     return parser
 
 
+def interrupt_on_signal(signum, frame):
+    """Turn SIGTERM and SIGHUP into Ctrl-C, so cleanup and rollback run as they do for it."""
+    raise KeyboardInterrupt
+
+
 def main():
+    for signum in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(signum, interrupt_on_signal)
+
     parser = setup_parser()
     args, extra = parser.parse_known_args()
     if extra:
@@ -3651,7 +4717,14 @@ def main():
         "capture": cmd_capture,
         "restore": cmd_restore,
         "migrate": cmd_migrate,
+        "list": cmd_list,
+        "prune": cmd_prune,
     }
+    if root_host and args.command in ("list", "prune"):
+        fatal(
+            f"snap.py {args.command} works only with a local snap root, not '{args.root}'",
+            f"Run snap.py {args.command} on {root_host} itself",
+        )
     if not root_host:
         args.root = resolve_root(args.root)
         commands[args.command](args)

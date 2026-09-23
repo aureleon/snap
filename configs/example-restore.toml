@@ -1,8 +1,9 @@
 # Example restore configuration with glob pattern matching
-# Copy this to restore.toml and customize for your needs
+# install.sh installs this as configs/restore.toml (only when that file doesn't exist yet).
+# Try it with 'snap restore --dry-run' before the first real restore.
 
 [tar]
-# Select which archives to restore (names from capture.toml):
+# Select which archives to restore (the [tar.<name>] names from capture.toml):
 #
 # Skip restore entirely:
 # archives = []
@@ -11,28 +12,34 @@
 # archives = ["*"]
 #
 # Restore specific archives (exact match):
-# archives = ["ssh-keys", "dotfiles", "homebrew"]
+# archives = ["ssh-keys", "dotfiles", "config"]
 #
 # Restore using glob patterns:
 archives = [
     "ssh*",           # All SSH-related archives (ssh-keys, ssh-config, etc.)
     "dotfiles",       # Exact match for dotfiles
+    "config",         # The .config directories
     "*-config",       # All archives ending with "-config"
 ]
 
 # Alternative examples:
 #
 # Restore only SSH and system configs:
-# archives = ["ssh*", "system-config"]
+# archives = ["ssh*", "system"]
 #
 # Restore everything except system files:
-# archives = ["ssh*", "dotfiles", "homebrew", "user-*"]
+# archives = ["ssh*", "dotfiles", "config", "local"]
 #
 # Restore user-specific files only:
 # archives = ["dot*", "*keys", "user-*"]
 
+# Needed only to restore archives captured with 'encrypt = true': your age identity
+# (private key) file. It is read on the machine that runs the restore, and never copied.
+# [age]
+# identity = "~/.config/age/key.txt"
+
+# Scripts to run before/after the restore, with 'snap restore --run-scripts'.
+# They run in the snapshot directory, so restore-brew.sh finds the captured Brewfile
 [scripts]
-# Optional: Run scripts before/after restore
 # before = ["scripts/pre-restore.sh"]
 after = ["scripts/restore-brew.sh"]
-

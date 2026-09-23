@@ -1,35 +1,35 @@
 # Example migrate configuration
-# Copy to migrate.toml and customize for your needs
+# install.sh installs this as configs/migrate.toml (only when that file doesn't exist yet).
 #
-# Migrate captures on the source machine, then restores on the destination.
-# "before" scripts run on the source, "after" scripts run on the destination.
+# A migration captures on the source machine (--from, default this machine), then restores
+# on the destination (--to, default this machine); at least one of them is a host.
+# [capture.*] is the source's capture config and [restore.*] the destination's restore
+# config, with the same keys as capture.toml and restore.toml.
 
 [tarball]
 compress = "gzip"
-checksum = "sha256"
+checksum = "sha256"     # always sha256 (the only supported value)
 rollback = ".bak"  # Extension for backing up existing files during restore
 
 #
 # Capture configuration ([capture.*])
 #
+
+# Scripts run with 'snap migrate --run-scripts', on the SOURCE machine, in the snapshot
 [capture.scripts]
-# Run on SOURCE machine after capture
-after = [
-    "scripts/dump-database.sh",
-    "scripts/stop-services.sh",
-]
+after = ["scripts/capture-brew.sh"]   # Saves a Brewfile in the snapshot
+# before = ["scripts/dump-database.sh"]
 
-# Application code and configuration
-[capture.tar.myapp]
-root = "/opt/myapp"
-link = "$HOME/myapp"  # Creates symlink: ~/myapp -> /opt/myapp
-dirs = ["bin", "lib", "config"]
+# Recipients for archives with 'encrypt = true'; the source needs the age CLI
+# [capture.age]
+# recipients = ["age1..."]
+# recipients_file = "~/.config/age/recipients.txt"
 
-# System configuration
-[capture.tar.system]
-root = "/etc"
-dirs = ["nginx", "systemd/system"]
-files = ["hosts"]
+# SSH keys
+[capture.tar.ssh-keys]
+root = "$HOME"
+dirs = [".ssh"]
+# encrypt = true
 
 # User dotfiles
 [capture.tar.dotfiles]
@@ -40,21 +40,36 @@ files = [
     ".gitconfig",
 ]
 
-# SSH keys
-[capture.tar.ssh-keys]
+# All config directories, without caches
+[capture.tar.config]
 root = "$HOME"
-dirs = [".ssh"]
+dirs = [".config/*"]
+exclude = ["node_modules", "*.log", "*/Cache/*"]
+
+# Application code and configuration (an example: /opt/myapp doesn't exist on most machines)
+# [capture.tar.myapp]
+# root = "/opt/myapp"
+# link = "$HOME/myapp"  # Creates symlink: ~/myapp -> /opt/myapp
+# dirs = ["bin", "lib", "config"]
+
+# System configuration (restoring it needs sudo on the destination)
+# [capture.tar.system]
+# root = "/etc"
+# dirs = ["nginx", "systemd/system"]
+# files = ["hosts"]
 
 #
 # Restore configuration ([restore.*])
 #
-[restore.scripts]
-# Run on DESTINATION machine before restore
-before = [
-    "scripts/fix-permissions.sh",
-    "scripts/start-services.sh",
-    "scripts/health-check.sh",
-]
 
 [restore.tar]
 archives = ["*"]
+
+# Your age identity file on the DESTINATION, for encrypted archives
+# [restore.age]
+# identity = "~/.config/age/key.txt"
+
+# Scripts run with 'snap migrate --run-scripts', on the DESTINATION machine, in the snapshot
+[restore.scripts]
+after = ["scripts/restore-brew.sh"]   # Installs the captured Brewfile
+# before = ["scripts/stop-services.sh"]

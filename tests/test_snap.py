@@ -7,15 +7,21 @@ fake `sudo` first on PATH, so they never touch the real home or escalate privile
 """
 
 import argparse
+import errno
 import io
+import json
 import os
 import re
 import shlex
 import shutil
+import signal
+import stat
 import subprocess
 import sys
 import tarfile
+import time
 
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -51,6 +57,11 @@ def make_archive(tmp_path, name, root, paths):
 def list_tree(root):
     """List every path under root, relative and sorted."""
     return sorted(str(p.relative_to(root)) for p in root.rglob("*"))
+
+
+def stat_mode(path):
+    """Return a path's permission bits, without following a symlink."""
+    return stat.S_IMODE(os.lstat(path).st_mode)
 
 
 def backup_files(tmp_path, name):
@@ -280,14 +291,14 @@ def test_incomplete_rollback_stops_restore(tmp_path, monkeypatch, capsys):
     archive = make_archive(tmp_path, "cat", src, ["a", "zz"])
 
     fail_on_extract(monkeypatch, "zz", OSError("disk full"))
-    original_copy = snap.copy_with_ownership
+    original_move = snap.move_path
 
-    def copy(src_path, dst_path):
+    def move(src_path, dst_path):
         if ".bak" in str(src_path):
             raise OSError("read-only file system")
-        return original_copy(src_path, dst_path)
+        return original_move(src_path, dst_path)
 
-    monkeypatch.setattr(snap, "copy_with_ownership", copy)
+    monkeypatch.setattr(snap, "move_path", move)
 
     with pytest.raises(SystemExit):
         snap.restore_category(archive, str(home), ".bak")
@@ -572,17 +583,53 @@ def needs_sudo(tmp_path, root, paths, roll_ext=".bak", snapshot_config=None):
     return snap.restore_needs_sudo([archive], {"cat": str(root)}, roll_ext, snapshot_config or {})
 
 
+def other_backup_device(monkeypatch):
+    """Make every backup dir look like it is on another filesystem than its root."""
+    real_device = snap.path_device
+    monkeypatch.setattr(snap, "path_device", lambda path: real_device(path) + 1)
+
+
 @unprivileged
-def test_needs_sudo_for_locked_dir_inside_captured_path(tmp_path):
+def test_needs_sudo_for_locked_dir_inside_captured_path(tmp_path, monkeypatch):
     home = tmp_path / "home"
     write_files(home, {"fonts/a.txt": "a", "fonts/locked/b.txt": "b"})
     (home / "fonts" / "locked").chmod(0o555)
     try:
-        assert needs_sudo(tmp_path, home, ["fonts"])
+        # Moving fonts aside only needs write on home and on fonts itself
+        assert not needs_sudo(tmp_path, home, ["fonts"])
         # Merging without rollback only rewrites files, which stay writable
         assert not needs_sudo(tmp_path, home, ["fonts"], roll_ext=None)
+        # A backup dir on another filesystem means a copy and a delete, which can't
+        # empty the locked dir
+        other_backup_device(monkeypatch)
+        assert needs_sudo(tmp_path, home, ["fonts"])
     finally:
         (home / "fonts" / "locked").chmod(0o755)
+
+
+@unprivileged
+def test_needs_sudo_to_move_a_locked_dir(tmp_path):
+    home = tmp_path / "home"
+    write_files(home, {"fonts/a.txt": "a"})
+    (home / "fonts").chmod(0o555)
+    try:
+        # A dir that moves to another parent needs write on itself (for its '..')
+        assert needs_sudo(tmp_path, home, ["fonts"])
+    finally:
+        (home / "fonts").chmod(0o755)
+
+
+def test_needs_sudo_in_a_sticky_dir_for_others_paths(tmp_path, monkeypatch):
+    shared = tmp_path / "shared"
+    write_files(shared, {"a.txt": "a"})
+    shared.chmod(0o1777)
+    try:
+        assert not needs_sudo(tmp_path, shared, ["a.txt"])
+        # In a sticky dir only the owner of a path (or of the dir) can rename it
+        monkeypatch.setattr(snap.os, "geteuid", lambda: os.getuid() + 1)
+        assert needs_sudo(tmp_path, shared, ["a.txt"])
+    finally:
+        shared.chmod(0o755)
 
 
 @unprivileged
@@ -611,12 +658,16 @@ def test_needs_sudo_for_unwritable_link_parent(tmp_path):
 
 
 @unprivileged
-def test_needs_sudo_for_unreadable_file_inside_captured_path(tmp_path):
+def test_needs_sudo_for_unreadable_file_inside_captured_path(tmp_path, monkeypatch):
     home = tmp_path / "home"
     write_files(home, {"gcloud/config": "a", "gcloud/credentials.db": "secret"})
     archive = make_archive(tmp_path, "cat", home, ["gcloud"])
     (home / "gcloud" / "credentials.db").chmod(0)
     try:
+        # A rename never reads the file
+        assert not snap.restore_needs_sudo([archive], {"cat": str(home)}, ".bak", {})
+        # A copy to a backup dir on another filesystem does
+        other_backup_device(monkeypatch)
         assert snap.restore_needs_sudo([archive], {"cat": str(home)}, ".bak", {})
     finally:
         (home / "gcloud" / "credentials.db").chmod(0o644)
@@ -681,7 +732,7 @@ def test_sudo_restore_runs_child_on_local_copy(tmp_path, monkeypatch):
         "sudo", "env",
         "HOME=/Users/someone",
         "XDG_DATA_HOME=/Users/someone/.local/share",
-        sys.executable, str(snap.__script__), "restore",
+        sys.executable, "-s", str(snap.__script__), "restore",
         "--from", str(tmp_path / "cap"), "-r", str(tmp_path / "root"), "-t", config_path,
         "--disable-rollback", "--run-scripts",
     ]
@@ -782,18 +833,27 @@ def test_e2e_sudo_only_for_unwritable_roots(env):
 
 
 @unprivileged
-def test_e2e_sudo_for_locked_dir_keeps_files(env):
+def test_e2e_locked_dir_is_moved_to_backup_without_sudo(env):
     fonts = env.home / ".local/share/fonts"
     write_files(fonts, {"a.txt": "v1", "locked/b.txt": "b"})
     (fonts / "locked").chmod(0o555)
     write_configs(env.root, {"local": ("$HOME/.local/share", ["fonts"])})
     assert env.run("capture", "-r", str(env.root)).returncode == 0
-
-    env.run("restore", "-r", str(env.root))
-
-    assert env.sudo_marker.exists()
-    assert (fonts / "a.txt").read_text() == "v1"
     (fonts / "locked").chmod(0o755)
+    write_files(fonts, {"a.txt": "edited"})
+    (fonts / "locked").chmod(0o555)
+
+    result = env.run("restore", "-r", str(env.root))
+
+    # The move needs no read or write access inside fonts, so no sudo
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not env.sudo_marker.exists()
+    assert (fonts / "a.txt").read_text() == "v1"
+    backup = env.home / ".local/share.bak/local/fonts"
+    assert (backup / "a.txt").read_text() == "edited"
+    assert stat_mode(backup / "locked") == 0o555
+    for path in (fonts / "locked", backup / "locked"):
+        path.chmod(0o755)
 
 
 def test_e2e_no_sudo_for_unselected_locked_category(env):
@@ -1637,6 +1697,7 @@ import re
 import shlex
 import subprocess
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 
 HOSTS = Path(os.environ["FAKE_HOSTS"])
@@ -1955,7 +2016,11 @@ def test_remote_capture_removes_its_work_dir_on_ctrl_c(tmp_path, monkeypatch, ca
     with pytest.raises(KeyboardInterrupt):
         snap.remote_capture(args, tmp_path, "user@web-01")
 
-    assert calls[-1][0][-1] == "rm -rf /tmp/snap-capture.Ab3dEf9h"
+    # snap.py still running there is stopped first, so it can't recreate files
+    assert calls[-1][0][-1] == (
+        "pkill -INT -f 'snap[.]py capture -r /tmp/snap-capture\\.Ab3dEf9h( |$)' && sleep 2; "
+        "rm -rf /tmp/snap-capture.Ab3dEf9h"
+    )
     # The cleanup after a failure prints nothing of its own
     assert "Removing work directory" not in capsys.readouterr().out
 
@@ -1996,7 +2061,11 @@ def test_e2e_remote_work_dir_is_removed_when_the_remote_step_fails(
     assert commands[0] == f'mktemp -d "${{TMPDIR:-/tmp}}/snap-{purpose}.XXXXXXXX"'
     work_dir = work_dir_of(commands, purpose)
     assert Path(work_dir).parent == hosts.tmp("web-01")
-    assert commands[-1] == f"rm -rf {work_dir}"
+    if purpose == "capture":
+        stop = snap.remote_stop_command(work_dir, "capture")
+        assert commands[-1] == f"{stop}; rm -rf {work_dir}"
+    else:
+        assert commands[-1] == f"rm -rf {work_dir}"
     assert list(hosts.tmp("web-01").iterdir()) == []
     assert list(tmpdir.iterdir()) == []
 
@@ -2949,3 +3018,1255 @@ def test_e2e_remote_capture_runs_under_a_private_umask(env, hosts):
     assert result.returncode == 0, result.stdout + result.stderr
     commands = hosts.ssh_commands("user@web-01")
     assert any(c.startswith("umask 077 && cd ") for c in commands)
+
+
+# --- Round 3 P1: snapshots are private to the user --- #
+
+
+def test_e2e_capture_writes_a_private_snapshot(env):
+    write_files(env.home, {".zshrc": "v1"})
+    write_files(env.root, {"scripts/sub/brew.sh": BREW_SCRIPT})
+    write_configs(env.root, {"dotfiles": ("$HOME", [".zshrc"])})
+    capture_toml = env.root / "configs" / "capture.toml"
+    capture_toml.write_text(
+        capture_toml.read_text() + '\n[scripts]\nafter = ["scripts/sub/brew.sh"]\n'
+    )
+    # A captures/ dir from before is left as it is
+    captures = env.root / "captures"
+    captures.mkdir()
+    captures.chmod(0o755)
+
+    result = env.run("capture", "-r", str(env.root), "--run-scripts")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    [snapshot] = captures.glob("*/*/*")
+    assert stat_mode(captures) == 0o755
+    for directory in (snapshot.parent.parent, snapshot.parent, snapshot):
+        assert stat_mode(directory) == 0o700, directory
+    assert sorted(p.name for p in snapshot.iterdir()) == [
+        "Brewfile", "dotfiles.tar.gz", "snapshot.toml",
+    ]
+    for path in snapshot.iterdir():
+        assert stat_mode(path) == 0o600, path
+
+    # A new --to path gets private dirs too
+    result = env.run("capture", "-r", str(env.root), "--to", str(env.tmp / "out" / "deep"))
+    assert result.returncode == 0, result.stdout + result.stderr
+    [snapshot] = (env.tmp / "out" / "deep").iterdir()
+    for directory in (env.tmp / "out", env.tmp / "out" / "deep", snapshot):
+        assert stat_mode(directory) == 0o700, directory
+    assert {stat_mode(path) for path in snapshot.iterdir()} == {0o600}
+
+
+def test_e2e_capture_to_host_is_private_there(env, hosts):
+    write_files(env.home, {".zshrc": "v1"})
+    write_configs(env.root, {"dotfiles": ("$HOME", [".zshrc"])})
+
+    result = env.run("capture", "-r", str(env.root), "--to", "user@web-01")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    commands = hosts.ssh_commands("user@web-01")
+    assert any(c.startswith("umask 077 && mkdir -p .snap/captures/") for c in commands)
+    [snapshot] = hosts.home("web-01").glob(".snap/captures/*/*/*")
+    directory = snapshot
+    while directory != hosts.home("web-01"):
+        assert stat_mode(directory) == 0o700, directory
+        directory = directory.parent
+    assert {stat_mode(path) for path in snapshot.iterdir()} == {0o600}
+
+
+def test_e2e_capture_from_host_is_private_here(env, hosts):
+    write_files(hosts.home("web-01"), {".zshrc": "on web-01"})
+    write_configs(env.root, {"dotfiles": ("$HOME", [".zshrc"])})
+
+    result = env.run("capture", "-r", str(env.root), "--from", "user@web-01")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    [snapshot] = (env.root / "captures").glob("*/*/*")
+    for directory in (env.root / "captures", snapshot.parent.parent, snapshot.parent, snapshot):
+        assert stat_mode(directory) == 0o700, directory
+    assert {stat_mode(path) for path in snapshot.iterdir()} == {0o600}
+
+
+# --- Round 3 P2: backups are moves, so they keep every attribute --- #
+
+
+def set_xattr(path, value):
+    """Set a test xattr on a path; return False where the platform or filesystem can't."""
+    if hasattr(os, "setxattr"):
+        try:
+            os.setxattr(path, "user.snap-test", value.encode())
+            return True
+        except OSError:
+            return False
+    if sys.platform == "darwin" and shutil.which("xattr"):
+        argv = ["xattr", "-w", "user.snap-test", value, str(path)]
+        return subprocess.run(argv, capture_output=True).returncode == 0
+    return False
+
+
+def get_xattr(path):
+    """Return a path's test xattr, or None."""
+    if hasattr(os, "getxattr"):
+        try:
+            return os.getxattr(path, "user.snap-test").decode()
+        except OSError:
+            return None
+    argv = ["xattr", "-p", "user.snap-test", str(path)]
+    result = subprocess.run(argv, capture_output=True, text=True)
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+MTIME = 1_000_000_000
+
+
+def old_files(home):
+    """Give home an 'a' dir with a 0640 file (old mtime, an xattr) and a hardlink to it.
+
+    Returns whether the xattr could be set.
+    """
+    write_files(home, {"a/f.txt": "old", "a/sub/g.txt": "g"})
+    f = home / "a" / "f.txt"
+    (home / "a" / "h.txt").hardlink_to(f)
+    (home / "a" / "link").symlink_to("f.txt")
+    f.chmod(0o640)
+    has_xattr = set_xattr(f, "kept")
+    os.utime(f, (MTIME, MTIME))
+    return has_xattr
+
+
+def test_backup_is_the_same_inode_with_every_attribute(tmp_path):
+    src = tmp_path / "src"
+    home = tmp_path / "home"
+    write_files(src, {"a/f.txt": "new"})
+    has_xattr = old_files(home)
+    before = {name: (home / "a" / name).lstat() for name in ("f.txt", "sub", "link")}
+    archive = make_archive(tmp_path, "cat", src, ["a"])
+
+    assert snap.restore_category(archive, str(home), ".bak")
+
+    backup = tmp_path / "home.bak" / "cat" / "a"
+    for name, info in before.items():
+        after = (backup / name).lstat()
+        assert (after.st_dev, after.st_ino) == (info.st_dev, info.st_ino), name
+    kept = (backup / "f.txt").lstat()
+    assert stat.S_IMODE(kept.st_mode) == 0o640
+    assert kept.st_mtime == MTIME
+    assert (backup / "f.txt").samefile(backup / "h.txt")
+    assert (backup / "link").is_symlink()
+    if has_xattr:
+        assert get_xattr(backup / "f.txt") == "kept"
+    assert list_tree(home) == ["a", "a/f.txt"]
+    assert (home / "a" / "f.txt").read_text() == "new"
+
+
+def test_rollback_moves_the_same_inode_back(tmp_path, monkeypatch):
+    src = tmp_path / "src"
+    home = tmp_path / "home"
+    write_files(src, {"a/new.txt": "new", "b/new.txt": "new"})
+    has_xattr = old_files(home)
+    write_files(home, {"b/orig.txt": "b"})
+    before = {name: (home / name).lstat().st_ino for name in ("a", "a/f.txt", "b")}
+    archive = make_archive(tmp_path, "cat", src, ["a", "b"])
+
+    fail_on_extract(monkeypatch, "b", OSError("disk full"))
+
+    assert not snap.restore_category(archive, str(home), ".bak")
+    assert {name: (home / name).lstat().st_ino for name in before} == before
+    assert stat_mode(home / "a" / "f.txt") == 0o640
+    assert (home / "a" / "f.txt").stat().st_mtime == MTIME
+    assert (home / "a" / "f.txt").samefile(home / "a" / "h.txt")
+    if has_xattr:
+        assert get_xattr(home / "a" / "f.txt") == "kept"
+
+
+def cross_device_backups(monkeypatch):
+    """Make every rename into or out of home.bak/ fail as it does across filesystems."""
+    real_rename = os.rename
+
+    def rename(src, dst, *args, **kwargs):
+        if f"{os.sep}home.bak{os.sep}" in f"{src} {dst}":
+            raise OSError(errno.EXDEV, os.strerror(errno.EXDEV))
+        return real_rename(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(snap.os, "rename", rename)
+
+
+def test_backup_across_filesystems_is_a_copy_with_attributes(tmp_path, monkeypatch):
+    src = tmp_path / "src"
+    home = tmp_path / "home"
+    write_files(src, {"a/f.txt": "new"})
+    has_xattr = old_files(home)
+    cross_device_backups(monkeypatch)
+    archive = make_archive(tmp_path, "cat", src, ["a"])
+
+    assert snap.restore_category(archive, str(home), ".bak")
+
+    backup = tmp_path / "home.bak" / "cat" / "a"
+    assert (backup / "f.txt").read_text() == "old"
+    assert stat_mode(backup / "f.txt") == 0o640
+    assert (backup / "f.txt").stat().st_mtime == MTIME
+    assert (backup / "link").is_symlink()
+    assert os.readlink(backup / "link") == "f.txt"
+    # Python copies xattrs only where the os module can (Linux)
+    if has_xattr and hasattr(os, "getxattr"):
+        assert get_xattr(backup / "f.txt") == "kept"
+    # The original is gone once the copy is complete
+    assert list_tree(home) == ["a", "a/f.txt"]
+    assert (home / "a" / "f.txt").read_text() == "new"
+
+
+def test_rollback_across_filesystems_copies_back(tmp_path, monkeypatch):
+    src = tmp_path / "src"
+    home = tmp_path / "home"
+    write_files(src, {"a/new.txt": "new", "b/new.txt": "new"})
+    old_files(home)
+    write_files(home, {"b/orig.txt": "b"})
+    cross_device_backups(monkeypatch)
+    archive = make_archive(tmp_path, "cat", src, ["a", "b"])
+
+    fail_on_extract(monkeypatch, "b", OSError("disk full"))
+
+    assert not snap.restore_category(archive, str(home), ".bak")
+    assert list_tree(home) == [
+        "a", "a/f.txt", "a/h.txt", "a/link", "a/sub", "a/sub/g.txt", "b", "b/orig.txt",
+    ]
+    assert stat_mode(home / "a" / "f.txt") == 0o640
+    assert (home / "a" / "f.txt").stat().st_mtime == MTIME
+
+
+def test_move_path_copies_only_across_filesystems(tmp_path, monkeypatch):
+    write_files(tmp_path, {"src/f.txt": "x"})
+
+    def rename(src, dst):
+        raise PermissionError(errno.EACCES, "Permission denied")
+
+    monkeypatch.setattr(snap.os, "rename", rename)
+
+    with pytest.raises(PermissionError):
+        snap.move_path(tmp_path / "src", tmp_path / "bak" / "src")
+    assert (tmp_path / "src" / "f.txt").exists()
+
+
+# --- Round 3 P3: excludes and the macOS metadata filter --- #
+
+
+def archive_names(archive):
+    """Return the member names of a tar archive, sorted."""
+    with tarfile.open(archive) as tar:
+        return sorted(tar.getnames())
+
+
+def test_capture_excludes_matching_members(tmp_path, monkeypatch):
+    src = tmp_path / "src"
+    write_files(src, {
+        "proj/main.py": "x",
+        "proj/node_modules/m/i.js": "x",
+        "proj/debug.log": "x",
+        "proj/sub/a.log": "x",
+        ".cache/data": "x",
+        "top.log": "x",
+    })
+    monkeypatch.setattr(snap, "__verbose__", True)
+    exclude = ["node_modules", "*.log", ".cache/*"]
+    paths = ["proj", ".cache", "top.log"]
+
+    outdir = tmp_path / "out"
+    outdir.mkdir()
+    archive, lines, _ = snap.archive_create("cat", str(src), paths, outdir, exclude=exclude)
+
+    assert archive_names(archive) == [".cache", "proj", "proj/main.py", "proj/sub"]
+    assert lines[1:] == [
+        "include: .cache",
+        "include: proj",
+        "exclude: .cache/data (pattern '.cache/*')",
+        "exclude: proj/debug.log (pattern '*.log')",
+        "exclude: proj/node_modules (pattern 'node_modules')",
+        "exclude: proj/sub/a.log (pattern '*.log')",
+        "exclude: top.log (pattern '*.log')",
+    ]
+
+    # A dry run shows the same lines, and writes nothing
+    monkeypatch.setattr(snap, "__dry_run__", True)
+    dry_out = tmp_path / "dry"
+    _, dry_lines, _ = snap.archive_create("cat", str(src), paths, dry_out, exclude=exclude)
+    assert dry_lines == lines
+    assert not dry_out.exists()
+
+    # Without --verbose there are no exclude lines
+    monkeypatch.setattr(snap, "__verbose__", False)
+    _, quiet_lines, _ = snap.archive_create("cat", str(src), paths, dry_out, exclude=exclude)
+    assert quiet_lines[1:] == ["include: 2 paths"]
+
+
+@pytest.mark.parametrize("exclude", ["*.log", [1], {"a": "b"}])
+def test_exclude_must_be_an_array_of_patterns(capsys, exclude):
+    config = {"tar": {"cat": {"root": "/x", "dirs": ["a"], "exclude": exclude}}}
+
+    with pytest.raises(SystemExit):
+        snap.verify_capture_config(config, "configs/capture.toml")
+    assert (
+        "Error: configs/capture.toml: the 'exclude' key in [tar.cat] must be an array "
+        "of patterns"
+    ) in capsys.readouterr().err
+
+
+def test_e2e_capture_excludes_and_verbose_lists_them(env):
+    write_files(env.home, {".config/app/settings": "v1", ".config/app/cache.log": "log"})
+    write_configs(env.root, {"app": ("$HOME", [".config/app"])})
+    capture_toml = env.root / "configs" / "capture.toml"
+    capture_toml.write_text(capture_toml.read_text() + 'exclude = ["*.log"]\n')
+
+    result = env.run("capture", "-r", str(env.root), "--verbose")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "    exclude: .config/app/cache.log (pattern '*.log')\n" in result.stdout
+    [archive] = (env.root / "captures").glob("*/*/*/app.tar.gz")
+    assert archive_names(archive) == [".config/app", ".config/app/settings"]
+
+    result = env.run("capture", "-r", str(env.root), "--dry-run", "--verbose")
+    assert "[DRY-RUN]     exclude: .config/app/cache.log (pattern '*.log')\n" in result.stdout
+
+    result = env.run("capture", "-r", str(env.root), "--dry-run")
+    assert "exclude:" not in result.stdout
+
+
+def test_metadata_filter_skips_macos_files_at_any_depth(tmp_path, monkeypatch):
+    src = tmp_path / "src"
+    write_files(src, {
+        "d/._x": "",
+        "d/e/.DS_Store": "",
+        "._top": "",
+        ".DS_Store": "",
+        "d/keep._x": "",
+        "d/xDS_Store": "",
+        "d/f.txt": "",
+    })
+    paths = ["d", "._top", ".DS_Store"]
+
+    monkeypatch.setattr(snap.sys, "platform", "darwin")
+    archive = make_archive(tmp_path, "mac", src, paths)
+    assert archive_names(archive) == ["d", "d/e", "d/f.txt", "d/keep._x", "d/xDS_Store"]
+
+    monkeypatch.setattr(snap.sys, "platform", "linux")
+    archive = make_archive(tmp_path, "linux", src, paths)
+    assert len(archive_names(archive)) == 9
+
+
+# --- Round 3 P8: leftovers --- #
+
+
+def test_remote_stop_command_stops_only_that_capture(tmp_path):
+    if not shutil.which("pkill") or not shutil.which("bash"):
+        pytest.skip("pkill and bash are needed")
+    work = tmp_path / "snap-capture.Ab3d.f9h"
+    other = tmp_path / "snap-capture.Ab3dXf9h"  # '.' in the pattern must not match 'X'
+    procs = []
+    try:
+        for directory in (work, other):
+            directory.mkdir()
+            (directory / "snap.py").write_text("import time\ntime.sleep(60)\n")
+            procs.append(subprocess.Popen(
+                [sys.executable, "snap.py", "capture", "-r", str(directory), "-t", "x.toml"],
+                cwd=directory,
+            ))
+        time.sleep(0.5)  # let both start
+
+        command = f"{snap.remote_stop_command(work, 'capture')}; rm -rf {shlex.quote(str(work))}"
+        result = subprocess.run(["bash", "-c", command], timeout=30)
+
+        # The cleanup's own shell survives and removes the dir
+        assert result.returncode == 0
+        assert not work.exists()
+        assert procs[0].wait(timeout=10) != 0
+        assert procs[1].poll() is None
+    finally:
+        for proc in procs:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+
+
+def test_sudo_restore_runs_python_without_user_site_packages(tmp_path, monkeypatch):
+    cmds = []
+
+    class FakePopen:
+        def __init__(self, cmd):
+            cmds.append(cmd)
+
+        def wait(self):
+            return 0
+
+    monkeypatch.setattr(snap.subprocess, "Popen", FakePopen)
+    args = argparse.Namespace(root_host=None)
+
+    with pytest.raises(SystemExit):
+        snap.sudo_restore(args, tmp_path, tmp_path, {"tar": {"archives": ["x"]}}, {})
+
+    [cmd] = cmds
+    assert cmd[cmd.index(sys.executable):][:3] == [sys.executable, "-s", str(snap.__script__)]
+
+
+def test_sudo_restore_keeps_a_missing_archives_key(tmp_path, monkeypatch):
+    configs = []
+
+    class FakePopen:
+        def __init__(self, cmd):
+            configs.append(Path(cmd[cmd.index("-t") + 1]).read_text())
+
+        def wait(self):
+            return 0
+
+    monkeypatch.setattr(snap.subprocess, "Popen", FakePopen)
+    args = argparse.Namespace(root_host=None)
+
+    with pytest.raises(SystemExit):
+        snap.sudo_restore(args, tmp_path, tmp_path, {"tarball": {}}, {}, table="restore.tar")
+
+    assert snap.tomllib.loads(configs[0]) == {
+        "tar": {"archives": []},
+        "snap": {"table": "restore.tar", "no_archives_key": True},
+    }
+
+
+MIGRATE_WITHOUT_ARCHIVES = (
+    '[tarball]\nchecksum = "sha256"\n\n'
+    '[capture.tar.dotfiles]\nroot = "$HOME"\nfiles = [".zshrc"]\n'
+)
+NO_ARCHIVES_KEY = "Skipping archive restore ([restore.tar] has no 'archives' key)\n"
+
+
+def test_e2e_child_config_reports_a_missing_archives_key(env):
+    write_files(env.home, {".zshrc": "v1"})
+    write_configs(env.root, {"dotfiles": ("$HOME", [".zshrc"])})
+    assert env.run("capture", "-r", str(env.root)).returncode == 0
+    # What sudo_restore writes for a migrate.toml without [restore.tar] 'archives'
+    (env.root / "configs" / "child.toml").write_text(snap.toml_dumps(
+        snap.restore_child_config({"tarball": {}}, "restore.tar")
+    ))
+
+    result = env.run("restore", "-r", str(env.root), "-t", "configs/child.toml")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert NO_ARCHIVES_KEY in result.stdout
+    assert "archives is empty" not in result.stdout
+
+
+def test_e2e_migrate_to_host_reports_a_missing_archives_key(env, hosts):
+    write_files(env.home, {".zshrc": "v1"})
+    (env.root / "configs" / "migrate.toml").write_text(MIGRATE_WITHOUT_ARCHIVES)
+
+    result = env.run("migrate", "-r", str(env.root), "--to", "user@web-01")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert NO_ARCHIVES_KEY in result.stdout
+    assert "archives is empty" not in result.stdout
+
+
+# --- Round 3 P4: encryption with age --- #
+
+# A stand-in for the age CLI. 'Encrypting' writes a header naming the recipients and the
+# data XORed with 0x5A, so the plaintext is not in the file; decrypting needs an
+# identity 'AGE-SECRET-KEY-<X>' whose recipient 'age1<x>' is in the header. Each call is
+# logged as JSON with the mode of the output's dir. FAKE_AGE_FAIL makes every call fail
+FAKE_AGE = r'''
+import json, os, sys
+
+args = sys.argv[1:]
+mode = out = identity = source = None
+recipients = []
+i = 0
+while i < len(args):
+    arg = args[i]
+    if arg in ("-e", "-d"):
+        mode = arg
+    elif arg in ("-r", "-R", "-i", "-o"):
+        i += 1
+        if arg == "-r":
+            recipients.append(args[i])
+        elif arg == "-R":
+            with open(args[i]) as f:
+                recipients += [line.strip() for line in f if line.strip()]
+        elif arg == "-i":
+            identity = args[i]
+        else:
+            out = args[i]
+    else:
+        source = arg
+    i += 1
+
+with open(os.environ["FAKE_AGE_LOG"], "a") as f:
+    out_dir = os.path.dirname(out)
+    f.write(json.dumps({"argv": args, "out_dir_mode": os.stat(out_dir).st_mode & 0o777}) + "\n")
+if os.environ.get("FAKE_AGE_FAIL"):
+    print("age: error: fake failure", file=sys.stderr)
+    sys.exit(1)
+
+with open(source, "rb") as f:
+    data = f.read()
+if mode == "-e":
+    header = ("FAKEAGE " + " ".join(recipients) + "\n").encode()
+    with open(out, "wb") as f:
+        f.write(header + bytes(b ^ 0x5A for b in data))
+    sys.exit(0)
+
+with open(identity) as f:
+    key = f.read().strip()
+header, _, body = data.partition(b"\n")
+public = "age1" + key[len("AGE-SECRET-KEY-"):].lower()
+if public not in header.decode().split()[1:]:
+    print("age: error: no identity matched any of the recipients", file=sys.stderr)
+    sys.exit(1)
+with open(out, "wb") as f:
+    f.write(bytes(b ^ 0x5A for b in body))
+'''
+
+ENCRYPTED_CAPTURE_TOML = """\
+[tarball]
+checksum = "sha256"
+rollback = ".bak"
+
+[age]
+recipients = ["age1one"]
+recipients_file = "$HOME/recipients.txt"
+
+[tar.dotfiles]
+root = "$HOME"
+files = [".zshrc"]
+
+[tar.secrets]
+root = "$HOME"
+dirs = [".secrets"]
+encrypt = true
+"""
+
+IDENTITY_RESTORE_TOML = '[tar]\narchives = ["*"]\n\n[age]\nidentity = "~/key.txt"\n'
+
+
+@pytest.fixture
+def fake_age(env):
+    """Put the fake age first on PATH; returns a function listing its logged calls."""
+    (env.tmp / "fakeage.py").write_text(FAKE_AGE)
+    shim = env.tmp / "fakeage.py"
+    write_script(env.tmp / "bin" / "age", f'exec "{sys.executable}" "{shim}" "$@"')
+    log = env.tmp / "age-calls.log"
+    env.env["FAKE_AGE_LOG"] = str(log)
+    if shutil.which("age", path=env.env["PATH"]) != str(env.tmp / "bin" / "age"):
+        pytest.skip("fake age is not first on PATH")
+
+    def calls():
+        if not log.exists():
+            return []
+        return [json.loads(line) for line in log.read_text().splitlines()]
+
+    return calls
+
+
+def encrypted_setup(env, identity="AGE-SECRET-KEY-TWO"):
+    """Files in HOME, a capture config that encrypts 'secrets', and a restore identity."""
+    write_files(env.home, {
+        ".zshrc": "zshrc v1",
+        ".secrets/token": "top secret v1",
+        "recipients.txt": "age1two\n",
+        "key.txt": identity + "\n",
+    })
+    (env.root / "configs" / "capture.toml").write_text(ENCRYPTED_CAPTURE_TOML)
+    (env.root / "configs" / "restore.toml").write_text(IDENTITY_RESTORE_TOML)
+
+
+def option_values(argv, option):
+    """Return the values that follow each `option` in an argv."""
+    return [argv[i + 1] for i, arg in enumerate(argv[:-1]) if arg == option]
+
+
+@pytest.mark.parametrize("config, problem", [
+    ({"tar": {"a": {"root": "/", "dirs": ["x"], "encrypt": True}}},
+     "[tar.a] sets 'encrypt', but [age] has no 'recipients' or 'recipients_file' key"),
+    ({"tar": {"a": {"root": "/", "dirs": ["x"], "encrypt": "yes"}}},
+     "the 'encrypt' key in [tar.a] must be true or false"),
+    ({"age": {"recipients": "age1x"}, "tar": {"a": {"root": "/", "dirs": ["x"]}}},
+     "the 'recipients' key in [age] must be an array of age public keys"),
+    ({"age": {"recipients_file": 3}, "tar": {"a": {"root": "/", "dirs": ["x"]}}},
+     "the 'recipients_file' key in [age] must be a path"),
+])
+def test_capture_config_checks_encryption(capsys, config, problem):
+    with pytest.raises(SystemExit):
+        snap.verify_capture_config(config, "configs/capture.toml")
+    assert f"Error: configs/capture.toml: {problem}" in capsys.readouterr().err
+
+
+def test_capture_config_names_the_migrate_age_table(capsys):
+    config = {"tar": {"a": {"root": "/", "dirs": ["x"], "encrypt": True}}}
+    with pytest.raises(SystemExit):
+        snap.verify_capture_config(config, "configs/migrate.toml", table="capture.tar")
+    assert "[capture.tar.a] sets 'encrypt', but [capture.age] has no" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("age", [{"recipients": ["age1x"]}, {"recipients_file": "~/r.txt"}])
+def test_capture_config_accepts_either_kind_of_recipients(age):
+    config = {"age": age, "tar": {"a": {"root": "/", "dirs": ["x"], "encrypt": True}}}
+    snap.verify_capture_config(config, "configs/capture.toml")
+
+
+def test_archive_category_strips_the_age_extension():
+    assert snap.archive_category("secrets.tar.gz.age") == "secrets"
+    assert snap.archive_category("plain.tar.age") == "plain"
+    assert snap.archive_file("secrets", ".tar.gz", encrypted=True) == "secrets.tar.gz.age"
+
+
+def test_e2e_capture_encrypts_with_age(env, fake_age):
+    encrypted_setup(env)
+
+    result = env.run("capture", "-r", str(env.root))
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "\nEncrypting 1 archive...\n  ✓ 1 archive encrypted\n" in result.stdout
+    snapshot = snapshot_dir(env)
+    assert sorted(p.name for p in snapshot.iterdir()) == [
+        "dotfiles.tar.gz", "secrets.tar.gz.age", "snapshot.toml",
+    ]
+    encrypted = snapshot / "secrets.tar.gz.age"
+    assert b"top secret" not in encrypted.read_bytes()
+    assert stat_mode(encrypted) == 0o600
+
+    # snapshot.toml marks the archive, and its checksum is over the .age file
+    tables = snap.tomllib.loads((snapshot / "snapshot.toml").read_text())["tar"]
+    assert tables["secrets"]["encrypted"] is True
+    assert tables["secrets"]["checksum"] == snap.calculate_file_checksum(encrypted)
+    assert "encrypted" not in tables["dotfiles"]
+
+    # age -e with both kinds of recipients, in the private staging dir
+    [call] = fake_age()
+    argv = call["argv"]
+    assert argv[0] == "-e"
+    assert option_values(argv, "-r") == ["age1one"]
+    assert option_values(argv, "-R") == [str(env.home / "recipients.txt")]
+    assert option_values(argv, "-o")[0].endswith("/secrets.tar.gz.age")
+    assert argv[-1].endswith("/secrets.tar.gz")
+    assert call["out_dir_mode"] == 0o700
+    assert not Path(argv[-1]).exists()
+
+
+def test_e2e_restore_decrypts_into_a_private_temp_dir(env, fake_age):
+    encrypted_setup(env)
+    assert env.run("capture", "-r", str(env.root)).returncode == 0
+    write_files(env.home, {".zshrc": "zshrc v2", ".secrets/token": "changed"})
+
+    result = env.run("restore", "-r", str(env.root))
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "\nDecrypting 1 archive...\n  ✓ 1 archive decrypted\n" in result.stdout
+    assert "  secrets.tar.gz (root: " in result.stdout
+    assert "✓ Restore completed: 2 archives restored" in result.stdout
+    assert (env.home / ".secrets" / "token").read_text() == "top secret v1"
+    assert (env.home / ".zshrc").read_text() == "zshrc v1"
+
+    decrypt = fake_age()[-1]
+    assert decrypt["argv"][:3] == ["-d", "-i", str(env.home / "key.txt")]
+    assert decrypt["argv"][-1] == str(snapshot_dir(env) / "secrets.tar.gz.age")
+    assert decrypt["out_dir_mode"] == 0o700
+    plain = Path(option_values(decrypt["argv"], "-o")[0])
+    assert plain.name == "secrets.tar.gz"
+    assert not plain.parent.exists()
+
+
+def test_e2e_restore_without_an_identity_changes_nothing(env, fake_age):
+    encrypted_setup(env)
+    assert env.run("capture", "-r", str(env.root)).returncode == 0
+    (env.root / "configs" / "restore.toml").write_text('[tar]\narchives = ["*"]\n')
+    write_files(env.home, {".secrets/token": "changed"})
+
+    result = env.run("restore", "-r", str(env.root))
+
+    assert result.returncode == 1
+    assert "Error: Cannot decrypt secrets.tar.gz.age: no age identity is set\n" in result.stderr
+    assert "Set 'identity' in the restore config's [age] table" in result.stderr
+    assert (env.home / ".secrets" / "token").read_text() == "changed"
+    assert len(fake_age()) == 1  # only the capture's age -e
+
+
+def test_e2e_restore_with_the_wrong_identity_changes_nothing(env, fake_age):
+    encrypted_setup(env, identity="AGE-SECRET-KEY-OTHER")
+    assert env.run("capture", "-r", str(env.root)).returncode == 0
+    write_files(env.home, {".secrets/token": "changed"})
+
+    result = env.run("restore", "-r", str(env.root))
+
+    assert result.returncode == 1
+    assert "  age: error: no identity matched any of the recipients\n" in result.stderr
+    assert "Error: Decrypting secrets.tar.gz.age failed (exit status 1)\n" in result.stderr
+    assert (env.home / ".secrets" / "token").read_text() == "changed"
+    plain = Path(option_values(fake_age()[-1]["argv"], "-o")[0])
+    assert not plain.parent.exists()
+
+
+def test_e2e_missing_identity_file_is_an_error(env, fake_age):
+    encrypted_setup(env)
+    assert env.run("capture", "-r", str(env.root)).returncode == 0
+    (env.home / "key.txt").unlink()
+
+    result = env.run("restore", "-r", str(env.root))
+
+    assert result.returncode == 1
+    assert f"Error: Age identity not found: {env.home / 'key.txt'}\n" in result.stderr
+
+
+def test_e2e_missing_age_names_the_archive(env, fake_age):
+    encrypted_setup(env)
+    no_age = {"PATH": str(env.tmp / "empty-bin")}
+
+    result = env.run("capture", "-r", str(env.root), extra_env=no_age)
+
+    assert result.returncode == 1
+    assert "Error: Cannot encrypt secrets.tar.gz: age not found\n" in result.stderr
+    assert "  Install age (brew install age, or apt install age)\n" in result.stderr
+    assert "Creating" not in result.stdout
+    assert not (env.root / "captures").exists()
+
+    assert env.run("capture", "-r", str(env.root)).returncode == 0
+    result = env.run("restore", "-r", str(env.root), extra_env=no_age)
+    assert result.returncode == 1
+    assert "Error: Cannot decrypt secrets.tar.gz.age: age not found\n" in result.stderr
+
+
+def test_e2e_failed_encryption_saves_no_snapshot(env, fake_age):
+    encrypted_setup(env)
+
+    result = env.run("capture", "-r", str(env.root), extra_env={"FAKE_AGE_FAIL": "1"})
+
+    assert result.returncode == 1
+    assert "  age: error: fake failure\nError: Encrypting secrets.tar.gz failed (exit status 1)\n" \
+        in result.stderr
+    assert "Error: Capture failed: 1 of 1 archive could not be encrypted" in result.stderr
+    assert not list(env.root.glob("captures/*/*/*"))
+    plain = Path(fake_age()[0]["argv"][-1])
+    assert not plain.parent.exists()  # the staging dir, with the plaintext, is gone
+
+
+def test_e2e_encrypted_dry_runs_create_no_plaintext(env, fake_age):
+    encrypted_setup(env)
+
+    result = env.run("capture", "-r", str(env.root), "--dry-run")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (
+        "[DRY-RUN] Encrypting 1 archive...\n"
+        "[DRY-RUN]   run: age -e -r age1one -R " + str(env.home / "recipients.txt")
+        + " -o '<staging dir>/"
+    ) in result.stdout
+    assert "secrets.tar.gz.age' '<staging dir>/" in result.stdout
+    assert fake_age() == []
+    assert not (env.root / "captures").exists()
+
+    assert env.run("capture", "-r", str(env.root)).returncode == 0
+    write_files(env.home, {".secrets/token": "changed"})
+    before = tree_state(env.home)
+    snapshot = snapshot_dir(env)
+
+    result = env.run("restore", "-r", str(env.root), "--dry-run")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (
+        f"[DRY-RUN]   run: age -d -i {env.home / 'key.txt'} "
+        f"-o '<decrypted dir>/secrets.tar.gz' {snapshot / 'secrets.tar.gz.age'}\n"
+    ) in result.stdout
+    assert "[DRY-RUN]     encrypted; a dry run does not list its paths\n" in result.stdout
+    assert "✓" not in result.stdout
+    assert len(fake_age()) == 1  # the real capture's; the dry run ran nothing
+    assert tree_state(env.home) == before
+
+
+def test_e2e_encrypted_dry_run_without_backups_asks_by_name(env, fake_age):
+    encrypted_setup(env)
+    assert env.run("capture", "-r", str(env.root)).returncode == 0
+
+    result = env.run("restore", "-r", str(env.root), "--dry-run", "--disable-rollback")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (
+        "[DRY-RUN]     encrypted; a dry run does not list its paths\n"
+        "[DRY-RUN]     Restore secrets.tar.gz? [y/N]: y (assumed in a dry run)\n"
+    ) in result.stdout
+
+
+def test_e2e_tampered_encrypted_archive_fails_verification(env, fake_age):
+    encrypted_setup(env)
+    assert env.run("capture", "-r", str(env.root)).returncode == 0
+    encrypted = snapshot_dir(env) / "secrets.tar.gz.age"
+    encrypted.write_bytes(encrypted.read_bytes() + b"x")
+
+    result = env.run("restore", "-r", str(env.root), "--verbose")
+
+    assert result.returncode == 1
+    assert "  verify: secrets.tar.gz.age\n" in result.stdout
+    assert "  secrets.tar.gz.age: checksum mismatch\n" in result.stderr
+    assert len(fake_age()) == 1  # never decrypted
+
+
+def test_e2e_unselected_encrypted_archive_needs_no_identity(env, fake_age):
+    encrypted_setup(env)
+    assert env.run("capture", "-r", str(env.root)).returncode == 0
+    (env.root / "configs" / "restore.toml").write_text('[tar]\narchives = ["dotfiles"]\n')
+
+    result = env.run("restore", "-r", str(env.root))
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Decrypting" not in result.stdout
+    assert "✓ Restore completed: 1 archive restored" in result.stdout
+
+
+def test_restore_child_config_ships_only_the_identity_path():
+    config = {"tar": {"archives": ["*"]}, "age": {"identity": "~/key.txt", "other": "x"}}
+    assert snap.restore_child_config(config)["age"] == {"identity": "~/key.txt"}
+    assert "age" not in snap.restore_child_config({"tar": {"archives": ["*"]}})
+
+
+def test_split_migrate_config_keeps_both_age_tables():
+    config = {
+        "capture": {"tar": {}, "age": {"recipients": ["age1x"]}},
+        "restore": {"tar": {"archives": ["*"]}, "age": {"identity": "~/key.txt"}},
+    }
+    capture_config, restore_config = snap.split_migrate_config(config, "migrate.toml")
+    assert capture_config["age"] == {"recipients": ["age1x"]}
+    assert restore_config["age"] == {"identity": "~/key.txt"}
+
+
+def test_sudo_restore_expands_the_identity_path(tmp_path, monkeypatch):
+    configs = []
+
+    class FakePopen:
+        def __init__(self, cmd):
+            configs.append(Path(cmd[cmd.index("-t") + 1]).read_text())
+
+        def wait(self):
+            return 0
+
+    monkeypatch.setattr(snap.subprocess, "Popen", FakePopen)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("KEYS", str(tmp_path / "keys"))
+    args = argparse.Namespace(root_host=None)
+    restore_config = {"tar": {"archives": ["*"]}, "age": {"identity": "$KEYS/key.txt"}}
+
+    with pytest.raises(SystemExit):
+        snap.sudo_restore(args, tmp_path, tmp_path, restore_config, {})
+
+    assert snap.tomllib.loads(configs[0])["age"] == {"identity": str(tmp_path / "keys/key.txt")}
+
+
+def test_e2e_restore_to_host_decrypts_there_with_its_identity(env, hosts, fake_age):
+    encrypted_setup(env)
+    assert env.run("capture", "-r", str(env.root)).returncode == 0
+    (env.home / "key.txt").unlink()  # the key is only on the host
+    host_home = hosts.home("web-01")
+    write_files(host_home, {"key.txt": "AGE-SECRET-KEY-TWO\n", ".secrets/token": "old"})
+
+    result = env.run("restore", "-r", str(env.root), "--to", "user@web-01")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (host_home / ".secrets" / "token").read_text() == "top secret v1"
+    decrypt = fake_age()[-1]
+    assert option_values(decrypt["argv"], "-i") == [str(host_home / "key.txt")]
+    assert "key.txt" not in " ".join(line for line in hosts.calls() if line.startswith("rsync"))
+    assert list(hosts.tmp("web-01").iterdir()) == []
+
+
+requires_age = pytest.mark.skipif(
+    not (shutil.which("age") and shutil.which("age-keygen")), reason="age is not installed"
+)
+
+
+@requires_age
+def test_e2e_capture_and_restore_with_real_age(env):
+    write_files(env.home, {".zshrc": "zshrc v1", ".secrets/token": "top secret v1"})
+    key = env.home / "key.txt"
+    subprocess.run(["age-keygen", "-o", str(key)], check=True, capture_output=True)
+    public = subprocess.run(
+        ["age-keygen", "-y", str(key)], check=True, capture_output=True, text=True
+    ).stdout.strip()
+    (env.home / "recipients.txt").write_text(public + "\n")
+    config = ENCRYPTED_CAPTURE_TOML.replace('recipients = ["age1one"]\n', "")
+    (env.root / "configs" / "capture.toml").write_text(config)
+    (env.root / "configs" / "restore.toml").write_text(IDENTITY_RESTORE_TOML)
+
+    result = env.run("capture", "-r", str(env.root))
+    assert result.returncode == 0, result.stdout + result.stderr
+    encrypted = snapshot_dir(env) / "secrets.tar.gz.age"
+    assert encrypted.read_bytes().startswith(b"age-encryption.org/v1")
+
+    write_files(env.home, {".secrets/token": "changed"})
+    result = env.run("restore", "-r", str(env.root))
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (env.home / ".secrets" / "token").read_text() == "top secret v1"
+
+
+def test_e2e_migrate_to_host_encrypts_and_decrypts_there(env, hosts, fake_age):
+    write_files(env.home, {".secrets/token": "top secret v1"})
+    host_home = hosts.home("web-01")
+    write_files(host_home, {"key.txt": "AGE-SECRET-KEY-ONE\n"})
+    (env.root / "configs" / "migrate.toml").write_text(
+        '[tarball]\nchecksum = "sha256"\nrollback = ".bak"\n\n'
+        '[capture.age]\nrecipients = ["age1one"]\n\n'
+        '[capture.tar.secrets]\nroot = "$HOME"\ndirs = [".secrets"]\nencrypt = true\n\n'
+        '[restore.tar]\narchives = ["*"]\n\n'
+        '[restore.age]\nidentity = "~/key.txt"\n'
+    )
+
+    result = env.run("migrate", "-r", str(env.root), "--to", "user@web-01")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (host_home / ".secrets" / "token").read_text() == "top secret v1"
+    assert [call["argv"][0] for call in fake_age()] == ["-e", "-d"]
+
+
+# --- Round 3 P5: snap list and snap prune --- #
+
+
+def days_ago(days):
+    """Return the captures/YYYY/MM-DD path part for a day `days` before today."""
+    day = datetime.now() - timedelta(days=days)
+    return day.strftime("%Y/%m-%d")
+
+
+def make_snapshot(root, rel, tables=None, rollback=".bak", size=100):
+    """Write a snapshot dir under root/captures/<rel> with snapshot.toml and archives.
+
+    tables maps archive names to their [tar.<name>] tables (default: one 'dotfiles'
+    archive with root $HOME). Each archive file holds `size` bytes.
+    """
+    if tables is None:
+        tables = {"dotfiles": {"root": "$HOME"}}
+    path = root / "captures" / rel
+    path.mkdir(parents=True)
+    tarball = {"checksum": "sha256"}
+    if rollback:
+        tarball["rollback"] = rollback
+    snapshot = {"tarball": tarball, "tar": {}}
+    for name, table in tables.items():
+        filename = snap.archive_file(name, ".tar.gz", table.get("encrypted", False))
+        (path / filename).write_bytes(b"x" * size)
+        snapshot["tar"][name] = dict(table, checksum="0" * 64)
+    (path / "snapshot.toml").write_text(snap.toml_dumps(snapshot))
+    return path
+
+
+def rotated_backup(home, stamp, content="old"):
+    """Create a rotated backup dir <home>.bak_<stamp> with one file."""
+    path = Path(f"{home}.bak_{stamp}")
+    write_files(path, {"dotfiles/.zshrc": content})
+    return path
+
+
+def columns_text(rows):
+    """Join rows of cells into lines, to compare column output cell by cell."""
+    return ["  ".join(row) for row in rows]
+
+
+def test_prune_select_keeps_what_any_rule_keeps():
+    today = datetime.now().date()
+    items = [(today - timedelta(days=age), age) for age in (0, 10, 40, 100)]
+    cutoff = today - timedelta(days=30)
+    assert snap.prune_select(items, 2, None) == [40, 100]
+    assert snap.prune_select(items, None, cutoff) == [40, 100]
+    assert snap.prune_select(items, 3, cutoff) == [100]
+    assert snap.prune_select(items, 1, today - timedelta(days=5)) == [10, 40, 100]
+    assert snap.prune_select(items, 0, None) == [0, 10, 40, 100]
+
+
+def test_e2e_list_shows_snapshots_newest_first_and_backup_dirs(env):
+    make_snapshot(env.root, f"{days_ago(40)}/aaaaaaa", size=2048)
+    make_snapshot(env.root, f"{days_ago(0)}/bbbbbbb", tables={
+        "dotfiles": {"root": "$HOME"},
+        "secrets": {"root": "$HOME", "encrypted": True},
+        "system": {"root": str(env.tmp / "sysroot")},
+    })
+    write_files(env.home.parent / "home.bak", {"dotfiles/.zshrc": "current"})
+    rotated = rotated_backup(env.home, "20250102_030405")
+    # Not a snapshot (no snapshot.toml) and not a backup dir: never listed
+    write_files(env.root / "captures" / "2024" / "01-01" / "stray", {"file": "x"})
+    write_files(env.tmp, {"home.bak_notes/file": "x"})
+
+    result = env.run("list", "-r", str(env.root))
+
+    assert result.returncode == 0, result.stderr
+    captures = env.root.resolve() / "captures"
+    snapshots = [toml.parent for toml in captures.glob("*/*/*/snapshot.toml")]
+    [new, old] = sorted(snapshots, key=lambda path: path.name, reverse=True)
+    today = days_ago(0).replace("/", "-")
+    assert [re.split(" {2,}", line) for line in result.stdout.split("\n")] == [
+        re.split(" {2,}", line) for line in columns_text([
+            [f"Snapshots in {captures}, newest first:"],
+            [f"  {today}", "bbbbbbb", "3 archives", snap.size_shown(new), "1 encrypted"],
+            [f"  {days_ago(40).replace('/', '-')}", "aaaaaaa", "1 archive", snap.size_shown(old)],
+            [""],
+            ["Backup dirs, newest first per root:"],
+            [f"  {env.home}.bak", "7 B", "current"],
+            [f"  {rotated}", "3 B", "2025-01-02 03:04:05"],
+            [""],
+            ["2 snapshots, 2 backup dirs"],
+            [""],
+        ])
+    ]
+    assert "2.2 KB" in snap.size_shown(old)
+
+
+def test_e2e_list_without_snapshots(env):
+    result = env.run("list", "-r", str(env.root))
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == f"No snapshots found in {env.root.resolve() / 'captures'}\n"
+
+
+@pytest.mark.parametrize("command", [["list"], ["prune", "--keep", "1", "--yes"]])
+def test_e2e_list_and_prune_need_a_local_snap_root(env, hosts, command):
+    result = env.run(*command, "-r", "user@web-01:.snap")
+
+    assert result.returncode == 1
+    assert result.stderr == (
+        f"Error: snap.py {command[0]} works only with a local snap root, "
+        "not 'user@web-01:.snap'\n"
+        f"  Run snap.py {command[0]} on user@web-01 itself\n"
+    )
+    assert hosts.calls() == []
+
+
+def test_e2e_prune_needs_a_rule(env):
+    result = env.run("prune", "-r", str(env.root))
+
+    assert result.returncode == 1
+    assert "Error: Nothing to prune by: pass --keep N, --older-than DAYS, or both" in result.stderr
+    assert result.stdout == ""
+
+
+def test_e2e_prune_asks_before_deleting(env):
+    old = make_snapshot(env.root, f"{days_ago(40)}/aaaaaaa")
+    older = make_snapshot(env.root, f"{days_ago(400)}/ccccccc")
+    new = make_snapshot(env.root, f"{days_ago(0)}/bbbbbbb")
+    stray = env.root / "captures" / "2001" / "01-01" / "stray"
+    write_files(stray, {"file": "x"})
+
+    result = env.run("prune", "-r", str(env.root), "--keep", "1", answers="n\n")
+
+    assert result.returncode == 0, result.stderr
+    assert (
+        f"\nChecking 3 snapshots...\n"
+        f"  delete: {days_ago(40)}/aaaaaaa ({snap.size_shown(old)})\n"
+        f"  delete: {days_ago(400)}/ccccccc ({snap.size_shown(older)})\n"
+        "  keep: 1 snapshot\n"
+        "  Delete 2 snapshots? [y/N]: n\n"
+        "  skip: declined\n"
+        "\n"
+        "Prune completed: nothing deleted\n"
+    ) in result.stdout
+    assert old.exists() and older.exists() and new.exists()
+
+    result = env.run("prune", "-r", str(env.root), "--keep", "1", answers="y\n")
+
+    assert result.returncode == 0, result.stderr
+    assert f"  ✓ {days_ago(40)}/aaaaaaa deleted\n" in result.stdout
+    assert result.stdout.endswith("\n✓ Prune completed: 2 snapshots deleted\n")
+    assert not old.exists() and not older.exists() and new.exists()
+    # Date dirs left empty are removed; captures/ and other dirs stay
+    assert not old.parent.exists() and not older.parent.parent.exists()
+    assert (env.root / "captures").is_dir() and (stray / "file").exists()
+
+
+def test_e2e_prune_older_than_with_keep(env):
+    snapshots = {}
+    for age in (0, 10, 40, 100):
+        snapshots[age] = make_snapshot(env.root, f"{days_ago(age)}/s{age:06d}")
+
+    result = env.run("prune", "-r", str(env.root), "--older-than", "30", "--keep", "3", "--yes")
+
+    assert result.returncode == 0, result.stderr
+    assert "Delete" not in result.stdout  # --yes: no prompt
+    assert [age for age, path in snapshots.items() if path.exists()] == [0, 10, 40]
+
+    result = env.run("prune", "-r", str(env.root), "--older-than", "5", "--yes")
+    assert result.returncode == 0, result.stderr
+    assert [age for age, path in snapshots.items() if path.exists()] == [0]
+
+    result = env.run("prune", "-r", str(env.root), "--older-than", "5", "--yes")
+    assert result.stdout.endswith("\nPrune completed: nothing to delete\n")
+
+
+def test_e2e_prune_backups_only_with_backups(env):
+    make_snapshot(env.root, f"{days_ago(0)}/bbbbbbb")
+    current = env.home.parent / "home.bak"
+    write_files(current, {"dotfiles/.zshrc": "current"})
+    newest = rotated_backup(env.home, datetime.now().strftime("%Y%m%d_%H%M%S"))
+    old = rotated_backup(env.home, "20200101_000000")
+    old_again = rotated_backup(env.home, "20200101_000000_1")
+
+    result = env.run("prune", "-r", str(env.root), "--keep", "1", "--yes")
+
+    assert result.returncode == 0, result.stderr
+    assert "\nSkipping rotated backup dirs (pass --backups to prune them)\n" in result.stdout
+    assert all(path.exists() for path in (current, newest, old, old_again))
+
+    result = env.run("prune", "-r", str(env.root), "--keep", "1", "--backups", answers="y\n")
+
+    assert result.returncode == 0, result.stderr
+    assert (
+        "\nChecking 3 rotated backup dirs...\n"
+        f"  delete: {old_again} (3 B)\n"
+        f"  delete: {old} (3 B)\n"
+        "  keep: 2 backup dirs\n"
+        "  Delete 0 snapshots and 2 backup dirs? [y/N]: y\n"
+    ) in result.stdout
+    assert result.stdout.endswith("✓ Prune completed: 0 snapshots and 2 backup dirs deleted\n")
+    assert current.exists() and newest.exists()
+    assert not old.exists() and not old_again.exists()
+
+    # The current backup dir is never deleted, whatever the rules say
+    result = env.run("prune", "-r", str(env.root), "--keep", "0", "--backups", "--yes")
+    assert result.returncode == 0, result.stderr
+    assert current.exists() and not newest.exists()
+
+
+def test_e2e_prune_dry_run_changes_nothing(env):
+    make_snapshot(env.root, f"{days_ago(40)}/aaaaaaa")
+    make_snapshot(env.root, f"{days_ago(0)}/bbbbbbb")
+    rotated_backup(env.home, "20200101_000000")
+    before = tree_state(env.tmp)
+
+    result = env.run("prune", "-r", str(env.root), "--older-than", "30", "--backups", "--dry-run")
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.startswith("[DRY-RUN] Starting prune (no changes will be made)\n")
+    assert "[DRY-RUN]   delete: " in result.stdout
+    assert (
+        "[DRY-RUN]   Delete 1 snapshot and 1 backup dir? [y/N]: y (assumed in a dry run)\n"
+        "[DRY-RUN]\n"
+        "[DRY-RUN] Dry run completed; no changes were made\n"
+    ) in result.stdout
+    assert "✓" not in result.stdout and "Deleting" not in result.stdout
+    assert tree_state(env.tmp) == before
+
+
+@unprivileged
+def test_e2e_prune_never_uses_sudo_for_root_owned_backup_dirs(env):
+    locked = env.tmp / "locked"
+    make_snapshot(env.root, f"{days_ago(0)}/bbbbbbb", tables={"sys": {"root": str(locked / "sys")}})
+    rotated = rotated_backup(locked / "sys", "20200101_000000")
+    locked.chmod(0o555)
+    try:
+        result = env.run("prune", "-r", str(env.root), "--older-than", "1", "--backups", "--yes")
+    finally:
+        locked.chmod(0o755)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stderr == (
+        f"Warning: {rotated} needs root to delete; it is kept\n"
+        f"  Run: sudo rm -rf {rotated}\n"
+    )
+    assert result.stdout.endswith("\nPrune completed: nothing to delete\n")
+    assert rotated.exists()
+    assert not env.sudo_marker.exists()
+
+
+def test_e2e_prune_never_follows_symlinked_snapshots(env):
+    outside = make_snapshot(env.tmp / "elsewhere", "2001/01-01/aaaaaaa")
+    year = env.root / "captures" / "2001"
+    year.parent.mkdir(parents=True)
+    year.symlink_to(outside.parent.parent)
+    make_snapshot(env.root, f"{days_ago(0)}/bbbbbbb")
+
+    result = env.run("prune", "-r", str(env.root), "--keep", "0", "--yes")
+
+    assert result.returncode == 0, result.stderr
+    assert "Checking 1 snapshot..." in result.stdout
+    assert (outside / "snapshot.toml").exists() and year.is_symlink()
+
+
+def test_e2e_list_after_a_real_capture_and_restore(env):
+    write_files(env.home, {".zshrc": "v1"})
+    write_configs(env.root, {"dotfiles": ("$HOME", [".zshrc"])})
+    assert env.run("capture", "-r", str(env.root)).returncode == 0
+    assert env.run("restore", "-r", str(env.root)).returncode == 0
+    assert env.run("restore", "-r", str(env.root)).returncode == 0
+
+    result = env.run("list", "-r", str(env.root))
+
+    assert result.returncode == 0, result.stderr
+    assert f"  {env.home}.bak " in result.stdout
+    assert f"  {env.home}.bak_" in result.stdout
+    assert result.stdout.endswith("\n1 snapshot, 2 backup dirs\n")
+
+
+# --- Final review: signals and private moves --- #
+
+
+def test_sigint_deferred_holds_ctrl_c_until_the_block_ends():
+    reached_end = []
+    with pytest.raises(KeyboardInterrupt):
+        with snap.sigint_deferred():
+            os.kill(os.getpid(), signal.SIGINT)
+            time.sleep(0.1)
+            reached_end.append(True)
+    assert reached_end == [True]
+
+
+def test_capture_move_into_captures_runs_under_a_private_umask(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    root = tmp_path / "snaproot"
+    (root / "configs").mkdir(parents=True)
+    write_files(home, {".zshrc": "v1"})
+    write_configs(root, {"dotfiles": ("$HOME", [".zshrc"])})
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(snap, "__dry_run__", False)
+    monkeypatch.setattr(snap, "__verbose__", False)
+    monkeypatch.setattr(snap.sys, "argv", ["snap", "capture", "-r", str(root)])
+    umasks = []
+    real_move = snap.shutil.move
+
+    def move(src, dst):
+        current = os.umask(0o022)
+        os.umask(current)
+        umasks.append(current)
+        return real_move(src, dst)
+
+    monkeypatch.setattr(snap.shutil, "move", move)
+    previous = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGHUP)}
+    try:
+        snap.main()
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
+
+    assert umasks == [0o077]
+    assert list(root.glob("captures/*/*/*/snapshot.toml"))
+
+
+@unprivileged
+def test_e2e_sigterm_during_capture_removes_its_staging_dir(env):
+    (env.root / "scripts").mkdir()
+    (env.root / "scripts" / "slow.sh").write_text("sleep 20\n")
+    write_files(env.home, {".zshrc": "v1"})
+    write_configs(env.root, {"dotfiles": ("$HOME", [".zshrc"])})
+    capture_toml = env.root / "configs" / "capture.toml"
+    capture_toml.write_text(
+        capture_toml.read_text() + '\n[scripts]\nbefore = ["scripts/slow.sh"]\n'
+    )
+    tmpdir = env.tmp / "tmpdir"
+    tmpdir.mkdir()
+
+    proc = subprocess.Popen(
+        [sys.executable, str(SNAP), "capture", "-r", str(env.root), "--run-scripts"],
+        cwd=env.tmp, env=dict(env.env, TMPDIR=str(tmpdir)),
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    try:
+        deadline = time.time() + 20
+        while not list(tmpdir.iterdir()) and time.time() < deadline:
+            time.sleep(0.1)
+        assert list(tmpdir.iterdir()), "the staging dir never appeared"
+        time.sleep(0.5)
+        proc.send_signal(signal.SIGTERM)
+        proc.communicate(timeout=30)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+    assert proc.returncode != 0
+    assert list(tmpdir.iterdir()) == []  # the plaintext staging dir is gone
