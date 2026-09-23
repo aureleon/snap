@@ -1,18 +1,19 @@
 #!/bin/bash
-# Backup Homebrew packages to text files
-# This script expects to run from the backup directory
+# Save the installed Homebrew packages as a Brewfile.
+# install.sh installs this as scripts/capture-brew.sh; capture.toml runs it as an after
+# script ('snap capture --run-scripts'), in the new snapshot directory, so the Brewfile
+# goes with the snapshot.
 
 set -euo pipefail
 
 if ! command -v brew &>/dev/null; then
-    echo "Warning: Homebrew not found, skipping brew backup" >&2
+    echo "Warning: Homebrew not found; no Brewfile saved" >&2
     exit 0
 fi
 
-echo "Backing up Homebrew packages..."
+echo "Saving Homebrew packages..."
 
-# Save to current directory (the backup directory)
-brew bundle dump
+# Save to the current directory (the snapshot directory)
+brew bundle dump --force --file=Brewfile
 
-echo "✓ Homebrew backup saved to Brewfile"
-
+echo "✓ Homebrew packages saved to Brewfile"
