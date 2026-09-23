@@ -50,15 +50,21 @@ def function_name(arg1, arg2):
 - **Try/except**: Only where recovery is possible
 
 ### User Feedback
-- No emojis — only `✓` for success messages
+- No emojis — only `✓` for success messages, printed with `ok()` or `finish()`
+- All output goes through the Output Helpers built on `emit()`: `banner()`/`context()` open a
+  run, `step()`/`step_skipped()`/`note()` start a section, `say()` prints items and details,
+  `warn()`/`error()`/`fatal()` print to stderr, `relay()` prints captured child output, `ask()`
+  prompts, and `finish()` prints the command's one final line. Only the Python-version guard
+  and `check`'s data lines use `print()`
 - Progress bars with `dtqdm()` helper for long operations (handles dry-run automatically)
-- Verbose mode shows detailed progress with `pbar.write()`
+- Verbose mode only adds lines, through the same helpers (`if __verbose__: say(...)`)
 
 ### Dry-Run Support
 - Check `__dry_run__` flag in every mutating function
-- Use `printd` for all output for `[DRY-RUN] ` support
-- Use `shlex.join()` to display commands that would run
-- Return mock/placeholder values when needed
+- `emit()` calls `printd`, which adds `[DRY-RUN] ` to every line; don't call `printd` directly
+- Use `echo(argv)` to display commands that would run (`run: <shlex.join(argv)>`)
+- Return mock/placeholder values when needed (`DRY_RUN_DIR`, `DRY_RUN_CHECKSUM`), and show
+  them with `shown()`
 
 ## Key Patterns
 
@@ -70,13 +76,17 @@ def function_name(arg1, arg2):
 ### Security
 - Archives store relative paths (no absolute)
 - Use `shlex.quote()` for all remote shell commands
-- Python 3.12+ tar extraction filter for path traversal protection
+- tarfile's `tar` extraction filter (Python 3.11.4+), plus `archive_entries()` refusing
+  absolute or `..` member paths
 - Sudo re-execution when needed for system file restoration
 
 ### Subprocess Output
-- All subprocess calls capture stdout/stderr
-- Output printed after completion (not streamed) to avoid interleaving with progress bars
-- Parallel operations use `pbar.write()` for thread-safety
+- Subprocess calls capture stdout/stderr, except the sudo re-run and the `ssh -t` remote
+  restore, which use the terminal directly (for password prompts)
+- Captured output is printed after completion with `relay()` (not streamed) to avoid
+  interleaving with progress bars
+- `emit()` is thread-safe (an output lock plus tqdm's `external_write_mode`), so parallel
+  workers print through the same helpers
 
 ### Temp Directory Cleanup
 - Always use try/finally with `shutil.rmtree()` for temp directories
@@ -86,7 +96,8 @@ def function_name(arg1, arg2):
 1. **Don't add type hints** — keep consistent with existing code
 2. **Don't add emojis** — only `✓` for success messages
 3. **Don't over-engineer** — keep functions focused and simple
-4. **Don't use external libraries** — only `tqdm` beyond stdlib
+4. **Don't use external libraries** — only `tqdm` beyond stdlib, and it stays optional
+   (`dtqdm()` returns a no-op bar without it)
 5. **Don't break single-file design** — no imports from other files
 6. **Don't use async/await** — ThreadPoolExecutor is sufficient
 

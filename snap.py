@@ -22,14 +22,12 @@ import hashlib
 import json
 import os
 import platform
-import random
 import re
 import select
 import shlex
 import shutil
 import signal
 import stat
-import string
 import subprocess
 import tarfile
 import tempfile
@@ -39,14 +37,14 @@ import tomllib
 import concurrent.futures as ccft
 
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
+# tqdm is optional: without it, dtqdm() hands out no-op bars, so the sudo re-run and
+# remote children also run where tqdm isn't installed
 try:
     from tqdm import tqdm
 except ImportError:
-    print("Error: snap.py requires the tqdm package", file=sys.stderr)
-    print("  Install it with: python3 -m pip install tqdm", file=sys.stderr)
-    sys.exit(1)
+    tqdm = None
 
 # Global flags
 
@@ -78,10 +76,12 @@ BAR_FORMAT = "  {desc}: {n}/{total} [{elapsed}]"
 
 # Dry-run stand-ins for paths and values a real run would create
 DRY_RUN_DIR = "/tmp/dry-run"
+DRY_RUN_WORK_DIR = "/tmp/snap-work.dry-run"  # a work directory on a host
 DRY_RUN_CHECKSUM = "abcd123"
 
 # Display names for the dry-run stand-ins, most specific first
 DRY_RUN_NAMES = [
+    (DRY_RUN_WORK_DIR, "<work dir>"),
     (f"{DRY_RUN_DIR}/remote-capture", "<pulled snapshot>"),
     (f"{DRY_RUN_DIR}/remote-restore", "<pulled snapshot>"),
     (DRY_RUN_DIR, "<staging dir>"),
@@ -160,7 +160,7 @@ def emit(text="", level=0, file=_STDOUT):
     lines = [line.rstrip() for line in str(text).split("\n")]
 
     # tqdm has its lock only after the first bar; before that there is no bar to clear
-    if hasattr(tqdm, "_lock"):
+    if tqdm is not None and hasattr(tqdm, "_lock"):
         bar_safe = tqdm.external_write_mode(file=file)
     else:
         bar_safe = contextlib.nullcontext()
@@ -245,9 +245,14 @@ def say(msg, level=1):
     emit(msg, level)
 
 
-def echo(argv, level=1, verbose=False):
-    """Show a command as 'run: <shell line>': always in a dry run, with --verbose if asked."""
-    if __dry_run__ or (verbose and __verbose__):
+def echo(argv, level=1, verbose=False, runs=False):
+    """Show a command as 'run: <shell line>'.
+
+    A dry run shows every command it skips. runs=True marks a read-only command that runs
+    in a dry run too; it shows only as in a real run. verbose=True shows it with --verbose.
+    """
+    skipped = __dry_run__ and not runs
+    if skipped or (verbose and __verbose__):
         emit("run: " + shlex.join(shown(arg) for arg in argv), level)
 
 
@@ -289,6 +294,16 @@ def fatal(msg, *details):
     """Print an error and exit with status 1."""
     error(msg, *details)
     sys.exit(1)
+
+
+def dry_run_stop(msg, *details):
+    """End a dry run where a real run would stop: the Error, then the dry run's final line.
+
+    Like every dry run it exits 0; the final line counts the error.
+    """
+    error(msg, *details)
+    finish("")
+    sys.exit(0)
 
 
 def compress_error(value, source, stop=True):
@@ -381,13 +396,26 @@ def finish(msg, success=True):
 SSH_ALIVE_INTERVAL = 10
 SSH_CONNECT_TIMEOUT = 30
 
-TIMEOUT_BUFFER = 60
+# Wall-clock limit for short ssh commands (mktemp, mkdir, ls, rm). The remote capture and
+# restore, scripts and rsync take as long as their data does, so they get none
 COMMAND_TIMEOUT = 300
-MIN_RSYNC_TIMEOUT = 300
-MAX_RSYNC_TIMEOUT = 7200
 
-REMOTE_DIR_SUFFIX_LENGTH = 8
-AVG_DOWNLOAD_RATE = 50
+# rsync's own --timeout: a copy stops after this many seconds with no data moving
+RSYNC_TIMEOUT = 300
+
+
+def ssh_argv(host, command, tty=False):
+    """Build the ssh argv that runs one shell command line on a host."""
+    argv = [
+        "ssh",
+        "-o",
+        f"ConnectTimeout={SSH_CONNECT_TIMEOUT}",
+        "-o",
+        f"ServerAliveInterval={SSH_ALIVE_INTERVAL}",
+    ]
+    if tty:
+        argv.append("-t")
+    return argv + [host, command]
 
 
 def ssh_run(
@@ -399,28 +427,23 @@ def ssh_run(
     quiet=False,
     desc="Remote command",
     level=1,
+    timeout=COMMAND_TIMEOUT,
+    read_only=False,
 ):
     """Execute commands on remote host with timeout and proper error handling.
 
-    desc names the action in error lines; level indents the run: echo and relayed output.
+    Returns (returncode, stdout, stderr). desc names the action in error lines; level
+    indents the run: echo and relayed output. timeout=None sets no wall-clock limit, for
+    commands that take as long as their data (ConnectTimeout and ServerAliveInterval
+    still apply). A dry run only shows the command and returns (0, '', ''), unless
+    read_only marks a query that changes nothing, which runs in a dry run too.
     """
-    command_str = " && ".join(commands)
-
-    ssh_args = [
-        "ssh",
-        "-o",
-        f"ConnectTimeout={SSH_CONNECT_TIMEOUT}",
-        "-o",
-        f"ServerAliveInterval={SSH_ALIVE_INTERVAL}",
-    ]
-    if tty:
-        ssh_args.append("-t")
-    ssh_args.extend([host, command_str])
+    ssh_args = ssh_argv(host, " && ".join(commands), tty)
 
     if not quiet:
-        echo(ssh_args, level, verbose=True)
-    if __dry_run__:
-        return None
+        echo(ssh_args, level, verbose=True, runs=read_only)
+    if __dry_run__ and not read_only:
+        return (0, "", "")
 
     try:
         # For TTY operations, don't capture output (interactive)
@@ -431,7 +454,7 @@ def ssh_run(
             result = subprocess.run(
                 ssh_args,
                 check=check,
-                timeout=COMMAND_TIMEOUT,
+                timeout=timeout,
                 input=stdin_data,
                 text=stdin_data is not None,
             )
@@ -441,7 +464,7 @@ def ssh_run(
         result = subprocess.run(
             ssh_args,
             check=check,
-            timeout=COMMAND_TIMEOUT,
+            timeout=timeout,
             input=stdin_data,
             text=True,
             capture_output=True,
@@ -451,7 +474,7 @@ def ssh_run(
         # Print what the command wrote before it hung, then the error
         relay(e.stdout, level)
         relay(e.stderr, level, sys.stderr)
-        fatal(f"{desc} timed out on {host} after {COMMAND_TIMEOUT}s")
+        fatal(f"{desc} timed out on {host} after {timeout}s")
     except subprocess.CalledProcessError as e:
         # Print captured output on error before exiting
         relay(e.stdout, level)
@@ -461,34 +484,23 @@ def ssh_run(
         fatal(f"{desc} failed on {host} (exit status {e.returncode})")
 
 
-def rsync_run(source, dest, check=True, desc=None):
-    """Execute rsync with timeout based on file size.
+def rsync_run(source, dest, check=True, desc=None, options=(), read_only=False):
+    """Execute rsync with its inactivity timeout.
 
-    Returns tuple: (returncode, stdout, stderr). desc names the copy in error lines.
+    Returns tuple: (returncode, stdout, stderr), or None in a dry run. desc names the copy
+    in error lines; options go before the paths. There is no wall-clock limit, so a large
+    archive takes as long as it needs: rsync's --timeout stops a copy that moves no data
+    for RSYNC_TIMEOUT seconds. read_only marks a copy that only reads a host into a local
+    temp dir, which runs in a dry run too.
     """
     if desc is None:
         desc = Path(source).name
 
-    # Simple timeout calculation for archives and small files
-    # We transfer: .tar.gz archives, snapshot TOML, snap.py, configs, scripts
-    timeout = MIN_RSYNC_TIMEOUT
+    # No --info=progress2 with --verbose: macOS openrsync rejects it, and rsync's stdout
+    # is never shown
+    rsync_cmd = ["rsync", "-az", f"--timeout={RSYNC_TIMEOUT}", *options, source, dest]
 
-    # Get file size if local for better timeout estimate
-    if ":" not in source:  # Local file
-        source_path = Path(source)
-        if source_path.is_file():
-            size_mb = source_path.stat().st_size / (1024 * 1024)
-            # 1 minute per 50 MB transfer, minimum 5 minutes
-            timeout = max(MIN_RSYNC_TIMEOUT, int(size_mb / AVG_DOWNLOAD_RATE) * 60)
-            timeout = min(timeout, MAX_RSYNC_TIMEOUT)
-
-    # Build rsync command with optional progress
-    rsync_cmd = ["rsync", "-az"]
-    if __verbose__:
-        rsync_cmd.append("--info=progress2")
-    rsync_cmd.extend([f"--timeout={timeout}", source, dest])
-
-    if __dry_run__:
+    if __dry_run__ and not read_only:
         echo(rsync_cmd)
         return None
 
@@ -496,27 +508,14 @@ def rsync_run(source, dest, check=True, desc=None):
         result = subprocess.run(
             rsync_cmd,
             check=check,
-            timeout=timeout + TIMEOUT_BUFFER,
             capture_output=True,
             text=True,
         )
         return (result.returncode, result.stdout, result.stderr)
-    except subprocess.TimeoutExpired as e:
-        # rsync's stdout holds only --info=progress2 text, which is never shown. One
-        # block, since this can run in an rsync_parallel worker; only the first failed
-        # copy prints it, and the others exit quietly
-        with _output_lock:
-            if _copy_failed.is_set():
-                sys.exit(1)
-            _copy_failed.set()
-            relay(e.stderr, 1, sys.stderr)
-            fatal(
-                f"Copying {desc} timed out after {timeout + TIMEOUT_BUFFER}s",
-                labeled("from:", source),
-                labeled("to:  ", dest),
-            )
     except subprocess.CalledProcessError as e:
-        # Print rsync's errors before exiting (its stdout is only progress text)
+        # Print rsync's errors before exiting (without -v its stdout is empty). One block,
+        # since this can run in an rsync_parallel worker; only the first failed copy
+        # prints it, and the others exit quietly
         with _output_lock:
             if _copy_failed.is_set():
                 sys.exit(1)
@@ -530,7 +529,7 @@ def rsync_run(source, dest, check=True, desc=None):
 
 
 def dtqdm(total, desc="", unit="item", autorefresh=None, **kwargs):
-    """Return tqdm progress bar or no-op context in __dry_run__ mode.
+    """Return a tqdm progress bar, or a no-op one in a dry run or without tqdm.
 
     For unknown totals (total=None) or when autorefresh=True, starts a background
     thread to refresh the display every second so elapsed time updates even during
@@ -538,7 +537,7 @@ def dtqdm(total, desc="", unit="item", autorefresh=None, **kwargs):
     """
 
     class _dtqdm:
-        """No-op progress bar for dry-run mode."""
+        """No-op progress bar for a dry run, or when tqdm isn't installed."""
 
         def __enter__(self):
             return self
@@ -596,6 +595,8 @@ def dtqdm(total, desc="", unit="item", autorefresh=None, **kwargs):
     # no bar is drawn; a broken stream stops the run here, as it always has
     flush_stream(sys.stderr, strict=True)
     flush_stream(sys.stdout, strict=True)
+    if tqdm is None:
+        return _dtqdm()
     pbar = tqdm(total=total, desc=desc, unit=unit, **kwargs)
 
     # Auto-refresh if requested or for unknown totals
@@ -674,25 +675,16 @@ def rsync_copy(source, dest, desc, label=None):
     return result
 
 
-def run_scripts(
-    root_dir, config, when, working_dir, remote_host=None, remote_dir=None, phase=None
-):
-    """Run scripts before or after an operation (local or remote).
+def run_scripts(root_dir, config, when, working_dir, phase=None):
+    """Run a config's before or after scripts on this machine, in working_dir.
 
-    Args:
-        root_dir: Root directory containing configs and scripts
-        config: Loaded config dict
-        when: "before" or "after"
-        working_dir: Directory to cd into before running scripts (capture directory)
-        remote_host: If set, run on remote host
-        remote_dir: Remote directory (when remote_host is set)
-        phase: Display only; names the migration phase ('capture before scripts')
+    On a host, snap.py runs there and runs the scripts itself (--run-scripts is passed
+    to it), so they run as in a local restore or capture. phase is display only; it
+    names the migration phase ('capture before scripts').
     """
     what = f"{when} scripts"
     if phase:
         what = f"{phase} {what}"
-    if remote_host:
-        what += f" on {remote_host}"
 
     scripts = None
     if config and "scripts" in config and when in config["scripts"]:
@@ -709,74 +701,52 @@ def run_scripts(
     if missing and len(missing) == len(scripts):
         step_skipped(what, "no scripts found")
         for run_script_path in missing:
-            warn(f"Script {run_script_path} not found in {root_dir}; skipping it")
+            warn(f"Script {run_script_path} not found in {root_shown(root_dir)}; skipping it")
         return
 
-    if remote_host:
-        step(f"Running {what} with sudo")
-    else:
-        step(f"Running {what}")
+    step(f"Running {what}")
 
     for run_script_path in scripts:
         script_path = root_dir / run_script_path
         if not script_path.exists():
-            warn(f"Script {run_script_path} not found in {root_dir}; skipping it")
+            warn(f"Script {run_script_path} not found in {root_shown(root_dir)}; skipping it")
             continue
         script_name = script_path.name
         say(script_name)
 
-        if remote_host:
-            # Run on remote with sudo, in the remote capture directory
-            # Use proper shell escaping
-            escaped_dir = shlex.quote(remote_dir)
-            escaped_script = shlex.quote(script_name)
-            cmds = [
-                f"cd {escaped_dir}",
-                f"chmod +x {escaped_script}",
-                f"sudo bash {escaped_script}",
-            ]
-            _, stdout, stderr = ssh_run(
-                remote_host, *cmds, desc=f"Script {script_name}", level=2
+        # Run in the capture directory
+        script_cmd = ["bash", str(script_path)]
+        if __dry_run__:
+            echo(script_cmd, 2)
+            if working_dir:
+                say(f"cwd: {shown(working_dir)}", 2)
+            continue
+        try:
+            # A script takes as long as it needs: no wall-clock limit
+            result = subprocess.run(
+                script_cmd,
+                check=True,
+                cwd=working_dir,
+                capture_output=True,
+                text=True,
             )
             # Print script output after completion
-            relay(stdout, 2)
-            relay(stderr, 2, sys.stderr)
+            relay(result.stdout, 2)
+            relay(result.stderr, 2, sys.stderr)
             ok(f"{script_name} completed")
-        else:
-            # Run locally in the capture directory
-            script_cmd = ["bash", str(script_path)]
-            if __dry_run__:
-                echo(script_cmd, 2)
-                if working_dir:
-                    say(f"cwd: {shown(working_dir)}", 2)
-            else:
-                try:
-                    result = subprocess.run(
-                        script_cmd,
-                        check=True,
-                        cwd=working_dir,
-                        timeout=COMMAND_TIMEOUT,
-                        capture_output=True,
-                        text=True,
-                    )
-                    # Print script output after completion
-                    relay(result.stdout, 2)
-                    relay(result.stderr, 2, sys.stderr)
-                    ok(f"{script_name} completed")
-                except subprocess.TimeoutExpired as e:
-                    relay(e.stdout, 2)
-                    relay(e.stderr, 2, sys.stderr)
-                    fatal(f"Script {script_name} timed out after {COMMAND_TIMEOUT}s")
-                except subprocess.CalledProcessError as e:
-                    # Print captured output on error
-                    relay(e.stdout, 2)
-                    relay(e.stderr, 2, sys.stderr)
-                    fatal(f"Script {script_name} failed (exit status {e.returncode})")
+        except subprocess.CalledProcessError as e:
+            # Print captured output on error
+            relay(e.stdout, 2)
+            relay(e.stderr, 2, sys.stderr)
+            fatal(f"Script {script_name} failed (exit status {e.returncode})")
 
 
 # --- Snap Configuration --- #
 
 DEFAULT_ROOT_SNAP = "~/.snap"
+
+# A host's snap root when no path is given, relative to its login directory
+DEFAULT_REMOTE_ROOT = ".snap"
 
 DEFAULT_CONFIG_CAPTURE = "configs/capture.toml"
 DEFAULT_CONFIG_DEPLOY = "configs/deploy.toml"
@@ -808,20 +778,111 @@ def parse_remote_arg(value, flag=None):
         return None, Path(value)
 
     # Reject empty parts and hosts that ssh/rsync would parse as options
+    where = f"{flag} '{value}'" if flag else f"'{value}'"
     user, at, hostname = host.rpartition("@")
     if not hostname or hostname.startswith("-") or user.startswith("-") or (at and not user):
-        where = f"{flag} '{value}'" if flag else f"'{value}'"
         fatal(
             f"Invalid host '{host}' in {where}",
             "Use [user@]host[:path]; the user and host cannot be empty or start with '-'",
         )
 
+    problem = remote_path_problem(path) if path else None
+    if problem:
+        fatal(f"Invalid path '{path}' in {where}: {problem}", REMOTE_PATH_HINT)
+
     return host, Path(path) if path else None
+
+
+# Characters a remote path may hold. rsync before 3.2.4, and macOS's /usr/bin/rsync,
+# pass remote paths to the remote shell unescaped, so any other character could be
+# split or expanded there
+REMOTE_PATH_CHARS = re.compile(r"[A-Za-z0-9._/~+=,%@-]*")
+REMOTE_PATH_HINT = "Remote paths can use letters, digits and . _ / ~ + = , % @ -"
+
+
+def remote_path_problem(path):
+    """Return why a path can't be used on a remote host, or None if it can."""
+    if not REMOTE_PATH_CHARS.fullmatch(str(path)):
+        return "it has characters rsync can't pass to a host safely"
+    parts = normalize_remote_path(path).parts
+    if parts and parts[0].startswith("-"):
+        return "it starts with '-', which ssh and rsync would read as an option"
+    return None
 
 
 def expand_path(path_str):
     """Expand environment variables and user home in a path string."""
     return Path(os.path.expandvars(path_str)).expanduser()
+
+
+def normalize_remote_path(path):
+    """Normalize a path on a remote host: '~' -> '.', '~/x' -> 'x', others as given.
+
+    ssh commands and rsync both resolve a relative path against the remote login
+    directory, so the path never depends on how a remote shell expands '~'.
+    """
+    parts = PurePosixPath(path).parts
+    if parts and parts[0] == "~":
+        parts = parts[1:]
+    return PurePosixPath(*parts)
+
+
+def remote_snap_root(args, host):
+    """Return the snap root on a host: the -r path for the -r host, else .snap."""
+    if host and host == getattr(args, "root_host", None):
+        return args.root_path
+    return PurePosixPath(DEFAULT_REMOTE_ROOT)
+
+
+# A remote snap root (-r host:path) is read from a local copy of its configs/ and
+# scripts/; messages name that copy by the host:path it came from
+_root_names = {}
+
+# rsync filter rules that copy only a snap root's configs/ and scripts/ (captures/ and
+# anything else stay on the host). Either may be missing
+ROOT_COPY_FILTER = [
+    "--include=/configs/",
+    "--include=/configs/**",
+    "--include=/scripts/",
+    "--include=/scripts/**",
+    "--exclude=*",
+]
+
+
+def root_shown(path):
+    """Return a path for messages, naming a remote snap root's copy by its host:path."""
+    text = str(path)
+    for copy, name in _root_names.items():
+        if text == copy or text.startswith(copy + os.sep):
+            return name + text[len(copy):]
+    return text
+
+
+def root_fetch(host, path, local_dir):
+    """Copy a remote snap root's configs/ and scripts/ into local_dir.
+
+    This only reads the host, so a dry run copies too and can read the real configs.
+    The caller creates and removes local_dir.
+    """
+    source = f"{host}:{path}/"
+    result = rsync_run(
+        source,
+        f"{local_dir}/",
+        check=False,
+        desc=f"the snap root from {host}",
+        options=ROOT_COPY_FILTER,
+        read_only=True,
+    )
+    if result[0] != 0:
+        relay(result[2], 1, sys.stderr)
+        details = [labeled("from:", source)]
+        if str(path) == DEFAULT_REMOTE_ROOT:
+            details.append(
+                f"Create a {DEFAULT_REMOTE_ROOT} directory on {host}, "
+                f"or pass -r/--snap-root {host}:<path>"
+            )
+        fatal(f"Copying the snap root from {host} failed (rsync exit status {result[0]})", *details)
+    _root_names[str(local_dir)] = f"{host}:{path}"
 
 
 def root_display(root):
@@ -835,23 +896,15 @@ def root_display(root):
         return Path(str(root))
 
 
-def resolve_root(specified_root, root_host=None):
-    """Resolve the snap root directory.
+def resolve_root(specified_root):
+    """Resolve the local snap root directory (main() handles a remote one).
 
-    When root_host is set, trust the remote path without local checks.
-
-    Search order (local only):
+    Search order:
     1. Use specified_root if provided (and it's not the default)
     2. Check for .snap in current directory
     3. Check for ~/.snap
     4. Error if none exist
     """
-    # Remote root - trust the path, can't check remotely
-    if root_host:
-        if specified_root:
-            return Path(specified_root)
-        return Path(DEFAULT_ROOT_SNAP)
-
     # Resolve both paths for comparison
     default_resolved = Path(DEFAULT_ROOT_SNAP).expanduser().resolve()
     specified_resolved = Path(specified_root).expanduser().resolve()
@@ -919,36 +972,49 @@ def resolve_snapshot_root(captures_dir):
     return latest
 
 
+# A snapshot's snapshot.toml below a captures directory: YYYY/MM-DD/<id>/snapshot.toml.
+# Stray files and dirs elsewhere don't match
+SNAPSHOT_TOML_GLOB = f"[0-9][0-9][0-9][0-9]/[0-9][0-9]-[0-9][0-9]/*/{DEFAULT_SNAPSHOT_TOML}"
+
+
 def resolve_remote_snapshot(host, captures_dir):
-    """Find the most recent capture snapshot on a remote host via SSH.
+    """Find the latest snapshot on a host: the one whose snapshot.toml is newest.
 
-    Returns the full path to the latest checksum directory (YYYY/MM-DD/hash).
-    Uses reverse-sorted ls to find the newest date dir, then newest subdir.
+    Returns the snapshot directory's path on the host. The listing runs under sh, so the
+    glob and 'ls -t' work alike on BSD and GNU hosts whatever the login shell. It only
+    reads, so a dry run looks too.
     """
-    escaped = shlex.quote(str(captures_dir))
-
-    # Find latest YYYY/MM-DD/checksum in one command:
-    # ls -1d captures/YYYY/MM-DD/*/ sorted reverse, take first
-    find_cmd = (
-        f"find {escaped} -mindepth 3 -maxdepth 3 -type d"
-        f" | sort -r | head -1"
+    captures = PurePosixPath(captures_dir)
+    listing = (
+        f"ls -1t -- {shlex.quote(str(captures))}/{SNAPSHOT_TOML_GLOB} 2>/dev/null | head -1"
     )
 
     step(f"Finding the latest snapshot on {host}")
-    result = ssh_run(host, find_cmd, check=False, desc="Finding the latest snapshot")
-    if __dry_run__:
-        # Return a placeholder path for dry-run
-        return captures_dir / "YYYY" / "MM-DD" / "latest"
-
-    if result is None or result[0] != 0 or not result[1].strip():
-        if result and result[2]:
-            relay(result[2], 1, sys.stderr)
-        if result and result[0] == 255:
+    code, stdout, stderr = ssh_run(
+        host,
+        f"sh -c {shlex.quote(listing)}",
+        check=False,
+        desc="Finding the latest snapshot",
+        read_only=True,
+    )
+    if code != 0:
+        relay(stderr, 1, sys.stderr)
+        if code == 255:
             fatal(f"Finding the latest snapshot failed on {host}: ssh error (exit status 255)")
-        fatal(f"No snapshots found in {host}:{captures_dir}")
+        fatal(f"Finding the latest snapshot failed on {host} (exit status {code})")
 
-    latest = Path(result[1].strip())
-    say(f"latest: {latest.relative_to(captures_dir)}")
+    lines = stdout.strip().splitlines()
+    if not lines:
+        fatal(f"No snapshots found in {host}:{captures}")
+
+    latest = PurePosixPath(lines[0]).parent
+    problem = remote_path_problem(latest)
+    if problem:
+        fatal(f"Cannot use snapshot {latest} on {host}: {problem}", REMOTE_PATH_HINT)
+    try:
+        say(f"latest: {latest.relative_to(captures)}")
+    except ValueError:
+        say(f"latest: {latest}")
     return latest
 
 
@@ -960,9 +1026,9 @@ def load_config(root_dir, config_name):
         with open(config_file, "rb") as f:
             return tomllib.load(f)
     except FileNotFoundError:
-        fatal(f"Config file not found: {config_file}")
+        fatal(f"Config file not found: {root_shown(config_file)}")
     except tomllib.TOMLDecodeError as e:
-        fatal(f"Cannot parse {config_file}: {e}")
+        fatal(f"Cannot parse {root_shown(config_file)}: {e}")
 
 
 def toml_string(value):
@@ -985,45 +1051,40 @@ def toml_value(value):
     raise TypeError(f"Unsupported TOML value: {value!r}")
 
 
+def toml_key(key):
+    """Format a key or table name: bare if it has only letters, digits and '_', else quoted."""
+    if re.fullmatch(r"[A-Za-z0-9_]+", key):
+        return key
+    return toml_string(key)
+
+
 def toml_dumps(config):
-    """Format a dict of tables of values (one level deep) as TOML."""
+    """Format a dict as TOML: its plain values first, then each dict value as a table.
+
+    Nested dicts get dotted headers ([tar."ssh-keys"]). A table that holds only tables
+    gets no header of its own; an empty table keeps its header, so it still exists.
+    Raises TypeError for values toml_value() can't format.
+    """
     lines = []
-    for table, values in config.items():
-        lines.append(f"[{toml_string(table)}]")
+
+    def add_table(path, table):
+        values = {key: value for key, value in table.items() if not isinstance(value, dict)}
+        tables = {key: value for key, value in table.items() if isinstance(value, dict)}
+
+        if path and (values or not tables):
+            if lines:
+                lines.append("")
+            lines.append("[" + ".".join(toml_key(name) for name in path) + "]")
         for key, value in values.items():
-            lines.append(f"{toml_string(key)} = {toml_value(value)}")
-        lines.append("")
-    return "\n".join(lines)
+            lines.append(f"{toml_key(key)} = {toml_value(value)}")
 
+        for name, subtable in tables.items():
+            add_table([*path, name], subtable)
 
-def load_remote_config(root_host, root_path, config_name):
-    """Fetch and load a TOML config from a remote host."""
-    remote_src = f"{root_host}:{root_path / config_name}"
-    tmp = Path(tempfile.mktemp(suffix=".toml", prefix="remote-config-"))
-
-    step(f"Copying {config_name} from {root_host}")
-    try:
-        # A dry run only shows the rsync command, so it has no settings to return
-        result = rsync_copy(
-            remote_src, str(tmp), f"{config_name} from {root_host}", label=config_name
-        )
-        if __dry_run__:
-            note(
-                f"A dry run does not read {config_name} from {root_host}; "
-                "its settings are unknown"
-            )
-            return {}
-
-        if result is None or result[0] != 0:
-            fatal(f"Cannot copy {config_name} from {root_host}")
-
-        with open(tmp, "rb") as f:
-            return tomllib.load(f)
-    except tomllib.TOMLDecodeError as e:
-        fatal(f"Cannot parse {config_name} from {root_host}: {e}")
-    finally:
-        if tmp.exists():
-            tmp.unlink()
+    add_table([], config)
+    if not lines:
+        return ""
+    return "\n".join(lines) + "\n"
 
 
 def verify_capture_config(config, config_name, table="tar"):
@@ -1040,6 +1101,8 @@ def verify_capture_config(config, config_name, table="tar"):
 
     # Verify each category has required fields
     for category, data in tar_config.items():
+        if category in ("", ".", "..") or "/" in category:
+            fatal(f"{config_name}: [{table}] table name '{category}' can't name an archive")
         if not isinstance(data, dict):
             fatal(f"{config_name}: [{table}.{category}] must be a table")
 
@@ -1256,11 +1319,9 @@ def create_archives(tasks, compress="gzip"):
                     buffer[archive_path.name] = [*lines, *warnings]
                     results.append(archive_path)
                 except Exception as e:
+                    # capture() stops after the list below, without saving the snapshot
                     arcname = f"{category}{ext}"
-                    error(
-                        f"Cannot create {arcname}: {e}",
-                        "The snapshot will be missing this archive or hold part of it",
-                    )
+                    error(f"Cannot create {arcname}: {e}")
                     # A failed archive keeps its place in the list below
                     failed.add(arcname)
                     buffer[arcname] = [f"{arcname} (root: {root_display(task[1])})"]
@@ -1313,31 +1374,36 @@ def generate_snapshot_toml(
             checksums[category] = checksum
             pbar.update(1)
 
-    # Generate TOML content
-    toml_lines = ["#", "# Capture Configuration TOML", "#", "[tarball]"]
+    # [tarball]: the compression (when not gzip), the rollback extension and the digest.
+    # root, link and rollback are written as strings, as the capture config's values
+    # always were
+    tarball = {}
     if compress != "gzip":
-        toml_lines += [f'compress = "{compress}"  # tar compression type']
+        tarball["compress"] = compress
     if roll_ext:
-        toml_lines += [f'rollback = "{roll_ext}"  # rollback intermediate extension']
-    toml_lines += ['checksum = "sha256"  # checksum digest type']
-    toml_lines += [""]
+        tarball["rollback"] = str(roll_ext)
+    tarball["checksum"] = "sha256"
 
+    # One [tar.<name>] table per archive, in name order
+    tar_tables = {}
     for category in sorted(checksums.keys()):
-        checksum = checksums[category]
-        toml_lines += [f"[tar.{category}]"]
-
         meta = category_meta.get(category, {})
+        table = {}
         if "root" in meta:
-            toml_lines += [f'root = "{meta["root"]}"']
+            table["root"] = str(meta["root"])
         if meta.get("link"):
-            toml_lines += [f'link = "{meta["link"]}"']
+            table["link"] = str(meta["link"])
+        table["checksum"] = checksums[category]
+        tar_tables[category] = table
 
-        toml_lines += [f'checksum = "{checksum}"']
-        toml_lines += [""]
+    snapshot = {"tarball": tarball}
+    if tar_tables:
+        snapshot["tar"] = tar_tables
 
-    # Write TOML file
-    with open(toml_path, "w") as f:
-        f.write("\n".join(toml_lines))
+    # tomllib reads TOML as UTF-8, whatever the locale
+    with open(toml_path, "w", encoding="utf-8") as f:
+        f.write("# Snapshot written by snap.py capture\n")
+        f.write(toml_dumps(snapshot))
 
     # Combined checksum from all archive checksums
     combined = "".join(checksums[cat] for cat in sorted(checksums))
@@ -1348,8 +1414,13 @@ def generate_snapshot_toml(
 
 
 def archive_category(archive):
-    """Extract category name from archive filename."""
-    return archive.stem.replace(".tar", "")
+    """Return an archive's [tar.<name>] name: its file name without the tar extension."""
+    name = Path(archive).name
+    # Longest extensions first, so 'x.tar.gz' loses '.tar.gz', not just '.gz'
+    for ext in sorted((ext for ext, _ in COMPRESS_MAP.values()), key=len, reverse=True):
+        if name.endswith(ext) and len(name) > len(ext):
+            return name[: -len(ext)]
+    return Path(archive).stem
 
 
 def archive_entries(tar, report=True):
@@ -1399,7 +1470,11 @@ def archive_entries(tar, report=True):
 
 
 def archive_confirm(archive, compress="gzip", root=None):
-    """Ask user for confirmation to extract archive."""
+    """Show what restoring an archive changes, then ask before it is extracted.
+
+    Returns True for yes, False for no (declined or no answer), and None when the
+    archive can't be read or is unsafe (the error is reported here).
+    """
     if compress not in COMPRESS_MAP:
         compress_error(compress, DEFAULT_SNAPSHOT_TOML)
 
@@ -1415,7 +1490,7 @@ def archive_confirm(archive, compress="gzip", root=None):
     except (tarfile.TarError, ValueError, OSError) as e:
         error(f"Cannot restore {archive.name}: {e}")
         say("failed (see the error above)", 2)
-        return False
+        return None
 
     # Show each path the prompt would overwrite, then each it would add, relative to
     # the root in the header
@@ -1440,43 +1515,52 @@ def archive_confirm(archive, compress="gzip", root=None):
     return ask(question)
 
 
-def archive_select(available, selected_archives, tmpdir, compress="gzip"):
-    """Select which archives to restore based on patterns.
+def snapshot_archives(capture_dir, snapshot_config, ext):
+    """List the archives a snapshot can restore: its [tar.<name>] tables whose file exists.
 
-    Returns (archives, unmatched patterns); the caller reports the unmatched ones.
+    Archive files that snapshot.toml doesn't list are never restored, so they can't skip
+    the checksum check or extract without a root.
     """
-    if not selected_archives:
+    available = []
+    for name in snapshot_config.get("tar", {}):
+        # A name with a '/' would point outside the snapshot dir, and '.' or '..' would
+        # put its backups outside the backup directory
+        if name in ("", ".", ".."):
+            continue
+        archive = capture_dir / f"{name}{ext}"
+        if archive.parent == capture_dir and archive.is_file():
+            available.append(archive)
+    return available
+
+
+def archive_select(available, patterns):
+    """Select the archives to restore from `available` by name or glob pattern.
+
+    An empty pattern list selects every archive. Returns (archives, unmatched
+    patterns); the caller reports the unmatched ones.
+    """
+    if not patterns:
         return available, []
 
-    if compress not in COMPRESS_MAP:
-        compress_error(compress, DEFAULT_SNAPSHOT_TOML)
-
-    ext, _ = COMPRESS_MAP[compress]
-
+    names = {archive_category(archive): archive for archive in available}
     archives_to_restore = []
     matched_names = set()
     unmatched = []
 
-    for pattern in selected_archives:
-        # Try exact match first
-        archive_file = tmpdir / f"{pattern}{ext}"
-        if archive_file.exists():
-            if pattern not in matched_names:
-                archives_to_restore.append(archive_file)
-                matched_names.add(pattern)
+    for pattern in patterns:
+        # An exact name first, then a glob over every archive in the snapshot; a match
+        # already selected by an earlier pattern still counts
+        if pattern in names:
+            matches = [pattern]
         else:
-            # Try glob pattern match
-            pattern_matched = False
-            for archive in available:
-                archive_name = archive_category(archive)
-                if fnmatch.fnmatch(archive_name, pattern):
-                    # A match already selected by an earlier pattern still counts
-                    pattern_matched = True
-                    if archive_name not in matched_names:
-                        archives_to_restore.append(archive)
-                        matched_names.add(archive_name)
-            if not pattern_matched:
-                unmatched.append(pattern)
+            matches = [name for name in names if fnmatch.fnmatch(name, pattern)]
+        if not matches:
+            unmatched.append(pattern)
+
+        for name in matches:
+            if name not in matched_names:
+                archives_to_restore.append(names[name])
+                matched_names.add(name)
 
     return archives_to_restore, unmatched
 
@@ -1615,21 +1699,34 @@ def backup_rotation_path(rollbackd):
     return prevbackd
 
 
-def restore_category(archive, root, roll_ext, compress="gzip"):
+def backup_dir(root_path, roll_ext):
+    """Return a root's backup directory, <root><roll_ext>; each archive gets a subdirectory."""
+    return Path(str(root_path) + roll_ext)
+
+
+def restore_category(archive, root, roll_ext, compress="gzip", rotated=None):
     """Transactionally restore a single category with rollback on failure.
 
     Replaces only the paths captured in the archive, one at a time:
-    1. Backs up the existing path (copy, not move)
+    1. Backs up the existing path (copy, not move) to <root><roll_ext>/<archive name>
     2. Removes the original
     3. Extracts the captured path from the archive
     4. On any error or Ctrl-C: restores every touched path from backup
+
+    rotated is the set of backup directories already moved aside in this restore run.
+    The first archive with a given root moves that root's old backup directory aside;
+    later ones reuse the fresh one, so they never rotate each other's backups. None
+    makes this call a run of its own.
     """
     if compress not in COMPRESS_MAP:
         compress_error(compress, DEFAULT_SNAPSHOT_TOML, stop=False)
         return False
+    if rotated is None:
+        rotated = set()
 
     root_path = expand_path(root)
-    rollbackd = Path(str(root_path) + roll_ext)
+    backups = backup_dir(root_path, roll_ext)
+    rollbackd = backups / archive_category(archive)
 
     # The item header comes first, so an error opening the archive appears under it
     say(f"{archive.name} (root: {root_path}, backup: {rollbackd})")
@@ -1656,23 +1753,30 @@ def restore_category(archive, root, roll_ext, compress="gzip"):
     for line in replaces + adds:
         say(line, 2)
 
+    # The same root can be spelled two ways (a symlink, '..'); rotate it once all the same
+    rotation_key = os.path.realpath(backups)
+    rotate = rotation_key not in rotated
     if __dry_run__:
         # Show the rotation a real run would make; nothing is renamed
-        if __verbose__:
+        rotated.add(rotation_key)
+        if __verbose__ and rotate:
             try:
-                if rollbackd.exists():
-                    say(f"rotate: {rollbackd} -> {backup_rotation_path(rollbackd)}", 2)
+                if backups.exists():
+                    say(f"rotate: {backups} -> {backup_rotation_path(backups)}", 2)
             except OSError:
                 pass  # A real run reports it when it creates the backup directory
         return True
 
-    # Move any existing backup aside, then create a fresh backup directory
+    # Move the root's old backup directory aside (once per run), then create this
+    # archive's subdirectory in the fresh one
     try:
-        if rollbackd.exists():
-            prevbackd = backup_rotation_path(rollbackd)
-            rollbackd.rename(prevbackd)
-            if __verbose__:
-                say(f"rotate: {rollbackd} -> {prevbackd}", 2)
+        if rotate:
+            if backups.exists():
+                prevbackd = backup_rotation_path(backups)
+                backups.rename(prevbackd)
+                if __verbose__:
+                    say(f"rotate: {backups} -> {prevbackd}", 2)
+            rotated.add(rotation_key)
         # Creates rollbackd and any missing parents with their parent's owner
         make_parents(rollbackd / "entry")
     except OSError as e:
@@ -1766,8 +1870,19 @@ def restore_rollback(name, root_path, rollbackd, touched, cause):
     ok(f"{name} rolled back")
 
 
-def extract_archives(archives, skip_confirm=False, root_map=None, compress="gzip"):
-    """Extract multiple archives in parallel (after confirmation)."""
+def extract_archives(
+    archives, skip_confirm=False, root_map=None, compress="gzip", restored=None, failed=None
+):
+    """Extract multiple archives in parallel (after confirmation); returns how many.
+
+    When the caller passes lists, `restored` gets each extracted archive and `failed`
+    each one that can't be read or extracted, in the given order. Declined archives
+    are in neither.
+    """
+    if restored is None:
+        restored = []
+    if failed is None:
+        failed = []
     if not archives:
         return 0
 
@@ -1775,54 +1890,61 @@ def extract_archives(archives, skip_confirm=False, root_map=None, compress="gzip
         root_map = {}
 
     # First, collect confirmations sequentially (unless skipped)
-    confirmed = []
+    confirmed, unreadable = [], set()
     if skip_confirm:
-        confirmed = archives
+        confirmed = list(archives)
     else:
         for archive in archives:
             category = archive_category(archive)
             root = root_map.get(category)
-            if archive_confirm(archive, compress, root):
+            answer = archive_confirm(archive, compress, root)
+            if answer is None:
+                unreadable.add(archive)
+            elif answer:
                 confirmed.append(archive)
 
-    if not confirmed:
-        return 0
-
     # Extract confirmed archives in parallel (the caller printed the step)
-    success_count = 0
+    extracted = set()
+    if confirmed:
+        with ccft.ThreadPoolExecutor(max_workers=len(confirmed)) as exc:
+            # Build futures with root for each archive
+            futures = {}
+            for archive in confirmed:
+                category = archive_category(archive)
+                root = root_map.get(category)
+                futures[exc.submit(archive_extract, archive, compress, root)] = archive
 
-    with ccft.ThreadPoolExecutor(max_workers=len(confirmed)) as exc:
-        # Build futures with root for each archive
-        futures = {}
-        for archive in confirmed:
-            category = archive_category(archive)
-            root = root_map.get(category)
-            futures[exc.submit(archive_extract, archive, compress, root)] = archive
+            with dtqdm(len(confirmed), "Extracting archives", autorefresh=True) as pbar:
+                for future in ccft.as_completed(futures):
+                    archive = futures[future]
+                    try:
+                        if future.result():
+                            extracted.add(archive)
+                    except Exception as e:
+                        error(f"Cannot extract {archive.name}: {e}")
+                    pbar.update(1)
 
-        with dtqdm(len(confirmed), "Extracting archives", autorefresh=True) as pbar:
-            for future in ccft.as_completed(futures):
-                archive = futures[future]
-                try:
-                    if future.result():
-                        success_count += 1
-                except Exception as e:
-                    error(f"Cannot extract {archive.name}: {e}")
-                pbar.update(1)
+        # Step result: the prompts above have no results of their own
+        total = plural(len(confirmed), "archive")
+        if len(extracted) == len(confirmed):
+            ok(f"{total} extracted")
+        else:
+            say(f"{len(extracted)} of {total} extracted")
 
-    # Step result: the prompts above have no results of their own
-    total = plural(len(confirmed), "archive")
-    if success_count == len(confirmed):
-        ok(f"{total} extracted")
-    else:
-        say(f"{success_count} of {total} extracted")
-
-    return success_count
+    for archive in archives:
+        if archive in extracted:
+            restored.append(archive)
+        elif archive in unreadable or archive in confirmed:
+            failed.append(archive)
+    return len(extracted)
 
 
-def create_symlinks(snapshot_config):
-    """Create symlinks from link -> root for each category with a link field.
+def create_symlinks(snapshot_config, restored):
+    """Create symlinks from link -> root for the restored archives with a 'link' key.
 
-    Returns the number of links created.
+    restored holds the [tar.<name>] names of the archives this run restored (in a dry
+    run, the ones it would restore); other archives' links are left alone. Returns the
+    number of links created.
     """
     tar_sections = snapshot_config.get("tar", {})
     if not tar_sections:
@@ -1831,6 +1953,8 @@ def create_symlinks(snapshot_config):
     symlinks_created = []
     started = False
     for category, section_data in tar_sections.items():
+        if category not in restored:
+            continue
         link = section_data.get("link")
         root = section_data.get("root")
 
@@ -2024,6 +2148,199 @@ def verify_archives_from_toml(capture_dir, warn_unverified=True):
     return snapshot_config
 
 
+# --- Remote Work Directories --- #
+
+
+def remote_workdir(host, purpose, subdirs=()):
+    """Create a private work directory on a host, with its subdirectories; returns its path.
+
+    mktemp -d makes it 0700 with an unpredictable name under the host's $TMPDIR (or /tmp),
+    and prints the path. subdirs are created in it with one mkdir -p. A dry run shows the
+    commands and returns a named placeholder. The caller removes the directory with
+    remote_workdir_remove() in a finally block.
+    """
+    step(f"Creating work directory on {host}")
+    template = f"${{TMPDIR:-/tmp}}/snap-{purpose}.XXXXXXXX"
+    _, stdout, _ = ssh_run(host, f'mktemp -d "{template}"', desc="Creating the work directory")
+
+    if __dry_run__:
+        work_dir = PurePosixPath(DRY_RUN_WORK_DIR)
+    else:
+        # The path is the last line (a login script may print before it). Anything but
+        # an absolute snap-<purpose>.* path is never used, so rm -rf only gets mktemp's
+        lines = stdout.strip().splitlines()
+        work_dir = PurePosixPath(lines[-1].strip() if lines else "")
+        usable = work_dir.is_absolute() and work_dir.name.startswith(f"snap-{purpose}.")
+        if not usable or remote_path_problem(work_dir):
+            fatal(
+                f"Cannot create a work directory on {host}: mktemp printed no usable path",
+                labeled("output:", stdout.strip() or "(none)"),
+            )
+
+    created = False
+    try:
+        if subdirs:
+            paths = " ".join(shlex.quote(str(work_dir / name)) for name in subdirs)
+            ssh_run(host, f"mkdir -p {paths}", desc="Creating the work directory")
+        created = True
+    finally:
+        if not created:
+            remote_workdir_remove(host, work_dir, report=False)
+    return work_dir
+
+
+def remote_workdir_remove(host, work_dir, report=True):
+    """Remove a work directory from a host, best effort.
+
+    After a run that went well (report=True) it prints its step, and a failed rm is a
+    Warning. After a failure or Ctrl-C (report=False) it prints nothing, so the run still
+    ends with its own Error block, and never raises for ssh problems.
+    """
+    command = f"rm -rf {shlex.quote(str(work_dir))}"
+
+    if report:
+        step(f"Removing work directory from {host}")
+        code, _, stderr = ssh_run(
+            host, command, check=False, desc="Removing the work directory"
+        )
+        if code != 0:
+            relay(stderr, 1, sys.stderr)
+            cause = "ssh error (exit status 255)" if code == 255 else f"exit status {code}"
+            warn(f"Cannot remove work directory {work_dir} from {host}: {cause}")
+        return
+
+    if __dry_run__:
+        return  # Nothing was created
+    try:
+        subprocess.run(
+            ssh_argv(host, command),
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=COMMAND_TIMEOUT,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        pass  # Best effort; the run is already failing
+
+
+# --- Remote snap.py Runs --- #
+
+# snap.py's name in a host's work directory
+REMOTE_SCRIPT = "snap.py"
+
+
+def remote_scripts(root_dir, config, host):
+    """List the before and after scripts to copy to a host for --run-scripts.
+
+    Returns their paths relative to the snap root. Each is copied to the same path in the
+    work directory, so snap.py there (-r <work dir>) finds it where the config says.
+    Missing scripts are left out; snap.py on the host warns about them. A path outside the
+    snap root (absolute, or with '..') has no place in the work directory, so it stops
+    the run before the host is touched.
+    """
+    table = config.get("scripts") if isinstance(config, dict) else None
+    if not isinstance(table, dict):
+        return []
+
+    scripts = []
+    for when in ("before", "after"):
+        entries = table.get(when) or []
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if not isinstance(entry, str):
+                continue
+            path = PurePosixPath(entry)
+            if path.is_absolute() or ".." in path.parts:
+                fatal(
+                    f"Cannot copy script {entry} to {host}: it is outside the snap root",
+                    f"Move it into the snap root (for example scripts/{path.name}) "
+                    "and list that path",
+                )
+            if path not in scripts and (root_dir / path).is_file():
+                scripts.append(path)
+    return scripts
+
+
+def remote_layout(base, scripts):
+    """Return a work directory's subdirectories: base, then the scripts' parent dirs."""
+    subdirs = list(base)
+    for script in scripts:
+        parent = str(script.parent)
+        if parent != "." and parent not in subdirs:
+            subdirs.append(parent)
+    return subdirs
+
+
+def remote_copies(root_dir, host, work_dir, config_src, config_name, scripts):
+    """List the copies (source, dest, desc) that give a work directory what snap.py needs.
+
+    That is snap.py, the config (config_src, copied to config_name) and the scripts at
+    their paths relative to the snap root.
+    """
+    dest = f"{host}:{work_dir}"
+    transfers = [
+        (str(__script__), f"{dest}/{REMOTE_SCRIPT}", REMOTE_SCRIPT),
+        (str(config_src), f"{dest}/{config_name}", config_name),
+    ]
+    for script in scripts:
+        transfers.append((str(root_dir / script), f"{dest}/{script}", str(script)))
+    return transfers
+
+
+def remote_child(work_dir, command, *options, private=False):
+    """Build the shell line that runs 'snap.py <command> [options]' in a host's work dir.
+
+    python3 comes from the host's PATH (this machine's interpreter path means nothing
+    there). --verbose passes through; the caller passes the command's other flags.
+    private=True runs it under umask 077, so what it writes stays private to the user,
+    even if it outlives an interrupted run and recreates the work directory.
+    """
+    argv = ["python3", REMOTE_SCRIPT, command, *(str(option) for option in options)]
+    if __verbose__:
+        argv.append("--verbose")
+    line = f"cd {shlex.quote(str(work_dir))} && {shlex.join(argv)}"
+    if private:
+        line = f"umask 077 && {line}"
+    return line
+
+
+def restore_child_config(restore_config, table="tar"):
+    """Return what restore() reads from a restore config, for a snap.py run with -t.
+
+    That is the [tar] 'archives' key (a missing or empty one becomes [], which skips the
+    archive restore just the same) and the before and after [scripts]. table is the name
+    the user's config gives the [tar] table ('restore.tar' in migrate.toml); it goes in
+    [snap] so the other run's messages name it the same way.
+    """
+    archives = restore_config.get("tar", {}).get("archives") or []
+    child_config = {"tar": {"archives": archives}}
+    if table != "tar":
+        child_config["snap"] = {"table": table}
+    if "scripts" in restore_config:
+        scripts = restore_config["scripts"]
+        child_config["scripts"] = {
+            when: scripts[when] for when in ("before", "after") if when in scripts
+        }
+    return child_config
+
+
+def write_config_toml(config, config_name, purpose):
+    """Write a config to a temporary TOML file and return its path.
+
+    config_name and purpose ('the remote capture') name it in the error line.
+    """
+    try:
+        text = toml_dumps(config)
+    except TypeError as e:
+        fatal(f"Cannot write {config_name} for {purpose}: {e}")
+
+    fd, tmp = tempfile.mkstemp(prefix=f"{Path(config_name).stem}-", suffix=".toml")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(text)
+    return Path(tmp)
+
+
 # --- Capture Logic --- #
 
 
@@ -2065,10 +2382,18 @@ def capture(args, root_dir, outdir, config, config_name=DEFAULT_CONFIG_CAPTURE, 
         # Store root and link for tarball TOML
         category_meta[category] = {"root": root, "link": data.get("link")}
 
-    # Create archives in parallel
+    # Create archives in parallel; a snapshot missing any of them is never saved (the
+    # caller removes the staging dir)
     if not tasks:
         warn(f"{config_name}: lists no paths; the snapshot has no archives")
-    create_archives(tasks, compress)
+    created = create_archives(tasks, compress)
+    if len(created) < len(tasks):
+        count = f"{len(tasks) - len(created)} of {plural(len(tasks), 'archive')}"
+        if __dry_run__:
+            dry_run_stop(
+                f"Capture would fail: {count} cannot be created; a real run saves no snapshot"
+            )
+        fatal(f"Capture failed: {count} could not be created; no snapshot was saved")
 
     # Generate snapshot TOML with checksum
     step(f"Writing {DEFAULT_SNAPSHOT_TOML}")
@@ -2092,158 +2417,93 @@ def capture(args, root_dir, outdir, config, config_name=DEFAULT_CONFIG_CAPTURE, 
         # Move snapshot TOML to checksum directory
         toml_path.rename(dst_dir / DEFAULT_SNAPSHOT_TOML)
 
-    # Run after-capture scripts if requested
+    # Run after-capture scripts from the same config as the archives and before scripts
     if args.run_scripts:
-        # Determine which config to use
-        scripts_config_name = args.config_toml if args.config_toml else DEFAULT_CONFIG_CAPTURE
-        scripts_config = load_config(root_dir, scripts_config_name)
-        # Skip verification for scripts-only config (may not have [tar] section)
-        run_scripts(root_dir, scripts_config, "after", working_dir=dst_dir, phase=phase)
+        run_scripts(root_dir, config, "after", working_dir=dst_dir, phase=phase)
 
     return dst_dir
 
 
 def capture_deploy(capture_dir, dest_host, intended_path):
-    """Copy capture to remote host."""
-    step(f"Copying snapshot to {dest_host}")
+    """Copy a snapshot directory, with every file in it, to intended_path on a host.
 
-    # Ensure remote directory exists
-    escaped_path = shlex.quote(str(intended_path))
-    ssh_run(dest_host, f"mkdir -p {escaped_path}", desc="Creating the snapshot directory")
-
-    # Copy all tar archives and snapshot TOML
-    transfers = []
-
-    # Add snapshot TOML
-    toml_path = capture_dir / DEFAULT_SNAPSHOT_TOML
-    if toml_path.exists():
-        transfers.append(
-            (str(toml_path), f"{dest_host}:{intended_path}/", DEFAULT_SNAPSHOT_TOML)
-        )
-
-        # Load compression type from snapshot TOML
-        with open(toml_path, "rb") as f:
-            snapshot_config = tomllib.load(f)
-        compress_type = snapshot_config.get("tarball", {}).get("compress", "gzip")
-        if compress_type not in COMPRESS_MAP:
-            compress_error(compress_type, DEFAULT_SNAPSHOT_TOML)
-        ext, _ = COMPRESS_MAP[compress_type]
-
-        # Add all tar archives with the specified compression type
-        for archive in capture_dir.glob(f"*{ext}"):
-            transfers.append(
-                (str(archive), f"{dest_host}:{intended_path}/", archive.name)
-            )
-    else:
+    Files that after-capture scripts wrote into the snapshot (a Brewfile) go with it.
+    """
+    if not (capture_dir / DEFAULT_SNAPSHOT_TOML).exists():
         fatal(f"{DEFAULT_SNAPSHOT_TOML} not found in {capture_dir}")
 
-    if not transfers:
-        fatal("No snapshot files to copy")
+    step(f"Copying snapshot to {dest_host}")
 
-    success_count = rsync_parallel(transfers)
-    if success_count < len(transfers):
-        failed = len(transfers) - success_count
-        fatal(f"Copying to {dest_host} failed for {failed} of {plural(len(transfers), 'file')}")
+    # rsync creates only the last directory of its destination
+    escaped_path = shlex.quote(str(intended_path))
+    ssh_run(dest_host, f"mkdir -p {escaped_path}", desc="Creating the snapshot directory")
+    rsync_copy(
+        f"{capture_dir}/",
+        f"{dest_host}:{intended_path}/",
+        f"the snapshot to {dest_host}",
+        label="snapshot",
+    )
 
 
 def write_capture_toml(capture_config):
-    """Write capture_config to a temporary capture.toml file."""
-    tmp = Path(tempfile.mktemp(suffix=".toml", prefix="capture-"))
-    lines = []
+    """Write capture_config to a temporary capture.toml file and return its path."""
+    return write_config_toml(capture_config, DEFAULT_CONFIG_CAPTURE, "the remote capture")
 
-    tarball = capture_config.get("tarball", {})
-    if tarball:
-        lines.append("[tarball]")
-        for key, val in tarball.items():
-            lines.append(
-                f'{key} = "{val}"' if isinstance(val, str) else f"{key} = {val}"
-            )
-        lines.append("")
 
-    for category, data in capture_config.get("tar", {}).items():
-        lines.append(f"[tar.{category}]")
-        for key, val in data.items():
-            if isinstance(val, str):
-                lines.append(f'{key} = "{val}"')
-            elif isinstance(val, list):
-                items = ", ".join(f'"{v}"' for v in val)
-                lines.append(f"{key} = [{items}]")
-        lines.append("")
+def remote_snapshot_id(stdout, out_dir, host):
+    """Return the snapshot id from 'ls -d <out_dir>/*/' output on a host.
 
-    scripts = capture_config.get("scripts", {})
-    if scripts:
-        lines.append("[scripts]")
-        for when, script_list in scripts.items():
-            items = ", ".join(f'"{s}"' for s in script_list)
-            lines.append(f"{when} = [{items}]")
-        lines.append("")
-
-    tmp.write_text("\n".join(lines))
-    return tmp
+    out/ holds only the snapshot the capture saved, so exactly one directory is listed.
+    Its name becomes a local directory name, so it must be a plain name.
+    """
+    lines = [line.strip() for line in stdout.splitlines() if line.strip()]
+    found = [PurePosixPath(line) for line in lines if PurePosixPath(line).parent == out_dir]
+    if len(found) != 1 or not re.fullmatch(r"\w[\w.-]*", found[0].name):
+        fatal(
+            f"Cannot find the snapshot on {host}: {out_dir} should hold one snapshot directory",
+            labeled("output:", "\n".join(lines) or "(none)"),
+        )
+    return found[0].name
 
 
 def remote_capture(args, root_dir, source_host, capture_config=None):
-    """Execute capture on a remote host and pull results back.
+    """Run snap.py capture on a host, then copy the snapshot it saved into a local temp dir.
 
-    If capture_config is None, transfers existing capture.toml from root_dir.
-    If capture_config is provided (e.g. from migrate), writes a temp TOML.
+    Without capture_config the host gets the capture config from -t or the default in
+    root_dir; migrate passes its [capture.*] half, which is written to a temp TOML. With
+    --run-scripts the host also gets the config's scripts, and snap.py there runs them.
+    Returns (the snapshot copy, named after the host's snapshot id; the temp dir to
+    remove, or None in a dry run). The work directory on the host is removed however the
+    capture ends.
     """
-
-    # Set up remote working directory
-    remote_work_dir = remote_mkdir(source_host, "capture")
-
-    # Determine config to transfer
-    root_host = getattr(args, "root_host", None)
-
-    if capture_config:
-        # Migrate path: write in-memory config to temp TOML
-        tmp_capture_toml = write_capture_toml(capture_config)
-        config_name = DEFAULT_CONFIG_CAPTURE
-    else:
-        # Standalone capture: load config for script discovery
+    # The config is read first, so a config problem stops before the host is touched
+    if capture_config is None:
         config_name = getattr(args, "config_toml", None) or DEFAULT_CONFIG_CAPTURE
-        if root_host:
-            capture_config = load_remote_config(root_host, root_dir, config_name)
-        else:
-            capture_config = load_config(root_dir, config_name)
+        capture_config = load_config(root_dir, config_name)
         verify_capture_config(capture_config, config_name)
-        tmp_capture_toml = None
+        config_src = root_dir / config_name
+    else:
+        config_src = None  # migrate: written to a temp TOML below
+    scripts = []
+    if args.run_scripts:
+        scripts = remote_scripts(root_dir, capture_config, source_host)
 
+    tmp_capture_toml = None
+    work_dir = None
+    tmpdir = None
+    done = False
     try:
-        if tmp_capture_toml:
-            config_src = str(tmp_capture_toml)
-        elif root_host:
-            config_src = f"{root_host}:{root_dir / config_name}"
-        else:
-            config_src = str(root_dir / config_name)
+        if config_src is None:
+            tmp_capture_toml = write_capture_toml(capture_config)
+            config_src = tmp_capture_toml
 
-        transfers = [
-            (str(__script__), f"{source_host}:{remote_work_dir}/", __script__.name),
-            (
-                config_src,
-                f"{source_host}:{remote_work_dir}/{DEFAULT_CONFIG_CAPTURE}",
-                DEFAULT_CONFIG_CAPTURE,
-            ),
-        ]
+        # Set up remote working directory
+        layout = remote_layout(["configs", "scripts"], scripts)
+        work_dir = remote_workdir(source_host, "capture", layout)
 
-        # Transfer all capture scripts (before and after) to source
-        scripts = capture_config.get("scripts", {})
-        if args.run_scripts:
-            for when in ("before", "after"):
-                for run_script_path in scripts.get(when, []):
-                    if root_host:
-                        script_src = f"{root_host}:{root_dir / run_script_path}"
-                    else:
-                        script_path = root_dir / run_script_path
-                        if not script_path.exists():
-                            warn(f"Script {run_script_path} not found in {root_dir}; skipping it")
-                            continue
-                        script_src = str(script_path)
-                    script_name = Path(run_script_path).name
-                    transfers.append(
-                        (script_src, f"{source_host}:{remote_work_dir}/", script_name)
-                    )
-
+        transfers = remote_copies(
+            root_dir, source_host, work_dir, config_src, DEFAULT_CONFIG_CAPTURE, scripts
+        )
         step(f"Copying {plural(len(transfers), 'file')} to {source_host}")
         success_count = rsync_parallel(transfers)
         if success_count < len(transfers):
@@ -2252,68 +2512,70 @@ def remote_capture(args, root_dir, source_host, capture_config=None):
                 f"Copying to {source_host} failed for {failed} of "
                 f"{plural(len(transfers), 'file')}"
             )
+
+        # snap.py on the host saves the snapshot in out/, and runs the scripts itself.
+        # It takes as long as the archives do: no wall-clock limit
+        out_dir = work_dir / "out"
+        options = ["-r", work_dir, "-t", DEFAULT_CONFIG_CAPTURE, "--to", out_dir]
+        if args.run_scripts:
+            options.append("--run-scripts")
+        step(f"Running capture on {source_host}")
+        code, stdout, stderr = ssh_run(
+            source_host,
+            remote_child(work_dir, "capture", *options, private=True),
+            check=False,
+            desc="Capture",
+            timeout=None,
+        )
+
+        # Show the remote capture's own output: nested under its host when it succeeded
+        # (its Warnings first, so its final line comes last), or ahead of the Error line
+        # when it failed
+        if code == 0:
+            if stdout.strip() or stderr.strip():
+                say(f"output from {source_host}:")
+            relay(stderr, 2, sys.stderr)
+            relay(stdout, 2)
+        else:
+            relay(stdout, 1)
+            relay(stderr, 1, sys.stderr)
+        if code == 255:
+            fatal(f"Capture failed on {source_host}: ssh error (exit status 255)")
+        if code != 0:
+            fatal(f"Capture failed on {source_host} (exit status {code})")
+
+        # Find the snapshot in out/; a dry run shows the listing it would make
+        step(f"Copying snapshot from {source_host}")
+        _, stdout, _ = ssh_run(
+            source_host,
+            f"ls -d {shlex.quote(str(out_dir))}/*/",
+            desc="Finding the snapshot",
+        )
+        if __dry_run__:
+            snapshot_id = DRY_RUN_CHECKSUM
+        else:
+            snapshot_id = remote_snapshot_id(stdout, out_dir, source_host)
+        tmpdir = remote_pull_dir("remote-capture")
+
+        # Copy the whole snapshot directory, with any files the after scripts wrote
+        snapshot = tmpdir / snapshot_id
+        rsync_copy(
+            f"{source_host}:{out_dir / snapshot_id}/",
+            f"{snapshot}/",
+            f"the snapshot from {source_host}",
+            label="snapshot",
+        )
+        done = True
     finally:
         if tmp_capture_toml and tmp_capture_toml.exists():
             tmp_capture_toml.unlink()
-
-    # Run capture on source (snap capture handles before/after scripts)
-    escaped_dir = shlex.quote(remote_work_dir)
-    program = f"{sys.executable} {__script__.name}"
-    capture_cmd = f"cd {escaped_dir} && {program} capture --to {escaped_dir}"
-    if args.run_scripts:
-        capture_cmd += " --run-scripts"
-    step(f"Running capture on {source_host}")
-    result = ssh_run(source_host, capture_cmd, check=False, desc="Capture")
-
-    # Show the remote capture's own output: nested under its host when it succeeded, or
-    # ahead of the Error line when it failed
-    if result and result[0] == 0:
-        if result[1].strip() or result[2].strip():
-            say(f"output from {source_host}:")
-        relay(result[1], 2)
-        relay(result[2], 2, sys.stderr)
-    elif result:
-        relay(result[1], 1)
-        relay(result[2], 1, sys.stderr)
-    if result and result[0] == 255:
-        fatal(f"Capture failed on {source_host}: ssh error (exit status 255)")
-    if result and result[0] != 0:
-        fatal(f"Capture failed on {source_host} (exit status {result[0]})")
-
-    # Pull capture to local temp directory
-    if __dry_run__:
-        tmpdir = Path(DRY_RUN_DIR) / "remote-capture"
-    else:
-        tmpdir = Path(tempfile.mkdtemp(prefix=f"{__script__.stem}-"))
-
-    # Find the capture directory on source (date/checksum structure)
-    step(f"Copying snapshot from {source_host}")
-    result = ssh_run(
-        source_host,
-        f"ls -d {escaped_dir}/*/",
-        desc="Finding the snapshot",
-    )
-    if result is not None and result[0] != 0:
-        if tmpdir.exists():
+        # A failed capture leaves no pulled copy behind
+        if not done and tmpdir and not __dry_run__ and tmpdir.exists():
             shutil.rmtree(tmpdir)
-        fatal(f"Cannot find the snapshot on {source_host}")
+        if work_dir is not None:
+            remote_workdir_remove(source_host, work_dir, report=done)
 
-    # Pull capture files
-    remote_capture_dir = result[1].strip() if result else f"{escaped_dir}/*/"
-    host_path = f"{source_host}:{remote_capture_dir}"
-    pull_result = rsync_copy(
-        host_path, str(tmpdir) + "/", f"the snapshot from {source_host}", label="snapshot"
-    )
-    if pull_result is not None and pull_result[0] != 0:
-        if tmpdir.exists():
-            shutil.rmtree(tmpdir)
-        fatal(f"Cannot copy the snapshot from {source_host}")
-
-    # Cleanup source working directory
-    step(f"Removing work directory from {source_host}")
-    ssh_run(source_host, f"rm -rf {escaped_dir}", desc="Removing the work directory")
-
-    return tmpdir, tmpdir if not __dry_run__ else None
+    return snapshot, tmpdir if not __dry_run__ else None
 
 
 # --- Restore Logic --- #
@@ -2360,8 +2622,9 @@ def archive_writable(archive, root, roll_ext):
         return False  # Unreadable archive, which root can read
 
     if roll_ext:
-        # Rotating and creating the backup dir happen in its parent
-        if not path_writable(Path(str(root_path) + roll_ext).parent):
+        # Rotating and creating <root><roll_ext> happen in its parent; each archive's
+        # subdirectory is then created inside the fresh one
+        if not path_writable(backup_dir(root_path, roll_ext).parent):
             return False
         for entry in groups:
             entry_path = root_path / entry
@@ -2397,9 +2660,11 @@ def restore_needs_sudo(selected, root_map, roll_ext, snapshot_config):
         if not archive_writable(archive, root, roll_ext):
             return archive.name
 
-    # create_symlinks() writes a link for every category with one
-    for section in snapshot_config.get("tar", {}).values():
-        link, root = section.get("link"), section.get("root")
+    # create_symlinks() writes the links of the archives it restores, at most these
+    tar_tables = snapshot_config.get("tar", {})
+    for archive in selected:
+        table = tar_tables.get(archive_category(archive), {})
+        link, root = table.get("link"), table.get("root")
         if link and root:
             link_path = expand_path(link)
             if not os.path.lexists(link_path) and not path_writable(link_path.parent):
@@ -2407,33 +2672,34 @@ def restore_needs_sudo(selected, root_map, roll_ext, snapshot_config):
     return False
 
 
-def sudo_restore(args, root_dir, capture_dir, restore_config, snapshot_config):
+# Variables never passed to the sudo run (see sudo_restore)
+SUDO_ENV_BLOCKED = re.compile(r"PATH|IFS|ENV|BASH_ENV|SHELLOPTS|PYTHON\w*|LD_\w*|DYLD_\w*")
+
+
+def sudo_restore(args, root_dir, capture_dir, restore_config, snapshot_config, table="tar"):
     """Run this restore again under sudo, then exit with its status.
 
     The child restores from the local capture_dir with the same restore config, so
     remote pulls and captures aren't repeated as root and the caller's temp dirs
-    still get cleaned up. sudo resets the environment, so HOME and the variables
-    used by roots and links are passed through, or '$HOME' and '~' would expand
-    to root's home.
+    still get cleaned up. Its snap root is the local root_dir (for a remote snap root,
+    the local copy), so it never reads a host as root. sudo resets the environment, so
+    HOME and the variables used by roots and links are passed through, or '$HOME' and
+    '~' would expand to root's home.
     """
     names = {"HOME"}
     for section in snapshot_config.get("tar", {}).values():
         for key in ("root", "link"):
             names.update(re.findall(r"\$\{?(\w+)", str(section.get(key, ""))))
+    # Never pass variables that change what the root run executes or loads, even if
+    # snapshot.toml (which may come from another host) names them
+    names = {name for name in names if not SUDO_ENV_BLOCKED.fullmatch(name)}
     env = {name: os.environ[name] for name in names if name in os.environ}
     env.setdefault("HOME", str(Path.home()))
     env_args = [f"{name}={value}" for name, value in sorted(env.items())]
 
     # Pass what restore() reads from the config through a temp file (it may come
     # from migrate.toml)
-    archives = restore_config.get("tar", {}).get("archives") or []
-    child_config = {"tar": {"archives": archives}}
-    scripts = restore_config.get("scripts", {})
-    child_scripts = {when: scripts[when] for when in ("before", "after") if when in scripts}
-    if "scripts" in restore_config:
-        child_config["scripts"] = child_scripts
-    root_host = getattr(args, "root_host", None)
-    root_arg = f"{root_host}:{root_dir}" if root_host else str(root_dir)
+    child_config = restore_child_config(restore_config, table)
 
     fd, config_path = tempfile.mkstemp(prefix=f"{__script__.stem}-", suffix=".toml")
     try:
@@ -2447,7 +2713,7 @@ def sudo_restore(args, root_dir, capture_dir, restore_config, snapshot_config):
                 )
 
         cmd = ["sudo", "env", *env_args, sys.executable, str(__script__), "restore"]
-        cmd += ["--from", str(capture_dir), "-r", root_arg, "-t", config_path]
+        cmd += ["--from", str(capture_dir), "-r", str(root_dir), "-t", config_path]
         if getattr(args, "disable_rollback", False):
             cmd.append("--disable-rollback")
         if getattr(args, "run_scripts", False):
@@ -2501,6 +2767,41 @@ def sudo_restore(args, root_dir, capture_dir, restore_config, snapshot_config):
     sys.exit(code)
 
 
+def restore_stop(args, selected, done, failed, checked):
+    """Stop a restore in which archives failed, with one Error block (exit 1).
+
+    done and failed are the restored and failed archives. checked says whether the
+    snapshot has checksums, which a real run checks first and a dry run doesn't.
+    """
+    not_run = "not run: symlinks"
+    stops = "stop before the symlinks"
+    if args.run_scripts:
+        not_run += ", after scripts"
+        stops += ", after scripts"
+
+    count = f"{len(failed)} of {plural(len(selected), 'archive')}"
+    failed_names = ", ".join(archive.name for archive in failed)
+
+    # A dry run only previewed the others, so it claims nothing was restored; a real
+    # run restores the others first, then stops where this one does
+    if __dry_run__:
+        if done:
+            hint = f"a real run would restore the others, then {stops}"
+        else:
+            hint = f"a real run would {stops}"
+        if checked:
+            hint = f"If the checksums match, {hint}"
+        else:
+            hint = hint[0].upper() + hint[1:]
+        dry_run_stop(f"{count} cannot be restored: {failed_names}", hint)
+
+    fatal(
+        f"{count} failed to restore: {failed_names}",
+        f"restored: {', '.join(archive.name for archive in done) or 'none'}",
+        not_run,
+    )
+
+
 def restore(
     args, root_dir, capture_dir=None, restore_config=None, label=None, table="tar", phase=None
 ):
@@ -2544,6 +2845,8 @@ def restore(
         config_name = args.config_toml if args.config_toml else DEFAULT_CONFIG_RESTORE
         restore_config = load_config(root_dir, config_name)
         verify_restore_config(restore_config, config_name)
+        # A config written for this run by another snap.py names the user's table
+        table = restore_config.get("snap", {}).get("table", table)
 
     # Get archives from config
     # Semantics: None/[] = skip restore, ["*"] = restore all, [patterns...] = restore matching
@@ -2555,12 +2858,13 @@ def restore(
     elif archives == ["*"] or "*" in archives:
         archives = []  # Wildcard means restore all available
 
-    # Find matching archive files; without the snapshot dir there is nothing to match
+    # Match the archives snapshot.toml lists (any other archive file in the snapshot dir
+    # is ignored); without the snapshot dir there is nothing to match
     selected, available, unmatched = [], [], []
     if archives is not None and snapshot_found:
         ext, _ = COMPRESS_MAP[compress]
-        available = list(capture_dir.glob(f"*{ext}"))
-        selected, unmatched = archive_select(available, archives, capture_dir, compress)
+        available = snapshot_archives(capture_dir, snapshot_config, ext)
+        selected, unmatched = archive_select(available, archives)
 
     # Re-run with sudo if any restore target is not writable (Unix only)
     use_rollback = bool(roll_ext) and not getattr(args, "disable_rollback", False)
@@ -2578,7 +2882,9 @@ def restore(
         else:
             note(f"{action} {needs_root} needs root")
             step("Re-running the restore with sudo")
-            sudo_restore(args, root_dir, capture_dir, restore_config, snapshot_config)
+            sudo_restore(
+                args, root_dir, capture_dir, restore_config, snapshot_config, table
+            )
 
     # Past the sudo re-run, which exits after the child printed these itself
     if snapshot_found and not tarball_opts.get("checksum"):
@@ -2596,8 +2902,8 @@ def restore(
     else:
         selection = f"{len(selected)} of {plural(len(available), 'archive')}"
 
-    # Restore archives
-    restored = 0
+    # Restore archives; done and failed collect the archives restored and failed
+    done, failed = [], []
     if archives is None:
         if "archives" in tar_table:
             step_skipped("archive restore", f"[{table}] archives is empty")
@@ -2610,8 +2916,8 @@ def restore(
     elif getattr(args, "disable_rollback", False):
         # No rollback protection - use existing extract_archives with confirmation
         step(f"Restoring {selection} without backups")
-        restored = extract_archives(
-            selected, skip_confirm=False, root_map=root_map, compress=compress
+        extract_archives(
+            selected, root_map=root_map, compress=compress, restored=done, failed=failed
         )
     elif not roll_ext:
         # Transactional restore needs a rollback extension; ask per archive instead
@@ -2622,13 +2928,14 @@ def restore(
             "config's [tarball] table to get backups",
         )
         step(f"Restoring {selection} without backups")
-        restored = extract_archives(
-            selected, skip_confirm=False, root_map=root_map, compress=compress
+        extract_archives(
+            selected, root_map=root_map, compress=compress, restored=done, failed=failed
         )
     else:
-        # Transactional restore with rollback support
+        # Transactional restore with rollback support; each root's old backup directory
+        # is moved aside once in this run
         step(f"Restoring {selection}")
-        failed, done = [], []
+        rotated = set()
         for archive in selected:
             category = archive_category(archive)
             root = root_map.get(category)
@@ -2636,46 +2943,19 @@ def restore(
                 say(archive.name)
                 say(f"skip: no 'root' key in {DEFAULT_SNAPSHOT_TOML}", 2)
                 continue
-            success = restore_category(archive, root, roll_ext, compress)
-            if success:
-                done.append(archive.name)
+            if restore_category(archive, root, roll_ext, compress, rotated):
+                done.append(archive)
             else:
-                failed.append(archive.name)
+                failed.append(archive)
 
-        if failed:
-            not_run = "not run: symlinks"
-            stops = "stop before the symlinks"
-            if args.run_scripts:
-                not_run += ", after scripts"
-                stops += ", after scripts"
+    # A failed archive stops the restore before the symlinks and after scripts. Declined
+    # archives are not failures
+    if failed:
+        restore_stop(args, selected, done, failed, checked=bool(tarball_opts.get("checksum")))
+    restored = len(done)
 
-            # A dry run only previewed the others, so it claims nothing was restored; a
-            # real run restores the others first, then stops where this one does
-            if __dry_run__:
-                if done:
-                    hint = f"a real run would restore the others, then {stops}"
-                else:
-                    hint = f"a real run would {stops}"
-                # A dry run doesn't check checksums, which a real run checks first
-                if tarball_opts.get("checksum"):
-                    hint = f"If the checksums match, {hint}"
-                else:
-                    hint = hint[0].upper() + hint[1:]
-                fatal(
-                    f"{len(failed)} of {plural(len(selected), 'archive')} cannot be restored: "
-                    f"{', '.join(failed)}",
-                    hint,
-                )
-            fatal(
-                f"{len(failed)} of {plural(len(selected), 'archive')} failed to restore: "
-                f"{', '.join(failed)}",
-                f"restored: {', '.join(done) or 'none'}",
-                not_run,
-            )
-        restored = len(done)
-
-    # Create symlinks from link -> root
-    links = create_symlinks(snapshot_config)
+    # Create symlinks from link -> root, only for the archives restored
+    links = create_symlinks(snapshot_config, {archive_category(archive) for archive in done})
 
     # Run after scripts
     if args.run_scripts:
@@ -2697,36 +2977,29 @@ def restore(
     return summary, success
 
 
-def remote_mkdir(dest_host, purpose="work"):
-    """Generate a unique remote work directory path and create it."""
-    chars = string.ascii_lowercase + string.digits
-    suffix = "".join(random.choices(chars, k=REMOTE_DIR_SUFFIX_LENGTH))
-    remote_dir = f"/tmp/{__script__.stem}-{purpose}-{suffix}"
+def remote_pull_dir(name):
+    """Return a new local temp dir for a snapshot copied from a host (a stand-in in a dry run)."""
+    if __dry_run__:
+        return Path(DRY_RUN_DIR) / name
+    return Path(tempfile.mkdtemp(prefix=f"{__script__.stem}-"))
 
-    # Create remote directory
-    step(f"Creating work directory on {dest_host}")
-    ssh_run(dest_host, f"mkdir -p {shlex.quote(remote_dir)}", desc="Creating the work directory")
-    return remote_dir
+
+def snapshot_pull(host, path, local_dir):
+    """Copy a snapshot directory on a host, with every file in it, into local_dir."""
+    step(f"Copying snapshot from {host}")
+    rsync_copy(f"{host}:{path}/", f"{local_dir}/", f"the snapshot from {host}", label="snapshot")
 
 
 def remote_restore(args, root_dir, source_host):
-    """Pull snapshot from remote and restore locally; returns restore()'s result."""
+    """Copy a snapshot from a host into a local temp dir and restore it here.
+
+    The snapshot is args.capture_dir on the host. Returns restore()'s result; the temp
+    dir is removed however the restore ends.
+    """
     capture_dir_path = str(args.capture_dir)
-    step(f"Copying snapshot from {source_host}")
-
-    if __dry_run__:
-        tmpdir = Path(DRY_RUN_DIR) / "remote-restore"
-    else:
-        tmpdir = Path(tempfile.mkdtemp(prefix=f"{__script__.stem}-"))
-
+    tmpdir = remote_pull_dir("remote-restore")
     try:
-        host_path = f"{source_host}:{capture_dir_path}/"
-        result = rsync_copy(
-            host_path, str(tmpdir) + "/", f"the snapshot from {source_host}", label="snapshot"
-        )
-
-        if result is not None and result[0] != 0:
-            fatal(f"Cannot copy the snapshot from {source_host}")
+        snapshot_pull(source_host, capture_dir_path, tmpdir)
 
         # Errors name what the user asked for, not the temp copy
         label = f"{source_host}:{capture_dir_path}"
@@ -2734,279 +3007,127 @@ def remote_restore(args, root_dir, source_host):
 
     finally:
         if not __dry_run__:
-            shutil.rmtree(tmpdir)
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-def remote_deploy(
-    args,
-    root_dir,
-    dest_host,
-    source_host=None,
-    deploy_config=None,
-    before_scripts=True,
-    phase=None,
-):
-    """Deploy snapshot to remote and restore (from local or remote source).
+def remote_relay(args, root_dir, source_host, dest_host):
+    """Restore a snapshot from one host on another, through a local temp dir.
 
-    phase ('restore' in a migration) prefixes the script steps; display only.
+    rsync can't copy from one host to another, so the snapshot (args.capture_dir on
+    source_host) is copied here first, then to dest_host. The local copy is removed
+    however the restore ends.
     """
-    root_host = getattr(args, "root_host", None)
+    capture_dir_path = str(args.capture_dir)
+    tmpdir = remote_pull_dir("remote-restore")
+    try:
+        snapshot_pull(source_host, capture_dir_path, tmpdir)
+        label = f"{source_host}:{capture_dir_path}"
+        remote_deploy(args, root_dir, dest_host, tmpdir, label=label)
+    finally:
+        if not __dry_run__:
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
-    # Determine source paths (local or remote)
-    if source_host:
-        # Remote source - use combined capture_dir (includes checksum)
-        capture_dir_path = (
-            str(args.capture_dir)
-            if isinstance(args.capture_dir, Path)
-            else args.capture_dir
+
+def remote_deploy(args, root_dir, dest_host, local_capture, deploy_config=None, label=None):
+    """Copy a local snapshot to a host and restore it there with snap.py.
+
+    snap.py on the host restores its copy as a local restore does: it re-runs itself with
+    sudo only when the restore needs root, and with --run-scripts it runs the config's
+    scripts. Without deploy_config the restore config comes from -t or the default in
+    root_dir (a remote snap root's local copy included); migrate passes its [restore.*]
+    half, written to a temp TOML. label names the snapshot in error lines. The work
+    directory on dest_host is removed however the restore ends.
+    """
+    if label is None:
+        label = local_capture
+
+    # A dry run reports a missing snapshot dir here, where a real run stops (and passes
+    # over a stand-in for one a real run would create)
+    if not __dry_run__ or not local_capture.exists():
+        verify_snapshot(local_capture, label)
+    elif not (local_capture / DEFAULT_SNAPSHOT_TOML).exists():
+        error(
+            f"{DEFAULT_SNAPSHOT_TOML} not found in {label}",
+            "A real run stops before creating the work directory",
         )
-        # Config/scripts come from root_host if set, otherwise source_host
-        if root_host:
-            config_src_base = f"{root_host}:{root_dir}"
-        else:
-            config_src_base = f"{source_host}:{root_dir}"
-        local_capture = None
-    else:
-        # Local source - use combined capture_dir (includes checksum)
-        local_capture = args.capture_dir if __dry_run__ else args.capture_dir.resolve()
 
-        # A dry run reports a missing snapshot dir here, where a real run stops (and
-        # passes over a stand-in for one a real run would create)
-        if not __dry_run__ or not local_capture.exists():
-            verify_snapshot(local_capture)
-        # Config/scripts from root_host if set, otherwise local
-        config_src_base = f"{root_host}:{root_dir}" if root_host else None
-
+    # The config is read first, so a config problem stops before the host is touched
     if deploy_config is None:
         if args.config_toml:
             config_name = args.config_toml
-        elif not root_host and (root_dir / DEFAULT_CONFIG_DEPLOY).exists():
+        elif (root_dir / DEFAULT_CONFIG_DEPLOY).exists():
             config_name = DEFAULT_CONFIG_DEPLOY
         else:
             config_name = DEFAULT_CONFIG_RESTORE
-        if root_host:
-            deploy_config = load_remote_config(root_host, root_dir, config_name)
-        else:
-            deploy_config = load_config(root_dir, config_name)
+        deploy_config = load_config(root_dir, config_name)
         verify_restore_config(deploy_config, config_name)
+        config_src = root_dir / config_name
     else:
-        config_name = None
-
-    remote_dir = remote_mkdir(dest_host, "restore")
-
-    # Collect all transfers to execute in parallel
-    transfers = []
-
-    # Add snap.py script
-    transfers.append((str(__script__), f"{dest_host}:{remote_dir}/", __script__.name))
-
-    # Add archive files (snapshot TOML and all tar archives)
-    archives_note = False  # a dry run of a pulled snapshot notes the archives at the copy
-    if source_host:
-        # Remote source - need to fetch snapshot TOML first to determine archives
-        step(f"Copying {DEFAULT_SNAPSHOT_TOML} from {source_host}")
-
-        # Create temp file for snapshot TOML
-        with tempfile.NamedTemporaryFile(
-            mode="wb", suffix=".toml", delete=False
-        ) as tmp:
-            tmp_toml_path = Path(tmp.name)
-
-        try:
-            # Fetch snapshot TOML from remote source
-            remote_toml = f"{source_host}:{capture_dir_path}/{DEFAULT_SNAPSHOT_TOML}"
-            result = rsync_copy(
-                remote_toml,
-                str(tmp_toml_path),
-                f"{DEFAULT_SNAPSHOT_TOML} from {source_host}",
-                label=DEFAULT_SNAPSHOT_TOML,
-            )
-
-            if result is None:  # __dry_run__
-                note(f"A real run would copy the archives listed in {DEFAULT_SNAPSHOT_TOML}")
-                compress_type = "gzip"
-                # In dry-run, show a placeholder archive
-                tar_sections = {"<archive>": {}}
-            elif result[0] != 0:
-                fatal(f"Cannot copy {DEFAULT_SNAPSHOT_TOML} from {source_host}")
-            else:
-                # Load snapshot TOML to get compression type and archive list
-                with open(tmp_toml_path, "rb") as f:
-                    snapshot_config = tomllib.load(f)
-                compress_type = snapshot_config.get("tarball", {}).get(
-                    "compress", "gzip"
-                )
-                tar_sections = snapshot_config.get("tar", {})
-
-                if compress_type not in COMPRESS_MAP:
-                    compress_error(
-                        compress_type,
-                        f"{source_host}:{capture_dir_path}/{DEFAULT_SNAPSHOT_TOML}",
-                    )
-        finally:
-            # Clean up temp file
-            if tmp_toml_path.exists():
-                tmp_toml_path.unlink()
-
-        # Add snapshot TOML transfer
-        transfers.append(
-            (
-                f"{source_host}:{capture_dir_path}/{DEFAULT_SNAPSHOT_TOML}",
-                f"{dest_host}:{remote_dir}/",
-                DEFAULT_SNAPSHOT_TOML,
-            )
-        )
-
-        # Add all tar archives based on tar sections
-        ext, _ = COMPRESS_MAP[compress_type]
-        for category in tar_sections.keys():
-            archive_name = f"{category}{ext}"
-            transfers.append(
-                (
-                    f"{source_host}:{capture_dir_path}/{archive_name}",
-                    f"{dest_host}:{remote_dir}/",
-                    archive_name,
-                )
-            )
-    else:
-        # Local source - enumerate files directly
-        toml_path = local_capture / DEFAULT_SNAPSHOT_TOML
-
-        if __dry_run__ and not toml_path.exists():
-            # Dry-run with placeholder capture dir (e.g. from remote_capture), or a
-            # snapshot that a real run would stop at (a missing dir is reported above)
-            if is_placeholder(local_capture):
-                archives_note = True
-            elif local_capture.exists():
-                error(
-                    f"{DEFAULT_SNAPSHOT_TOML} not found in {local_capture}",
-                    "A real run stops before creating the work directory",
-                )
-            transfers.append(
-                (str(toml_path), f"{dest_host}:{remote_dir}/", DEFAULT_SNAPSHOT_TOML)
-            )
-        else:
-            if not toml_path.exists():
-                fatal(f"{DEFAULT_SNAPSHOT_TOML} not found in {local_capture}")
-
-            transfers.append(
-                (str(toml_path), f"{dest_host}:{remote_dir}/", DEFAULT_SNAPSHOT_TOML)
-            )
-
-            # Load compression type from snapshot TOML
-            with open(toml_path, "rb") as f:
-                snapshot_config = tomllib.load(f)
-            compress_type = snapshot_config.get("tarball", {}).get("compress", "gzip")
-            if compress_type not in COMPRESS_MAP:
-                compress_error(compress_type, DEFAULT_SNAPSHOT_TOML)
-            ext, _ = COMPRESS_MAP[compress_type]
-
-            # Add all tar archives with the specified compression type
-            for archive in local_capture.glob(f"*{ext}"):
-                transfers.append(
-                    (str(archive), f"{dest_host}:{remote_dir}/", archive.name)
-                )
-
-    # Add config transfer (remote restore needs a restore config)
-    tmp_config = None
-    if config_name:
-        if source_host or root_host:
-            config_src = f"{config_src_base}/{config_name}"
-        else:
-            config_src = str(root_dir / config_name)
-        transfers.append(
-            (
-                config_src,
-                f"{dest_host}:{remote_dir}/{DEFAULT_CONFIG_RESTORE}",
-                config_name,
-            )
-        )
-    else:
-        # Generate minimal restore config for remote (restore all archives)
-        tmp_config = Path(tempfile.mktemp(suffix=".toml", prefix="restore-"))
-        tmp_config.write_text('[tar]\narchives = ["*"]\n')
-        transfers.append(
-            (
-                str(tmp_config),
-                f"{dest_host}:{remote_dir}/{DEFAULT_CONFIG_RESTORE}",
-                DEFAULT_CONFIG_RESTORE,
-            )
-        )
-
-    # Add script transfers
-    script_whens = ["before", "after"] if before_scripts else ["after"]
-    if deploy_config and "scripts" in deploy_config:
-        for when in script_whens:
-            if when in deploy_config["scripts"]:
-                for run_script_path in deploy_config["scripts"][when]:
-                    if source_host or root_host:
-                        script_src = f"{config_src_base}/{run_script_path}"
-                        script_name = Path(run_script_path).name
-                        transfers.append(
-                            (script_src, f"{dest_host}:{remote_dir}/", script_name)
-                        )
-                    else:
-                        script_path = root_dir / run_script_path
-                        # run_scripts warns about a missing script when it runs
-                        if not script_path.exists():
-                            continue
-                        script_name = Path(run_script_path).name
-                        transfers.append(
-                            (
-                                str(script_path),
-                                f"{dest_host}:{remote_dir}/",
-                                script_name,
-                            )
-                        )
-
-    # Execute all transfers in parallel
-    step(f"Copying {plural(len(transfers), 'file')} to {dest_host}")
-    success_count = rsync_parallel(transfers)
-    if archives_note:
-        note("A real run would also copy the snapshot's archives")
-
-    # Clean up temp restore config if generated
-    if tmp_config and tmp_config.exists():
-        tmp_config.unlink()
-
-    if success_count < len(transfers):
-        failed = len(transfers) - success_count
-        fatal(f"Copying to {dest_host} failed for {failed} of {plural(len(transfers), 'file')}")
-
-    if args.run_scripts and before_scripts:
-        run_scripts(
-            root_dir,
-            deploy_config,
-            "before",
-            working_dir=None,
-            remote_host=dest_host,
-            remote_dir=remote_dir,
-            phase=phase,
-        )
-
-    # Execute restore on remote
-    escaped_remote_dir = shlex.quote(remote_dir)
-    program = f"{sys.executable} {__script__.name}"
-    remote_cmd = (
-        f"cd {escaped_remote_dir} && sudo {program} restore"
-        f" --from {escaped_remote_dir}"
-    )
-    step(f"Running restore on {dest_host} with sudo")
-    ssh_run(dest_host, remote_cmd, tty=True, desc="Restore")
-
+        config_src = None  # migrate: written to a temp TOML below
+    scripts = []
     if args.run_scripts:
-        run_scripts(
-            root_dir,
-            deploy_config,
-            "after",
-            working_dir=None,
-            remote_host=dest_host,
-            remote_dir=remote_dir,
-            phase=phase,
-        )
+        scripts = remote_scripts(root_dir, deploy_config, dest_host)
 
-    step(f"Removing work directory from {dest_host}")
-    ssh_run(dest_host, f"rm -rf {shlex.quote(remote_dir)}", desc="Removing the work directory")
+    tmp_config = None
+    work_dir = None
+    done = False
+    try:
+        if config_src is None:
+            tmp_config = write_config_toml(
+                restore_child_config(deploy_config, "restore.tar"),
+                DEFAULT_CONFIG_RESTORE,
+                f"the restore on {dest_host}",
+            )
+            config_src = tmp_config
+
+        layout = remote_layout(["configs", "scripts", "snapshot"], scripts)
+        work_dir = remote_workdir(dest_host, "restore", layout)
+
+        # The whole snapshot directory, with any files after-capture scripts wrote into
+        # it, then snap.py, the config and the scripts; all in parallel
+        transfers = remote_copies(
+            root_dir, dest_host, work_dir, config_src, DEFAULT_CONFIG_RESTORE, scripts
+        )
+        files = plural(len(transfers), "file")
+        transfers.insert(0, (f"{local_capture}/", f"{dest_host}:{work_dir}/snapshot/", "snapshot"))
+        step(f"Copying the snapshot and {files} to {dest_host}")
+        success_count = rsync_parallel(transfers)
+        if success_count < len(transfers):
+            failed = len(transfers) - success_count
+            fatal(f"Copying to {dest_host} failed for {failed} of {len(transfers)} copies")
+
+        # snap.py on the host decides whether it needs sudo, and asks for a password (or,
+        # with --disable-rollback, for each archive) on the terminal. It takes as long as
+        # the archives do: no wall-clock limit
+        options = ["--from", work_dir / "snapshot", "-r", work_dir, "-t", DEFAULT_CONFIG_RESTORE]
+        if getattr(args, "disable_rollback", False):
+            options.append("--disable-rollback")
+        if args.run_scripts:
+            options.append("--run-scripts")
+        step(f"Running restore on {dest_host}")
+        code, _, _ = ssh_run(
+            dest_host,
+            remote_child(work_dir, "restore", *options),
+            check=False,
+            tty=True,
+            desc="Restore",
+            timeout=None,
+        )
+        # With ssh -t, Ctrl-C reaches snap.py on the host, which rolls back and exits
+        # 130 (or dies from SIGINT); report and exit like an interrupted local restore
+        if code == 130 or code == -signal.SIGINT:
+            error(f"Restore on {dest_host} was interrupted")
+            sys.exit(130)
+        if code == 255:
+            fatal(f"Restore failed on {dest_host}: ssh error (exit status 255)")
+        if code != 0:
+            fatal(f"Restore failed on {dest_host} (exit status {code})")
+        done = True
+    finally:
+        if tmp_config and tmp_config.exists():
+            tmp_config.unlink()
+        if work_dir is not None:
+            remote_workdir_remove(dest_host, work_dir, report=done)
 
 
 # --- Migrate Logic --- #
@@ -3099,13 +3220,23 @@ def cmd_capture(args):
     to_host, to_path = parse_remote_arg(getattr(args, "dst", None), flag="--to")
     require_remote(args, "src", from_host)
 
-    # Determine intended destination path
-    if to_path:
-        intended_path = to_path if to_host else to_path.resolve()
+    # A remote snap root keeps its captures on its host (root_dir is only a local copy
+    # of its configs and scripts)
+    if root_host and not to_host and not to_path:
+        to_host = root_host
+
+    # Determine intended destination path; a host's paths are relative to its login
+    # directory unless absolute
+    now = datetime.now()
+    year = now.strftime("%Y")
+    month_day = now.strftime("%m-%d")
+    if to_host and to_path:
+        intended_path = normalize_remote_path(to_path)
+    elif to_host:
+        intended_path = remote_snap_root(args, to_host) / "captures" / year / month_day
+    elif to_path:
+        intended_path = to_path.resolve()
     else:
-        now = datetime.now()
-        year = now.strftime("%Y")
-        month_day = now.strftime("%m-%d")
         intended_path = root_dir / "captures" / year / month_day
 
     banner("capture")
@@ -3114,35 +3245,33 @@ def cmd_capture(args):
     else:
         context(from_host or here(), intended_path)
 
-    if from_host:
-        # Run capture on remote host, pull results back
-        dst_dir, tmpdir = remote_capture(args, root_dir, from_host)
-    else:
-        # Local capture
-        if root_host:
-            config = load_remote_config(root_host, root_dir, DEFAULT_CONFIG_CAPTURE)
-        else:
-            config = load_config(root_dir, DEFAULT_CONFIG_CAPTURE)
-        verify_capture_config(config, DEFAULT_CONFIG_CAPTURE)
-
-        tmpdir = None
-        if __dry_run__:
-            outdir = Path(DRY_RUN_DIR) / intended_path.name
-        else:
-            tmpdir = Path(tempfile.mkdtemp(prefix=f"{__script__.stem}-"))
-            outdir = tmpdir / intended_path.name
-            outdir.mkdir(parents=True, exist_ok=False)
-
-        dst_dir = capture(args, root_dir, outdir, config, config_name=DEFAULT_CONFIG_CAPTURE)
-
+    # The staging dir is removed however the capture ends
+    tmpdir = None
     try:
+        if from_host:
+            # Run capture on remote host, pull results back
+            dst_dir, tmpdir = remote_capture(args, root_dir, from_host)
+        else:
+            # Local capture, from -t or the default capture config
+            config_name = getattr(args, "config_toml", None) or DEFAULT_CONFIG_CAPTURE
+            config = load_config(root_dir, config_name)
+            verify_capture_config(config, config_name)
+
+            if __dry_run__:
+                outdir = Path(DRY_RUN_DIR) / intended_path.name
+            else:
+                tmpdir = Path(tempfile.mkdtemp(prefix=f"{__script__.stem}-"))
+                outdir = tmpdir / intended_path.name
+                outdir.mkdir(parents=True, exist_ok=False)
+
+            dst_dir = capture(args, root_dir, outdir, config, config_name=config_name)
+
         if __dry_run__:
             final_dst = intended_path / dst_dir.name
         elif to_host:
             # Copy snapshot to remote destination
-            remote_path = intended_path / dst_dir.name
-            capture_deploy(dst_dir, to_host, remote_path)
-            final_dst = remote_path
+            final_dst = intended_path / dst_dir.name
+            capture_deploy(dst_dir, to_host, final_dst)
         else:
             # Move snapshot to local destination
             final_dst = intended_path / dst_dir.name
@@ -3172,7 +3301,6 @@ def cmd_capture(args):
 def cmd_migrate(args):
     """Execute migrate command: capture on source, restore on destination."""
     root_dir = args.root
-    root_host = getattr(args, "root_host", None)
 
     from_host, _ = parse_remote_arg(getattr(args, "src", None), flag="--from")
     to_host, _ = parse_remote_arg(getattr(args, "dst", None), flag="--to")
@@ -3189,43 +3317,36 @@ def cmd_migrate(args):
     context(from_host or here(), to_host or here())
 
     config_name = args.config_toml if args.config_toml else DEFAULT_CONFIG_MIGRATE
-    if root_host:
-        config = load_remote_config(root_host, root_dir, config_name)
-    else:
-        config = load_config(root_dir, config_name)
+    config = load_config(root_dir, config_name)
     capture_config, restore_config = split_migrate_config(config, config_name)
     verify_capture_config(capture_config, config_name, table="capture.tar")
 
-    # Phase 1: Capture on source
-    if from_host:
-        capture_dir, tmpdir = remote_capture(args, root_dir, from_host, capture_config)
-    else:
-        tmpdir = None
-        dir_name = datetime.now().strftime("%m-%d")
-        if __dry_run__:
-            outdir = Path(DRY_RUN_DIR) / dir_name
-        else:
-            tmpdir = Path(tempfile.mkdtemp(prefix=f"{__script__.stem}-"))
-            outdir = tmpdir / dir_name
-            outdir.mkdir(parents=True, exist_ok=False)
-        capture_dir = capture(
-            args, root_dir, outdir, capture_config, config_name=config_name, phase="capture"
-        )
-
+    # The staging dir is removed however the migration ends
+    tmpdir = None
     try:
+        # Phase 1: Capture on source
+        if from_host:
+            capture_dir, tmpdir = remote_capture(args, root_dir, from_host, capture_config)
+        else:
+            dir_name = datetime.now().strftime("%m-%d")
+            if __dry_run__:
+                outdir = Path(DRY_RUN_DIR) / dir_name
+            else:
+                tmpdir = Path(tempfile.mkdtemp(prefix=f"{__script__.stem}-"))
+                outdir = tmpdir / dir_name
+                outdir.mkdir(parents=True, exist_ok=False)
+            capture_dir = capture(
+                args, root_dir, outdir, capture_config, config_name=config_name, phase="capture"
+            )
+
         # Phase 2: Restore on destination
         args.capture_dir = capture_dir
 
         if to_host:
-            remote_deploy(
-                args,
-                root_dir,
-                to_host,
-                deploy_config=restore_config,
-                before_scripts=True,
-                phase="restore",
-            )
-            finish(f"Migration to {to_host} completed")
+            # With --from too, the snapshot goes through this machine: the local copy
+            # remote_capture made is copied on to the destination
+            remote_deploy(args, root_dir, to_host, capture_dir, deploy_config=restore_config)
+            finish(f"Migration to {to_host} finished; see the restore summary above", False)
         else:
             summary, success = restore(
                 args,
@@ -3250,12 +3371,10 @@ def cmd_restore(args):
     to_host, _ = parse_remote_arg(getattr(args, "dst", None), flag="--to")
     require_remote(args, "dst", to_host)
 
-    # A local restore reads its configs and snapshots on this machine
-    if root_host and not from_host and not to_host:
-        warn(
-            f"-r/--snap-root host '{root_host}' is ignored by a local restore; "
-            f"reading {root_dir} on this machine"
-        )
+    # A remote snap root restores the latest snapshot in its own captures directory,
+    # unless --from names another snapshot
+    if root_host and not from_host and not from_path:
+        from_host = root_host
 
     banner("restore")
     dest = to_host or here()
@@ -3263,12 +3382,13 @@ def cmd_restore(args):
     # Determine snapshot source path; latest is set when snap.py chose the snapshot
     latest = False
     if from_host:
-        # Remote source: find latest on remote or use provided path
-        captures_dir = root_dir / "captures"
+        # Remote source: the given path (relative to the login directory unless
+        # absolute), or the latest snapshot in the host's captures directory
         if from_path:
-            context(f"{from_host}:{from_path}", dest)
-            capture_path = from_path
+            capture_path = normalize_remote_path(from_path)
+            context(f"{from_host}:{capture_path}", dest)
         else:
+            captures_dir = remote_snap_root(args, from_host) / "captures"
             context(f"{from_host}:{captures_dir} (latest)", dest)
             capture_path = resolve_remote_snapshot(from_host, captures_dir)
     elif from_path:
@@ -3307,15 +3427,15 @@ def cmd_restore(args):
     # Store capture path in args for subfunctions
     args.capture_dir = capture_path
 
-    # Case 1: Remote to remote (source -> dest)
+    # Case 1: Remote to remote, through a local copy
     if from_host and to_host:
-        remote_deploy(args, root_dir, to_host, source_host=from_host)
-        finish(f"Restore on {to_host} completed")
+        remote_relay(args, root_dir, from_host, to_host)
+        finish(f"Restore on {to_host} finished; see its summary above", False)
         return
     # Case 2: Local to remote (deploy)
     if to_host:
-        remote_deploy(args, root_dir, to_host)
-        finish(f"Restore on {to_host} completed")
+        remote_deploy(args, root_dir, to_host, capture_path)
+        finish(f"Restore on {to_host} finished; see its summary above", False)
         return
 
     # Case 3: Remote to local (pull and restore)
@@ -3361,7 +3481,8 @@ def add_snap_options(parser):
         default=DEFAULT_ROOT_SNAP,
         help=(
             "Snap root with configs, scripts and captures "
-            f"(default: ./.snap, then {DEFAULT_ROOT_SNAP})"
+            f"(default: ./.snap, then {DEFAULT_ROOT_SNAP}; on a host, "
+            f"{DEFAULT_REMOTE_ROOT} in its login directory)"
         ),
     )
     group.add_argument(
@@ -3370,7 +3491,7 @@ def add_snap_options(parser):
     )
     group.add_argument(
         "--run-scripts", action="store_true",
-        help="Run the config's before/after scripts (with sudo on remote hosts)",
+        help="Run the config's before/after scripts (on a host, snap.py there runs them)",
     )
 
 
@@ -3524,7 +3645,6 @@ def main():
     # Parse --snap-root for remote host support
     root_host, root_path = parse_remote_arg(args.root, flag="-r/--snap-root")
     args.root_host = root_host
-    args.root = resolve_root(root_path if root_host else args.root, root_host=root_host)
 
     # Each command prints its own banner after checking its arguments
     commands = {
@@ -3532,7 +3652,21 @@ def main():
         "restore": cmd_restore,
         "migrate": cmd_migrate,
     }
-    commands[args.command](args)
+    if not root_host:
+        args.root = resolve_root(args.root)
+        commands[args.command](args)
+        return
+
+    # A remote snap root: (root_host, root_path) name it on its host, and args.root is a
+    # local copy of its configs/ and scripts/ (made in a dry run too), removed at exit
+    args.root_path = normalize_remote_path(root_path or DEFAULT_REMOTE_ROOT)
+    args.root = Path(tempfile.mkdtemp(prefix=f"{__script__.stem}-root-"))
+    try:
+        root_fetch(root_host, args.root_path, args.root)
+        commands[args.command](args)
+    finally:
+        _root_names.pop(str(args.root), None)
+        shutil.rmtree(args.root, ignore_errors=True)
 
 
 if __name__ == "__main__":
