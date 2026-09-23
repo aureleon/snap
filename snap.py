@@ -15,11 +15,14 @@ if sys.version_info < (3, 11):
 import argparse
 import fnmatch
 import hashlib
+import json
 import os
 import random
 import re
 import shlex
 import shutil
+import signal
+import stat
 import string
 import subprocess
 import tarfile
@@ -423,20 +426,32 @@ DEFAULT_SNAPSHOT_TOML = "snapshot.toml"
 
 
 def parse_remote_arg(value):
-    """Parse a [user@host:]path argument into (host, path) tuple.
+    """Parse a [user@]host:[path], user@host, or local path argument into (host, path).
 
     Returns (None, None) for empty values, (None, path) for local paths,
-    or (host, path) for remote. Trailing colon with no path returns (host, None).
+    or (host, path) for remote. 'user@host' and 'host:' return (host, None).
+    A local path containing '@' needs a '/' (e.g. './name@tag').
     """
     if not value:
         return None, None
+
     # Match [user@]host: or [user@]host:path
-    match = re.match(r'^((?:[^/:]+@)?[^/:]+):(.*)$', value)
+    match = re.fullmatch(r"((?:[^/:]+@)?[^/:]+):(.*)", value)
     if match:
-        host = match.group(1)
-        path = match.group(2)
-        return host, Path(path) if path else None
-    return None, Path(value)
+        host, path = match.group(1), match.group(2)
+    elif re.fullmatch(r"[^/:]+@[^/:]+", value):
+        # user@host with no colon
+        host, path = value, ""
+    else:
+        return None, Path(value)
+
+    # Reject empty parts and hosts that ssh/rsync would parse as options
+    user, at, hostname = host.rpartition("@")
+    if not hostname or hostname.startswith("-") or user.startswith("-") or (at and not user):
+        printd(f"Error: Invalid host '{host}'", file=sys.stderr)
+        sys.exit(1)
+
+    return host, Path(path) if path else None
 
 
 def expand_path(path_str):
@@ -575,6 +590,37 @@ def load_config(root_dir, config_name):
     except tomllib.TOMLDecodeError as e:
         printd(f"Error parsing TOML: {e}", file=sys.stderr)
         sys.exit(1)
+
+
+def toml_string(value):
+    """Format a string as a TOML basic string."""
+    # JSON escapes quotes, backslashes, and control characters the way TOML does,
+    # except DEL, which TOML also requires to be escaped
+    return json.dumps(value, ensure_ascii=False).replace("\x7f", "\\u007f")
+
+
+def toml_value(value):
+    """Format a string, number, bool, or list of them as a TOML value."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return repr(value)
+    if isinstance(value, str):
+        return toml_string(value)
+    if isinstance(value, list):
+        return "[" + ", ".join(toml_value(item) for item in value) + "]"
+    raise TypeError(f"Unsupported TOML value: {value!r}")
+
+
+def toml_dumps(config):
+    """Format a dict of tables of values (one level deep) as TOML."""
+    lines = []
+    for table, values in config.items():
+        lines.append(f"[{toml_string(table)}]")
+        for key, value in values.items():
+            lines.append(f"{toml_string(key)} = {toml_value(value)}")
+        lines.append("")
+    return "\n".join(lines)
 
 
 def load_remote_config(root_host, root_path, config_name):
@@ -951,14 +997,45 @@ def archive_category(archive):
     return archive.stem.replace(".tar", "")
 
 
-def archive_entries(tar):
-    """Get set of top-level entry names from a tar archive."""
-    entries = set()
-    for member in tar.getmembers():
-        parts = Path(member.name).parts
-        if parts:
-            entries.add(parts[0])
-    return entries
+def archive_entries(tar, warn=True):
+    """Group archive members by captured path, in archive order.
+
+    A captured path is a member with no ancestor member: capturing '.config/nvim'
+    yields '.config/nvim', not '.config', so restore never touches its siblings.
+    Members below a symlink member are skipped, since extracting them would write
+    through the link into paths that were never backed up.
+    Raises ValueError for absolute or '..' member paths.
+    """
+    members = tar.getmembers()
+    names, links = set(), set()
+    for member in members:
+        path = Path(member.name)
+        if path.is_absolute() or ".." in path.parts:
+            raise ValueError(f"unsafe path in archive: '{member.name}'")
+        if path.parts:
+            names.add(path)
+            if member.issym():
+                links.add(path)
+
+    groups = {}
+    for member in members:
+        path = Path(member.name)
+        if not path.parts:
+            continue
+
+        # Ancestors from shallowest to deepest, without '.'
+        ancestors = list(reversed(path.parents))[1:]
+        if any(ancestor in links for ancestor in ancestors):
+            if warn:
+                printd(
+                    f"Warning: skipping '{member.name}' below a symlink in the archive",
+                    file=sys.stderr,
+                )
+            continue
+
+        entry = next((a for a in ancestors if a in names), path)
+        groups.setdefault(str(entry), []).append(member)
+    return groups
 
 
 def archive_confirm(archive, compress="gzip", root=None):
@@ -969,9 +1046,13 @@ def archive_confirm(archive, compress="gzip", root=None):
         printd(f"Error: Unsupported compression type: {compress}", file=sys.stderr)
         sys.exit(1)
 
-    # Get top-level directories from the archive (auto-detect compression)
-    with tarfile.open(archive, "r:*") as tar:
-        entries = archive_entries(tar)
+    # Get captured paths from the archive (auto-detect compression)
+    try:
+        with tarfile.open(archive, "r:*") as tar:
+            entries = archive_entries(tar)
+    except (tarfile.TarError, ValueError, OSError) as e:
+        printd(f"Error: Cannot restore {name}: {e}", file=sys.stderr)
+        return False
 
     # Format paths for display
     top_level_dirs = set()
@@ -1043,35 +1124,94 @@ def archive_select(available, selected_archives, tmpdir, compress="gzip"):
 
 
 def copy_with_ownership(src, dst):
-    """Copy file or directory tree preserving ownership when running as root."""
+    """Copy a file, symlink, or directory tree, preserving ownership when running as root.
+
+    Symlinks are copied as links, never followed.
+    """
     src_path = Path(src)
     dst_path = Path(dst)
+    make_parents(dst_path)
 
-    if src_path.is_dir():
-        shutil.copytree(str(src_path), str(dst_path), symlinks=True)
-        # Preserve ownership recursively if running as root
-        if hasattr(os, "geteuid") and os.geteuid() == 0:
-            for root, dirs, files in os.walk(dst_path):
-                root_path = Path(root)
-                src_root = src_path / root_path.relative_to(dst_path)
-
-                # Copy ownership for directory itself
-                src_stat = src_root.stat()
-                os.chown(root_path, src_stat.st_uid, src_stat.st_gid)
-
-                # Copy ownership for files
-                for file in files:
-                    dst_file = root_path / file
-                    src_file = src_root / file
-                    if src_file.exists():
-                        file_stat = src_file.stat()
-                        os.chown(dst_file, file_stat.st_uid, file_stat.st_gid)
+    if src_path.is_symlink():
+        os.symlink(os.readlink(src_path), dst_path)
+    elif src_path.is_dir():
+        shutil.copytree(src_path, dst_path, symlinks=True)
     else:
-        shutil.copy2(str(src_path), str(dst_path))
-        # Preserve ownership if running as root
+        shutil.copy2(src_path, dst_path)
+
+    if not (hasattr(os, "geteuid") and os.geteuid() == 0):
+        return
+
+    # Preserve ownership of every copied path without following symlinks
+    copied = [dst_path]
+    if dst_path.is_dir() and not dst_path.is_symlink():
+        for root, dirs, files in os.walk(dst_path):
+            copied += [Path(root) / name for name in dirs + files]
+    for path in copied:
+        src_stat = (src_path / path.relative_to(dst_path)).lstat()
+        os.chown(path, src_stat.st_uid, src_stat.st_gid, follow_symlinks=False)
+
+
+def make_parents(path, created=None):
+    """Create the missing parent dirs of a path and return them, deepest first.
+
+    Each new dir is added to `created` as soon as it exists, so a caller can remove
+    it on rollback even if a later mkdir fails. When running as root, new dirs get
+    the owner of their nearest existing ancestor, so restoring into a user's home
+    doesn't leave root-owned dirs.
+    """
+    if created is None:
+        created = []
+    parent = Path(path).parent
+    missing = []
+    while not os.path.lexists(parent) and parent.parent != parent:
+        missing.append(parent)
+        parent = parent.parent
+
+    owner = parent.stat()
+    for directory in reversed(missing):
+        directory.mkdir()
+        created.insert(0, directory)
         if hasattr(os, "geteuid") and os.geteuid() == 0:
-            src_stat = src_path.stat()
-            os.chown(dst_path, src_stat.st_uid, src_stat.st_gid)
+            os.chown(directory, owner.st_uid, owner.st_gid)
+    return created
+
+
+def remove_path(path):
+    """Remove a file, symlink, or directory tree if it exists.
+
+    Read-only dirs inside the tree are made writable so their contents can go.
+    """
+    path = Path(path)
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+    elif path.is_dir():
+
+        def retry(func, failed, error):
+            parent = Path(failed).parent
+            inside = parent == path or path in parent.parents
+            if func not in (os.unlink, os.rmdir) or not inside:
+                raise error
+            if not isinstance(error, PermissionError):
+                raise error
+            os.chmod(parent, stat.S_IMODE(parent.lstat().st_mode) | stat.S_IRWXU)
+            func(failed)
+
+        if sys.version_info >= (3, 12):
+            shutil.rmtree(path, onexc=retry)
+        else:
+            shutil.rmtree(path, onerror=lambda func, failed, info: retry(func, failed, info[1]))
+    elif path.exists():
+        path.unlink()
+
+
+def extract_members(tar, path, members):
+    """Extract archive members under path, with the 'tar' safety filter when available."""
+    try:
+        tar.extractall(path, members=members, filter="tar")
+    except TypeError:
+        # Python < 3.11.4 doesn't support the filter parameter
+        tar.extractall(path, members=members)
 
 
 def archive_extract(archive, compress="gzip", root=None):
@@ -1089,22 +1229,19 @@ def archive_extract(archive, compress="gzip", root=None):
         # Legacy: extract to / for absolute paths
         extract_path = Path("/")
 
+    if __dry_run__:
+        return True
+
     try:
         # Don't show individual progress bars during parallel extraction
         # (avoids terminal corruption and empty lines)
         # Use 'r:*' to auto-detect compression type
         with tarfile.open(archive, "r:*") as tar:
-            # Extract to root; use 'tar' filter if available (Python 3.12+)
-            # 'tar' filter provides security without breaking symlinks or permissions
-            # When running as root, tarfile automatically preserves ownership from archive
-            members = tar.getmembers()
-            for member in members:
-                try:
-                    # 'tar' filter preserves ownership information
-                    tar.extract(member, extract_path, filter="tar")
-                except TypeError:
-                    # Python < 3.12 doesn't support filter parameter
-                    tar.extract(member, extract_path)
+            # Same members as a rollback restore (nothing below a symlink), in archive
+            # order; when running as root, tarfile preserves ownership from the archive
+            kept = {id(m) for group in archive_entries(tar, warn=False).values() for m in group}
+            members = [m for m in tar.getmembers() if id(m) in kept]
+            extract_members(tar, extract_path, members)
         return True
     except Exception as e:
         printd("\n", f"Error extracting {name}: {e}", file=sys.stderr)
@@ -1114,11 +1251,11 @@ def archive_extract(archive, compress="gzip", root=None):
 def restore_category(archive, root, roll_ext, compress="gzip"):
     """Transactionally restore a single category with rollback on failure.
 
-    Interleaves rollback and restore per-entry:
-    1. Backs up existing entry (copy, not move)
-    2. Removes original
-    3. Extracts new entry from archive
-    4. On any error: rolls back by restoring from backup
+    Replaces only the paths captured in the archive, one at a time:
+    1. Backs up the existing path (copy, not move)
+    2. Removes the original
+    3. Extracts the captured path from the archive
+    4. On any error or Ctrl-C: restores every touched path from backup
     """
     category = archive_category(archive)
 
@@ -1130,13 +1267,19 @@ def restore_category(archive, root, roll_ext, compress="gzip"):
     rollbackd = Path(str(root_path) + roll_ext)
 
     # Always open archive and classify entries
-    with tarfile.open(archive, "r:*") as tar:
-        entries = list(archive_entries(tar))
-        all_members = tar.getmembers()
+    try:
+        with tarfile.open(archive, "r:*") as tar:
+            groups = archive_entries(tar)
+    except (tarfile.TarError, ValueError, OSError) as e:
+        printd(f"Error: Cannot restore {category}: {e}", file=sys.stderr)
+        return False
 
     # Classify entries: replace (existing) vs extract (new)
     replaces, extracts = archive_classify(
-        entries, "replace", "extract", cond=lambda entry: (root_path / entry).exists()
+        list(groups),
+        "replace",
+        "extract",
+        cond=lambda entry: os.path.lexists(root_path / entry),
     )
 
     printd(f"  {archive.name} (root: '{root_path}')")
@@ -1148,73 +1291,105 @@ def restore_category(archive, root, roll_ext, compress="gzip"):
     if __dry_run__:
         return True
 
-    # Handle existing rollback directory
-    if rollbackd.exists():
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        prevbackd = Path(str(rollbackd) + f"_{timestamp}")
-        rollbackd.rename(prevbackd)
-        if __verbose__:
-            printd(f"  Moved existing backup: {rollbackd} -> {prevbackd}")
-
-    # Create fresh backup directory
-    rollbackd.mkdir(parents=True, exist_ok=True)
+    # Move any existing backup aside, then create a fresh backup directory
+    try:
+        if rollbackd.exists():
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            prevbackd = Path(f"{rollbackd}_{timestamp}")
+            count = 1
+            while prevbackd.exists():
+                prevbackd = Path(f"{rollbackd}_{timestamp}_{count}")
+                count += 1
+            rollbackd.rename(prevbackd)
+            if __verbose__:
+                printd(f"  Moved existing backup: {rollbackd} -> {prevbackd}")
+        # Creates rollbackd and any missing parents with their parent's owner
+        make_parents(rollbackd / "entry")
+    except OSError as e:
+        printd(f"Error: Cannot create backup directory {rollbackd}: {e}", file=sys.stderr)
+        return False
 
     printd(f"  Restoring {category}...")
-    restored = []  # Track what we've touched for rollback
+    touched = []  # (entry, has_backup, created parent dirs) for every changed path
 
     try:
-        for entry in entries:
-            entry_path = root_path / entry
+        with tarfile.open(archive, "r:*") as tar:
+            links = []
+            for entry, members in groups.items():
+                entry_path = root_path / entry
+                has_backup = os.path.lexists(entry_path)
 
-            # Backup existing entry if it exists
-            if entry_path.exists():
-                copy_with_ownership(entry_path, rollbackd / entry)
-                if entry_path.is_dir():
-                    shutil.rmtree(str(entry_path))
-                else:
-                    entry_path.unlink()
+                # Back up the existing path, then remove it
+                if has_backup:
+                    copy_with_ownership(entry_path, rollbackd / entry)
+                created = []
+                touched.append((entry, has_backup, created))
+                remove_path(entry_path)
+                make_parents(entry_path, created)
 
-            # Extract this entry's members from the archive
-            members = [
-                m
-                for m in all_members
-                if Path(m.name).parts and Path(m.name).parts[0] == entry
-            ]
+                # Extract this entry's members from the archive
+                extract_members(tar, root_path, [m for m in members if not m.islnk()])
+                links += [m for m in members if m.islnk()]
 
-            with tarfile.open(archive, "r:*") as tar:
-                for member in members:
-                    try:
-                        tar.extract(member, root_path, filter="tar")
-                    except TypeError:
-                        tar.extract(member, root_path)
-
-            restored.append(entry)
+            # Hardlinks last, so they link to restored files instead of old ones
+            extract_members(tar, root_path, links)
 
         printd(f"  ✓ {category} restored")
         return True
 
-    except Exception as e:
-        # Rollback: delete extracted entries and restore from backup
-        printd("\n", f"Error restoring {category}: {e}", file=sys.stderr)
-        printd(f"Rolling back {len(restored)} entry(s)...", file=sys.stderr)
+    except (Exception, KeyboardInterrupt) as e:
+        # Ignore further Ctrl-C so the rollback itself can't be cut short
+        try:
+            previous_sigint = signal.signal(signal.SIGINT, signal.SIG_IGN)
+        except ValueError:
+            previous_sigint = None  # Not in the main thread
+        try:
+            restore_rollback(category, root_path, rollbackd, touched, e)
+        finally:
+            if previous_sigint is not None:
+                signal.signal(signal.SIGINT, previous_sigint)
 
-        for entry in restored:
-            entry_path = root_path / entry
-            rollback_path = rollbackd / entry
-
-            # Remove the partially extracted entry
-            if entry_path.exists():
-                if entry_path.is_dir():
-                    shutil.rmtree(str(entry_path))
-                else:
-                    entry_path.unlink()
-
-            # Restore from backup if it exists
-            if rollback_path.exists():
-                copy_with_ownership(rollback_path, entry_path)
-
-        printd(f"✓ Rollback complete for {category}", file=sys.stderr)
+        if isinstance(e, KeyboardInterrupt):
+            raise
         return False
+
+
+def restore_rollback(category, root_path, rollbackd, touched, error):
+    """Delete touched paths and restore them from backup; exit if that fails."""
+    reason = "interrupted" if isinstance(error, KeyboardInterrupt) else error
+    printd("\n", f"Error restoring {category}: {reason}", file=sys.stderr)
+    printd(f"Rolling back {len(touched)} path(s)...", file=sys.stderr)
+
+    failures = []
+    for entry, has_backup, created in reversed(touched):
+        entry_path = root_path / entry
+        try:
+            remove_path(entry_path)
+            if has_backup:
+                copy_with_ownership(rollbackd / entry, entry_path)
+        except OSError as rollback_error:
+            failures.append(f"{entry}: {rollback_error}")
+            continue
+
+        # Remove parent dirs that were created for the extraction
+        for directory in created:
+            try:
+                directory.rmdir()
+            except OSError:
+                break
+
+    if failures:
+        # Stop before a later category rotates these backups away
+        printd(
+            f"Error: Rollback incomplete for {category}, backups are in {rollbackd}",
+            file=sys.stderr,
+        )
+        for failure in failures:
+            printd(f"  {failure}", file=sys.stderr)
+        printd("Stopping restore so the backups stay in place.", file=sys.stderr)
+        sys.exit(1)
+
+    printd(f"✓ Rollback complete for {category}", file=sys.stderr)
 
 
 def extract_archives(archives, skip_confirm=False, root_map=None, compress="gzip"):
@@ -1289,8 +1464,8 @@ def create_symlinks(snapshot_config):
         root_path = expand_path(root)
 
         # Check if link already exists
-        if link_path.exists() or link_path.is_symlink():
-            if link_path.is_symlink():
+        if os.path.lexists(link_path):
+            if os.path.islink(link_path):
                 current_target = link_path.resolve()
                 if current_target == root_path.resolve():
                     continue
@@ -1308,8 +1483,11 @@ def create_symlinks(snapshot_config):
                 sys.exit(1)
 
         if not __dry_run__:
-            link_path.parent.mkdir(parents=True, exist_ok=True)
+            make_parents(link_path)
             link_path.symlink_to(root_path)
+            if hasattr(os, "geteuid") and os.geteuid() == 0:
+                owner = link_path.parent.stat()
+                os.chown(link_path, owner.st_uid, owner.st_gid, follow_symlinks=False)
 
         symlinks_created.append(str(link_path))
 
@@ -1766,6 +1944,150 @@ def remote_capture(args, root_dir, source_host, capture_config=None):
 # --- Restore Logic --- #
 
 
+def path_writable(path):
+    """Check if a path, or its nearest existing parent when missing, is writable."""
+    path = Path(path)
+    while not os.path.lexists(path) and path.parent != path:
+        path = path.parent
+    return os.access(path, os.W_OK)
+
+
+def tree_replaceable(path):
+    """Check if the current user can back up and delete a path and everything below it."""
+    path = Path(path)
+    if not os.access(path.parent, os.W_OK | os.X_OK):
+        return False
+    if path.is_symlink():
+        return True
+    if not path.is_dir():
+        return os.access(path, os.R_OK)
+
+    errors = []
+    for root, _, files in os.walk(path, onerror=errors.append):
+        if not os.access(root, os.R_OK | os.W_OK | os.X_OK):
+            return False
+        for name in files:
+            file_path = os.path.join(root, name)
+            if not os.path.islink(file_path) and not os.access(file_path, os.R_OK):
+                return False
+    return not errors
+
+
+def archive_writable(archive, root, roll_ext):
+    """Check if the current user can restore an archive without sudo."""
+    root_path = expand_path(root) if root else Path("/")
+    try:
+        with tarfile.open(archive, "r:*") as tar:
+            groups = archive_entries(tar, warn=False)
+    except (tarfile.TarError, ValueError):
+        return True  # The restore itself reports the error
+    except OSError:
+        return False  # Unreadable archive, which root can read
+
+    if roll_ext:
+        # Rotating and creating the backup dir happen in its parent
+        if not path_writable(Path(str(root_path) + roll_ext).parent):
+            return False
+        for entry in groups:
+            entry_path = root_path / entry
+            if os.path.lexists(entry_path):
+                if not tree_replaceable(entry_path):
+                    return False
+            elif not path_writable(entry_path.parent):
+                return False
+        return True
+
+    # Extraction without rollback rewrites existing files in place and creates the rest
+    for members in groups.values():
+        for member in members:
+            target = root_path / member.name
+            if os.path.lexists(target) and not target.is_symlink():
+                if target.is_file() and not os.access(target, os.W_OK):
+                    return False
+            elif not path_writable(target.parent):
+                return False
+    return True
+
+
+def restore_needs_sudo(selected, root_map, roll_ext, snapshot_config):
+    """Check if restoring the selected archives and links needs sudo."""
+    for archive in selected:
+        root = root_map.get(archive_category(archive))
+        # Rollback restore skips categories without a root
+        if roll_ext and not root:
+            continue
+        if not archive_writable(archive, root, roll_ext):
+            return True
+
+    # create_symlinks() writes a link for every category with one
+    for section in snapshot_config.get("tar", {}).values():
+        link, root = section.get("link"), section.get("root")
+        if link and root:
+            link_path = expand_path(link)
+            if not os.path.lexists(link_path) and not path_writable(link_path.parent):
+                return True
+    return False
+
+
+def sudo_restore(args, root_dir, capture_dir, restore_config, snapshot_config):
+    """Run this restore again under sudo, then exit with its status.
+
+    The child restores from the local capture_dir with the same restore config, so
+    remote pulls and captures aren't repeated as root and the caller's temp dirs
+    still get cleaned up. sudo resets the environment, so HOME and the variables
+    used by roots and links are passed through, or '$HOME' and '~' would expand
+    to root's home.
+    """
+    names = {"HOME"}
+    for section in snapshot_config.get("tar", {}).values():
+        for key in ("root", "link"):
+            names.update(re.findall(r"\$\{?(\w+)", str(section.get(key, ""))))
+    env = {name: os.environ[name] for name in names if name in os.environ}
+    env.setdefault("HOME", str(Path.home()))
+    env_args = [f"{name}={value}" for name, value in sorted(env.items())]
+
+    # Pass what restore() reads from the config through a temp file (it may come
+    # from migrate.toml)
+    archives = restore_config.get("tar", {}).get("archives") or []
+    child_config = {"tar": {"archives": archives}}
+    scripts = restore_config.get("scripts", {})
+    child_scripts = {when: scripts[when] for when in ("before", "after") if when in scripts}
+    if "scripts" in restore_config:
+        child_config["scripts"] = child_scripts
+    root_host = getattr(args, "root_host", None)
+    root_arg = f"{root_host}:{root_dir}" if root_host else str(root_dir)
+
+    fd, config_path = tempfile.mkstemp(prefix=f"{__script__.stem}-", suffix=".toml")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(toml_dumps(child_config))
+
+        cmd = ["sudo", "env", *env_args, sys.executable, str(__script__), "restore"]
+        cmd += ["--from", str(capture_dir), "-r", root_arg, "-t", config_path]
+        if getattr(args, "disable_rollback", False):
+            cmd.append("--disable-rollback")
+        if getattr(args, "run_scripts", False):
+            cmd.append("--run-scripts")
+        if __verbose__:
+            cmd.append("--verbose")
+
+        sys.stdout.flush()
+        sys.stderr.flush()
+        child = subprocess.Popen(cmd)
+        while True:
+            try:
+                returncode = child.wait()
+                break
+            except KeyboardInterrupt:
+                # The child got the same Ctrl-C and is rolling back; wait for it
+                continue
+    finally:
+        os.unlink(config_path)
+
+    # A child killed by a signal reports -N; exit like a shell would (128 + N)
+    sys.exit(128 - returncode if returncode < 0 else returncode)
+
+
 def restore(args, root_dir, capture_dir=None, restore_config=None):
     """Restore from local capture directory."""
     if capture_dir is None:
@@ -1790,16 +2112,6 @@ def restore(args, root_dir, capture_dir=None, restore_config=None):
         if root:
             root_map[category] = root
 
-    # Check if running with sudo is required (Unix only)
-    needs_sudo = any(not os.access(r, os.W_OK) for r in root_map.values())
-    if needs_sudo and hasattr(os, "geteuid") and os.geteuid() != 0:
-        printd(
-            "Note: This script needs sudo privileges to restore files to system locations."
-        )
-        printd("Re-running with sudo...")
-        cmd = ["sudo", sys.executable] + sys.argv
-        os.execvp("sudo", cmd)
-
     # Load restore config (use provided or load from file)
     if restore_config is None:
         config_name = args.config_toml if args.config_toml else DEFAULT_CONFIG_RESTORE
@@ -1815,17 +2127,34 @@ def restore(args, root_dir, capture_dir=None, restore_config=None):
     elif archives == ["*"] or "*" in archives:
         archives = []  # Wildcard means restore all available
 
+    # Find matching archive files
+    selected = []
+    if archives is not None:
+        ext, _ = COMPRESS_MAP[compress]
+        available = list(capture_dir.glob(f"*{ext}"))
+        selected = archive_select(available, archives, capture_dir, compress)
+
+    # Re-run with sudo if any restore target is not writable (Unix only)
+    use_rollback = bool(roll_ext) and not getattr(args, "disable_rollback", False)
+    can_sudo = hasattr(os, "geteuid") and os.geteuid() != 0
+    if can_sudo and restore_needs_sudo(
+        selected, root_map, roll_ext if use_rollback else None, snapshot_config
+    ):
+        if __dry_run__:
+            printd("Note: A real run would re-run with sudo to restore to system locations.")
+        else:
+            printd(
+                "Note: This script needs sudo privileges to restore files to system locations."
+            )
+            printd("Re-running with sudo...")
+            sudo_restore(args, root_dir, capture_dir, restore_config, snapshot_config)
+
     # Run before scripts
     if args.run_scripts:
         run_scripts(root_dir, restore_config, "before", working_dir=capture_dir)
 
     # Restore archives
     if archives is not None:
-        # Find matching archive files
-        ext, _ = COMPRESS_MAP[compress]
-        available = list(capture_dir.glob(f"*{ext}"))
-        selected = archive_select(available, archives, capture_dir, compress)
-
         if not selected:
             printd("No archives selected for restore")
         elif getattr(args, "disable_rollback", False):
@@ -2223,6 +2552,18 @@ def split_migrate_config(config, config_name):
 # --- Command Execution --- #
 
 
+def require_remote(args, attr, host):
+    """Exit if --from/--to was given but does not name a remote host."""
+    value = getattr(args, attr, None)
+    if value is not None and not host:
+        flag = "--from" if attr == "src" else "--to"
+        printd(
+            f"Error: {flag} '{value}' is not a remote host; use user@host or host:",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
 def cmd_check(args):
     """Calculate and display checksums for files."""
     files = getattr(args, "files", []) or []
@@ -2262,6 +2603,7 @@ def cmd_capture(args):
 
     from_host, _ = parse_remote_arg(getattr(args, "src", None))
     to_host, to_path = parse_remote_arg(getattr(args, "dst", None))
+    require_remote(args, "src", from_host)
 
     # Determine intended destination path
     if to_path:
@@ -2330,6 +2672,8 @@ def cmd_migrate(args):
 
     from_host, _ = parse_remote_arg(getattr(args, "src", None))
     to_host, _ = parse_remote_arg(getattr(args, "dst", None))
+    require_remote(args, "src", from_host)
+    require_remote(args, "dst", to_host)
 
     if not from_host and not to_host:
         printd(
@@ -2395,6 +2739,7 @@ def cmd_restore(args):
 
     from_host, from_path = parse_remote_arg(getattr(args, "src", None))
     to_host, _ = parse_remote_arg(getattr(args, "dst", None))
+    require_remote(args, "dst", to_host)
 
     # Determine snapshot source path
     if from_host:
@@ -2465,7 +2810,7 @@ def add_snap_options(parser):
     """Add shared snap configuration options."""
     group = parser.add_argument_group("snap options")
     group.add_argument(
-        "-r", "--snap-root", dest="root", metavar="[host:]root",
+        "-r", "--snap-root", dest="root", metavar="[[user@]host:]root",
         default=DEFAULT_ROOT_SNAP,
         help=f"Root directory for configs and scripts (default: {DEFAULT_ROOT_SNAP})",
     )
@@ -2481,13 +2826,17 @@ def add_snap_options(parser):
 
 def add_host_options(parser, from_help, to_help):
     """Add --from and --to host options."""
-    group = parser.add_argument_group("host options")
+    group = parser.add_argument_group(
+        "host options",
+        "A local path containing '@' needs a '/' (e.g. ./name@tag), "
+        "or it is read as user@host.",
+    )
     group.add_argument(
-        "--from", dest="src", metavar="[host:]path",
+        "--from", dest="src", metavar="[user@]host[:path]",
         help=from_help,
     )
     group.add_argument(
-        "--to", dest="dst", metavar="[host:]path",
+        "--to", dest="dst", metavar="[user@]host[:path]",
         help=to_help,
     )
 
@@ -2576,7 +2925,7 @@ def setup_parser():
     add_snap_options(mig)
     add_host_options(
         mig,
-        from_help="Source host/path to capture from (default: local)",
+        from_help="Source host to capture from (default: local)",
         to_help="Destination host to restore to (default: local)",
     )
     mig_group = mig.add_argument_group("migrate options")
@@ -2614,7 +2963,7 @@ def main():
     # Parse --snap-root for remote host support
     root_host, root_path = parse_remote_arg(args.root)
     args.root_host = root_host
-    args.root = resolve_root(root_path or args.root, root_host=root_host)
+    args.root = resolve_root(root_path if root_host else args.root, root_host=root_host)
 
     commands = {
         "capture": (cmd_capture, "Starting capture!"),
